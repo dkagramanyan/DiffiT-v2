@@ -1,5 +1,16 @@
 # Copyright (c) 2024, DiffiT authors.
-# Diffusion model for image generation using diffusers schedulers.
+# Diffusion model for image generation.
+#
+# Implements the diffusion framework from the DiffiT paper (Section 3.1).
+#
+# The paper uses Variance-Exploding (VE) notation:
+#   q(z_t | z_0) = N(z_0, σ_t² I)
+#
+# Training objective (Eq. 1):
+#   L = E[λ(t) * ||ε - ε_θ(z_0 + σ_t·ε, t)||²]
+#
+# The score network relates to epsilon prediction via:
+#   s_θ(z_t, t) = -ε_θ(z_t, t) / σ_t
 
 from __future__ import annotations
 
@@ -19,7 +30,12 @@ except ImportError:
 class Diffusion:
     """Denoising Diffusion Probabilistic Model.
 
+    Implements the diffusion framework described in the DiffiT paper (Section 3.1).
     Uses diffusers schedulers when available for efficient and well-tested implementations.
+    
+    The paper uses Variance-Exploding (VE) notation but notes it can be converted to
+    Variance-Preserving (VP) by rescaling. This implementation uses VP (DDPM) scheduling
+    which is equivalent after the appropriate rescaling.
     """
 
     def __init__(
@@ -33,11 +49,12 @@ class Diffusion:
         """Initialize the diffusion model.
 
         Args:
-            model: The denoising network (predicts noise).
+            model: The denoising network (predicts noise ε_θ as per paper Eq. 1).
             image_resolution: Tuple of (channels, height, width).
-            n_times: Number of diffusion timesteps.
+            n_times: Number of diffusion timesteps T.
             device: Device to run computations on.
             beta_schedule: Noise schedule type ('linear', 'squaredcos_cap_v2').
+                'squaredcos_cap_v2' corresponds to the improved cosine schedule.
         """
         self.model = model
         self.img_C, self.img_H, self.img_W = image_resolution
@@ -45,7 +62,8 @@ class Diffusion:
         self.n_times = n_times
 
         if HAS_DIFFUSERS:
-            # Use diffusers schedulers
+            # Use diffusers schedulers (DDPM/DDIM implementations)
+            # These implement the sampling SDEs from the paper (Eq. 2)
             self.ddpm_scheduler = DDPMScheduler(
                 num_train_timesteps=n_times,
                 beta_schedule=beta_schedule,
@@ -98,21 +116,36 @@ class Diffusion:
 
     def perturb_and_predict(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Add noise and predict it back (training forward pass).
+        
+        Implements the training objective from DiffiT paper Eq. 1:
+            L = E[λ(t) * ||ε - ε_θ(z_0 + σ_t·ε, t)||²]
+        
+        This function:
+        1. Samples random timesteps t ~ p(t) (uniform)
+        2. Samples noise ε ~ N(0, I)
+        3. Creates noisy samples: z_t = z_0 + σ_t·ε (in VE) or equivalent VP formulation
+        4. Predicts noise: ε̂ = ε_θ(z_t, t)
 
         Args:
-            x: Clean images in [0, 1] range.
+            x: Clean images (z_0) in [0, 1] range.
 
         Returns:
-            Tuple of (noisy_images, true_noise, predicted_noise).
+            Tuple of (noisy_images z_t, true_noise ε, predicted_noise ε̂).
         """
-        # Scale to [-1, 1]
+        # Scale to [-1, 1] (standard preprocessing for diffusion models)
         x = x * 2 - 1
 
         B = x.shape[0]
+        # Sample timesteps uniformly: t ~ p(t) where p(t) is uniform over [0, T)
         timesteps = torch.randint(0, self.n_times, (B,), device=self.device, dtype=torch.long)
+        # Sample noise: ε ~ N(0, I)
         noise = torch.randn_like(x)
 
+        # Create noisy samples using the forward diffusion process
+        # z_t = √α̅_t · z_0 + √(1-α̅_t) · ε (VP formulation, equivalent to VE after rescaling)
         noisy_x = self.add_noise(x, noise, timesteps)
+        
+        # Predict noise: ε̂ = ε_θ(z_t, t)
         pred_noise = self.model(noisy_x, timesteps)
 
         return noisy_x, noise, pred_noise
@@ -120,6 +153,12 @@ class Diffusion:
     @torch.no_grad()
     def sample(self, n_samples: int, return_intermediates: bool = False) -> torch.Tensor:
         """Generate samples using DDPM reverse process.
+        
+        Implements the sampling SDE from DiffiT paper Eq. 2:
+            dz = -(σ̇_t + β_t)σ_t·s_θ(z,t)dt + √(2β_t·σ_t)·dω_t
+        
+        When β_t > 0, this is the stochastic DDPM sampler.
+        The score network s_θ relates to ε_θ via: s_θ = -ε_θ/σ_t
 
         Args:
             n_samples: Number of samples to generate.
@@ -173,11 +212,14 @@ class Diffusion:
     @torch.no_grad()
     def sample_ddim(self, n_samples: int, num_inference_steps: int = 50, eta: float = 0.0) -> torch.Tensor:
         """Generate samples using DDIM (faster sampling).
+        
+        When β_t = 0 in paper Eq. 2, the sampling becomes a probability flow ODE
+        that can be solved with DDIM. This allows for faster sampling with fewer steps.
 
         Args:
             n_samples: Number of samples to generate.
-            num_inference_steps: Number of denoising steps.
-            eta: DDIM eta parameter (0 = deterministic).
+            num_inference_steps: Number of denoising steps (can be << n_times).
+            eta: DDIM eta parameter (0 = deterministic ODE, 1 = stochastic like DDPM).
 
         Returns:
             Generated images in [0, 1] range.

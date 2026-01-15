@@ -42,7 +42,40 @@ pip install -r requirements.txt
 
 ## Training
 
-Train a DiffiT model on your dataset:
+Train a DiffiT model on your dataset.
+
+### Multi-GPU Training (Recommended: torchrun)
+
+For multi-GPU training, use `torchrun` which provides robust distributed training:
+
+```bash
+# Single node, 4 GPUs
+torchrun --nproc_per_node=4 train.py \
+    --outdir=./training-runs \
+    --data=/path/to/dataset \
+    --batch-gpu=16 \
+    --resolution=64 \
+    --kimg=25000
+
+# Multi-node training (2 nodes, 4 GPUs each)
+torchrun --nnodes=2 --nproc_per_node=4 \
+    --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+    train.py --outdir=./runs --data=/path/to/dataset --batch-gpu=16
+```
+
+### SLURM Cluster
+
+For SLURM-managed clusters:
+
+```bash
+# The script automatically detects SLURM environment variables
+srun --nodes=2 --ntasks-per-node=4 --gpus-per-node=4 \
+    python train.py --outdir=./runs --data=/path/to/dataset --batch-gpu=16
+```
+
+### Legacy Mode (Single Node)
+
+For simpler single-node training:
 
 ```bash
 python train.py \
@@ -60,7 +93,7 @@ python train.py \
 |----------|-------------|---------|
 | `--outdir` | Output directory | Required |
 | `--data` | Path to dataset (folder or zip) | Required |
-| `--gpus` | Number of GPUs | Required |
+| `--gpus` | Number of GPUs (legacy mode, ignored with torchrun) | 1 |
 | `--batch-gpu` | Batch size per GPU | Required |
 | `--resolution` | Image resolution | 64 |
 | `--timesteps` | Diffusion timesteps | 1000 |
@@ -69,6 +102,8 @@ python train.py \
 | `--num-heads` | Attention heads | 4 |
 | `--lr` | Learning rate | 1e-4 |
 | `--kimg` | Training duration (kimg) | 25000 |
+| `--fp32` | Disable mixed precision | False |
+| `--resume` | Resume from checkpoint | None |
 
 ## Generation
 
@@ -98,33 +133,40 @@ python gen_images.py \
 
 ## Model Architecture
 
-DiffiT uses a U-Net architecture with Vision Transformer blocks:
+DiffiT uses a U-Net architecture with Vision Transformer blocks, as described in the paper:
 
 ```
 Input Image → [Encoder Path] → [Bottleneck] → [Decoder Path] → Output
                   ↓                               ↑
               Skip Connections ──────────────────┘
 
-Each block contains:
-- GroupNorm + SiLU + Conv
-- Vision Transformer with TDMHSA
-- Residual connection
+DiffiT ResBlock (Paper Eq. 9-10):
+  x̂ = Conv3×3(Swish(GN(x)))      # Convolutional layer
+  x = DiffiT-Block(x̂, t) + x     # Transformer + residual
+
+DiffiT Transformer Block (Paper Eq. 7-8):
+  x̂ = TMSA(LN(x), t) + x         # Time-dependent attention
+  x = MLP(LN(x̂)) + x̂             # Feed-forward + residual
 ```
 
-### Key Components
+### Key Components (Paper Reference)
 
-1. **TDMHSA (Time-Dependent Multi-Head Self-Attention)**:
-   - Combines spatial attention with temporal conditioning
-   - Uses relative positional embeddings
-   - Efficient implementation using `scaled_dot_product_attention`
+1. **Time-Dependent Multi-Head Self-Attention (TMSA)** - Paper Eq. 3-6:
+   - Computes time-dependent queries, keys, values:
+     - q = x·W_qs + t·W_qt
+     - k = x·W_ks + t·W_kt  
+     - v = x·W_vs + t·W_vt
+   - Attention with relative position bias B:
+     - Attention(Q,K,V) = Softmax(QK^T/√d + B)V
 
-2. **Timestep Embedding**:
+2. **Timestep Embedding** - Paper Section 3.2:
    - Sinusoidal position embeddings for timesteps
-   - MLP projection to model dimension
+   - MLP with Swish activation for projection
 
-3. **Diffusion Process**:
+3. **Diffusion Process** - Paper Section 3.1:
+   - Training: denoising score matching (Eq. 1)
+   - Sampling: SDE/ODE solvers (Eq. 2)
    - Uses `diffusers` DDPMScheduler/DDIMScheduler when available
-   - Fallback to custom implementation
 
 ## Dataset Format
 

@@ -1,5 +1,10 @@
 # Copyright (c) 2024, DiffiT authors.
 # Main training loop for DiffiT diffusion model.
+#
+# Implements the training objective from the DiffiT paper (Eq. 1):
+#   L = E[λ(t) * ||ε - ε_θ(z_0 + σ_t * ε, t)||^2]
+#
+# Multi-GPU training uses DistributedDataParallel for efficient gradient sync.
 
 from __future__ import annotations
 
@@ -14,7 +19,9 @@ import numpy as np
 import PIL.Image
 import psutil
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 import dnnlib
 from torch_utils import misc
@@ -140,13 +147,13 @@ def training_loop(
 
     # Construct model
     stage("Constructing model")
-    model = dnnlib.util.construct_class_by_name(**model_kwargs).train().requires_grad_(False).to(device)
-    model_ema = copy.deepcopy(model).eval()
+    model = dnnlib.util.construct_class_by_name(**model_kwargs).train().to(device)
+    model_ema = copy.deepcopy(model).eval().requires_grad_(False)
 
-    # Construct diffusion
+    # Construct diffusion for EMA model (used for sampling/snapshots)
     stage("Constructing diffusion")
-    diffusion = dnnlib.util.construct_class_by_name(model=model, **diffusion_kwargs)
     diffusion_ema = dnnlib.util.construct_class_by_name(model=model_ema, **diffusion_kwargs)
+    # Note: For training, we'll create diffusion with ddp_model after DDP wrapping
 
     # Check for existing checkpoint
     ckpt_pkl = None
@@ -165,22 +172,41 @@ def training_loop(
             __CUR_TICK__ = resume_data["progress"]["cur_tick"].to(device)
             __BATCH_IDX__ = resume_data["progress"]["batch_idx"].to(device)
 
-    # Print network summary
+    # Print network summary (use base model before DDP wrapping)
     if rank == 0:
         x = torch.empty([batch_gpu, *training_set.image_shape], device=device)
         t = torch.zeros([batch_gpu], dtype=torch.long, device=device)
-        misc.print_module_summary(model, [x, t])
+        with torch.no_grad():
+            misc.print_module_summary(model, [x, t])
 
-    # Distribute across GPUs
+    # Distribute across GPUs using DistributedDataParallel
     stage(f"Distributing across {num_gpus} GPUs")
-    for module in [model, model_ema]:
-        if module is not None and num_gpus > 1:
-            for param in misc.params_and_buffers(module):
-                torch.distributed.broadcast(param, src=0)
+    ddp_model = None
+    if num_gpus > 1:
+        # Sync initial model weights across all GPUs
+        for module in [model, model_ema]:
+            if module is not None:
+                for param in misc.params_and_buffers(module):
+                    dist.broadcast(param, src=0)
+        
+        # Wrap model in DDP for automatic gradient synchronization
+        ddp_model = DDP(
+            model, 
+            device_ids=[rank],
+            output_device=rank,
+            broadcast_buffers=True,
+            find_unused_parameters=False,
+        )
+    else:
+        ddp_model = model
 
-    # Setup optimizer
+    # Setup optimizer (use ddp_model.module for DDP to get the underlying model)
     stage("Setting up optimizer")
-    optimizer = dnnlib.util.construct_class_by_name(params=model.parameters(), **opt_kwargs)
+    base_model = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
+    optimizer = dnnlib.util.construct_class_by_name(params=base_model.parameters(), **opt_kwargs)
+    
+    # Create diffusion wrapper for training (uses DDP-wrapped model)
+    diffusion = dnnlib.util.construct_class_by_name(model=ddp_model, **diffusion_kwargs)
 
     # Export sample images
     grid_size = None
@@ -210,10 +236,10 @@ def training_loop(
     # Train
     stage(f"Training start (total_kimg={total_kimg}, batch_size={batch_size}, batch_gpu={batch_gpu})")
     if num_gpus > 1:
-        torch.distributed.broadcast(__CUR_NIMG__, 0)
-        torch.distributed.broadcast(__CUR_TICK__, 0)
-        torch.distributed.broadcast(__BATCH_IDX__, 0)
-        torch.distributed.barrier()
+        dist.broadcast(__CUR_NIMG__, 0)
+        dist.broadcast(__CUR_TICK__, 0)
+        dist.broadcast(__BATCH_IDX__, 0)
+        dist.barrier()
 
     cur_nimg = __CUR_NIMG__.item()
     cur_tick = __CUR_TICK__.item()
@@ -234,54 +260,55 @@ def training_loop(
             batch_images = (batch_images.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
 
         # Training step
-        model.requires_grad_(True)
+        # DDP handles gradient sync automatically during backward pass
         optimizer.zero_grad(set_to_none=True)
-
-        for real_img in batch_images:
+        
+        # Gradient accumulation: split batch and accumulate
+        num_accumulation_steps = len(batch_images)
+        
+        for accum_idx, real_img in enumerate(batch_images):
             # Scale from [-1, 1] to [0, 1] for diffusion (it will rescale internally)
             real_img_01 = (real_img + 1) / 2
+            
+            # Only sync gradients on the last accumulation step (DDP optimization)
+            sync_grads = (accum_idx == num_accumulation_steps - 1)
+            
+            with misc.ddp_sync(ddp_model, sync_grads):
+                with torch.cuda.amp.autocast(enabled=not fp32):
+                    # Forward pass: perturb and predict (paper Eq. 1)
+                    # The diffusion uses the model to predict noise ε_θ
+                    _, epsilon, pred_epsilon = diffusion.perturb_and_predict(real_img_01)
+                    # MSE loss: ||ε - ε_θ||^2 (paper Eq. 1, with λ(t) = 1)
+                    loss = F.mse_loss(epsilon, pred_epsilon)
+                    # Scale loss for gradient accumulation
+                    loss = loss / num_accumulation_steps
 
-            with torch.cuda.amp.autocast(enabled=not fp32):
-                # Forward pass: perturb and predict
-                _, epsilon, pred_epsilon = diffusion.perturb_and_predict(real_img_01)
-                loss = F.mse_loss(epsilon, pred_epsilon)
-
-            # Backward pass
-            scaler.scale(loss).backward()
-            training_stats.report("Loss/train", loss)
+                # Backward pass
+                scaler.scale(loss).backward()
+            
+            training_stats.report("Loss/train", loss * num_accumulation_steps)
 
         # Update weights
-        model.requires_grad_(False)
         with torch.autograd.profiler.record_function("opt_step"):
-            # Gradient clipping
+            # Gradient clipping (before optimizer step)
             scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
             training_stats.report("Loss/grad_norm", grad_norm)
 
-            # All-reduce gradients if distributed
-            if num_gpus > 1:
-                params = [p for p in model.parameters() if p.grad is not None]
-                if len(params) > 0:
-                    flat = torch.cat([p.grad.flatten() for p in params])
-                    torch.distributed.all_reduce(flat)
-                    flat /= num_gpus
-                    misc.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)
-                    grads = flat.split([p.numel() for p in params])
-                    for param, grad in zip(params, grads):
-                        param.grad = grad.reshape(param.shape)
-
+            # Optimizer step (DDP already synchronized gradients)
             scaler.step(optimizer)
             scaler.update()
 
-        # Update EMA
+        # Update EMA (Exponential Moving Average)
+        # This creates a smoother model for sampling
         with torch.autograd.profiler.record_function("ema_update"):
             ema_nimg = ema_kimg * 1000
             if ema_rampup is not None:
                 ema_nimg = min(ema_nimg, cur_nimg * ema_rampup)
             ema_beta = 0.5 ** (batch_size / max(ema_nimg, 1e-8))
-            for p_ema, p in zip(model_ema.parameters(), model.parameters()):
+            for p_ema, p in zip(model_ema.parameters(), base_model.parameters()):
                 p_ema.copy_(p.lerp(p_ema, ema_beta))
-            for b_ema, b in zip(model_ema.buffers(), model.buffers()):
+            for b_ema, b in zip(model_ema.buffers(), base_model.buffers()):
                 b_ema.copy_(b)
 
         # Update state
@@ -323,12 +350,12 @@ def training_loop(
             print("Restart job...")
             __RESTART__ = torch.tensor(1.0, device=device)
         if num_gpus > 1:
-            torch.distributed.broadcast(__RESTART__, 0)
+            dist.broadcast(__RESTART__, 0)
         if __RESTART__:
             done = True
             print(f"Process {rank} leaving...")
             if num_gpus > 1:
-                torch.distributed.barrier()
+                dist.barrier()
 
         # Save image snapshot
         if (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
@@ -337,11 +364,11 @@ def training_loop(
                 images = generate_snapshot_images(diffusion_ema, grid_size, device, batch_gpu)
                 save_image_grid(images, os.path.join(run_dir, f"fakes{cur_nimg//1000:06d}.png"), drange=[0, 1], grid_size=grid_size)
 
-        # Save network snapshot
+        # Save network snapshot (save base_model, not the DDP wrapper)
         snapshot_data = None
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
             stage(f"Preparing network snapshot (kimg={cur_nimg/1e3:.1f})")
-            snapshot_data = dict(model=model, model_ema=model_ema, training_set_kwargs=dict(training_set_kwargs))
+            snapshot_data = dict(model=base_model, model_ema=model_ema, training_set_kwargs=dict(training_set_kwargs))
 
         # Save checkpoint
         if (rank == 0) and (restart_every > 0) and (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
@@ -384,6 +411,16 @@ def training_loop(
         if done:
             break
 
+    # Cleanup
+    if stats_jsonl is not None:
+        stats_jsonl.close()
+    if stats_tfevents is not None:
+        stats_tfevents.close()
+    
+    # Synchronize before exiting (for clean distributed shutdown)
+    if num_gpus > 1:
+        dist.barrier()
+    
     # Done
     if rank == 0:
         stage("Exiting")
