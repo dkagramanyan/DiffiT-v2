@@ -14,7 +14,7 @@ module purge
 module load Python
 module load CUDA/12.9
 
-conda activate san_rocky_51
+conda activate diff
 
 export CC=/usr/bin/gcc
 export CXX=/usr/bin/g++
@@ -45,7 +45,7 @@ export CUDA_CACHE_PATH="${HOME}/.cache/cuda_cache"
 # DiffiT training with torchrun (recommended for multi-GPU)
 torchrun --nproc_per_node=4 train.py \
     --outdir=./runs/diffit_h200 \
-    --data=./datasets/imagenet128.zip \
+    --data=./datasets/imagenet_9to4_1024x1024_128x128.zip \
     --batch-gpu=32 \
     --resolution=128 \
     --base-dim=128 \

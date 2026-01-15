@@ -132,7 +132,7 @@ def _sync():
         if len(values) > 0:
             flat = torch.cat(values)
             moments = torch.stack([flat.sum(), flat.square().sum(), torch.tensor(flat.numel(), dtype=_reduce_dtype, device=flat.device)])
-            _cumulative[name] += moments
+            _cumulative[name] += moments.cpu()
 
     # Clear counters
     _counters.clear()
