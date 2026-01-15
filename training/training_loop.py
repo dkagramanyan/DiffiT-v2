@@ -170,6 +170,14 @@ def training_loop(
 
     # Load training set
     stage("Loading training set")
+    # #region agent log - H6, H7: Log training_set_kwargs before construction
+    import json
+    log_entry = {"sessionId":"debug-session","runId":"post-fix","hypothesisId":"H6_H7","location":"training_loop.py:173","message":"training_set_kwargs before construction","data":{"training_set_kwargs_keys":list(training_set_kwargs.keys()),"has_has_labels":"has_labels" in training_set_kwargs,"has_label_dim":"label_dim" in training_set_kwargs},"timestamp":int(__import__('time').time()*1000)}
+    try:
+        with open('/home/dgkagramanyan/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+    except: pass
+    # #endregion
     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs)
     training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
     training_set_iterator = iter(

@@ -42,7 +42,7 @@ torchrun --nproc_per_node=2 train.py \
     --tick=4 \
     --snap=50 \
     --workers=4 \
-    --cond \
+    --cond=True \
     --label-drop=0.1 \
     --cfg-scale=2.0 \
     --metrics=fid10k_full \

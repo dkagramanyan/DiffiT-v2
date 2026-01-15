@@ -45,7 +45,7 @@ export CUDA_CACHE_PATH="${HOME}/.cache/cuda_cache"
 # DiffiT training with torchrun (recommended for multi-GPU)
 torchrun --nproc_per_node=4 train.py \
     --outdir=./runs/diffit_h200 \
-    --data=./datasets/imagenet64.zip \
+    --data=./datasets/imagenet_9to4_1024x1024_64x64.zip \
     --batch-gpu=64 \
     --resolution=64 \
     --base-dim=128 \
@@ -58,7 +58,7 @@ torchrun --nproc_per_node=4 train.py \
     --tick=4 \
     --snap=50 \
     --workers=4 \
-    --cond \
+    --cond=True \
     --label-drop=0.1 \
     --cfg-scale=1.5 \
     --metrics=fid10k_full \

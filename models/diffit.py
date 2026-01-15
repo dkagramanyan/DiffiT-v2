@@ -199,9 +199,11 @@ class DiffiT(nn.Module):
             self.skip_convs.append(nn.Conv2d(dim, dim, 1))
 
             # ResBlocks at this level
-            for _ in range(num_res_blocks):
+            for res_idx in range(num_res_blocks):
+                # First ResBlock receives concatenated features (dim*2), rest receive dim
+                block_dim_in = dim * 2 if res_idx == 0 else dim
                 self.up_blocks.append(
-                    ResBlock(dim * 2, dim, time_embed_dim, curr_res, gn_groups, hidden_dim, num_patches, num_heads, num_transformer_blocks, mlp_ratio)
+                    ResBlock(block_dim_in, dim, time_embed_dim, curr_res, gn_groups, hidden_dim, num_patches, num_heads, num_transformer_blocks, mlp_ratio)
                 )
 
         # Output
@@ -262,9 +264,27 @@ class DiffiT(nn.Module):
         # Downsampling
         block_idx = 0
         for i, downsample in enumerate(self.down_samples):
+            # #region agent log - H14, H15, H16: Log shapes in downsampling path
+            import json
+            log_entry_pre = {"sessionId":"debug-session","runId":"post-fix-3","hypothesisId":"H14_H15_H16","location":"diffit.py:267","message":"Before ResBlocks at downsample level","data":{"level":i,"block_idx":block_idx,"h_shape":list(h.shape)},"timestamp":int(__import__('time').time()*1000)}
+            try:
+                with open('/home/dgkagramanyan/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps(log_entry_pre) + '\n')
+            except: pass
+            # #endregion
+            
             for _ in range(len(self.down_blocks) // len(self.down_samples)):
                 h = self.down_blocks[block_idx](h, cond_emb)
                 block_idx += 1
+            
+            # #region agent log - H14, H15, H16: Log shape after ResBlocks, before downsample
+            log_entry_post = {"sessionId":"debug-session","runId":"post-fix-3","hypothesisId":"H14_H15_H16","location":"diffit.py:271","message":"After ResBlocks, before downsample","data":{"level":i,"h_shape":list(h.shape)},"timestamp":int(__import__('time').time()*1000)}
+            try:
+                with open('/home/dgkagramanyan/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps(log_entry_post) + '\n')
+            except: pass
+            # #endregion
+            
             skips.append(h)
             h = downsample(h)
 
@@ -280,7 +300,15 @@ class DiffiT(nn.Module):
             skip = skip_conv(skip)
             h = torch.cat([h, skip], dim=1)
 
-            for _ in range(len(self.up_blocks) // len(self.up_samples)):
+            for res_block_idx in range(len(self.up_blocks) // len(self.up_samples)):
+                # #region agent log - H10, H12: Log shape before each upsampling ResBlock
+                import json
+                log_entry = {"sessionId":"debug-session","runId":"post-fix-2","hypothesisId":"H10_H12","location":"diffit.py:290","message":"upsampling ResBlock input shape","data":{"upsample_level":i,"res_block_idx":res_block_idx,"block_idx":block_idx,"h_shape":list(h.shape)},"timestamp":int(__import__('time').time()*1000)}
+                try:
+                    with open('/home/dgkagramanyan/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps(log_entry) + '\n')
+                except: pass
+                # #endregion
                 h = self.up_blocks[block_idx](h, cond_emb)
                 block_idx += 1
 

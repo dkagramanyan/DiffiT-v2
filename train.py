@@ -228,9 +228,20 @@ def init_dataset_kwargs(data: str, resolution: int | None = None, use_labels: bo
         dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)
         dataset_kwargs.resolution = dataset_obj.resolution
         dataset_kwargs.max_size = len(dataset_obj)
-        dataset_kwargs.has_labels = dataset_obj.has_labels
-        dataset_kwargs.label_dim = dataset_obj.label_dim if dataset_obj.has_labels else 0
-        return dataset_kwargs, dataset_obj.name
+        # Store metadata separately (don't add to dataset_kwargs to avoid passing to constructor)
+        has_labels = dataset_obj.has_labels
+        label_dim = dataset_obj.label_dim if dataset_obj.has_labels else 0
+        
+        # #region agent log - H6, H7: Log dataset_kwargs keys to verify no contamination
+        import json
+        log_entry = {"sessionId":"debug-session","runId":"post-fix","hypothesisId":"H6_H7","location":"train.py:233","message":"init_dataset_kwargs return values","data":{"dataset_kwargs_keys":list(dataset_kwargs.keys()),"has_labels":has_labels,"label_dim":label_dim},"timestamp":int(__import__('time').time()*1000)}
+        try:
+            with open('/home/dgkagramanyan/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps(log_entry) + '\n')
+        except: pass
+        # #endregion
+        
+        return dataset_kwargs, dataset_obj.name, has_labels, label_dim
     except IOError as err:
         raise click.ClickException(f"--data: {err}")
 
@@ -259,7 +270,7 @@ def parse_comma_separated_list(s):
 @click.option("--num-blocks", help="Number of transformer blocks", metavar="INT", type=click.IntRange(min=1), default=1)
 # Optional features
 @click.option("--mirror", help="Enable dataset x-flips", metavar="BOOL", type=bool, default=False, show_default=True)
-@click.option("--cond", help="Enable class-conditional training (requires dataset.json with labels)", metavar="BOOL", type=bool, default=False, show_default=True)
+@click.option("--cond", help="Enable class-conditional training (requires dataset.json with labels)", metavar="BOOL", type=bool, default=False, show_default=True, is_flag=False)
 @click.option("--label-drop", help="Probability of dropping labels for CFG training", metavar="FLOAT", type=click.FloatRange(min=0, max=1), default=0.1, show_default=True)
 @click.option("--cfg-scale", help="Classifier-free guidance scale for snapshot generation", metavar="FLOAT", type=click.FloatRange(min=1), default=1.5, show_default=True)
 @click.option("--resume", help="Resume from given network pickle", metavar="[PATH|URL]", type=str)
@@ -295,6 +306,14 @@ def main(**kwargs):
     2. Using legacy spawn (with --gpus):
        python train.py --outdir=./runs --data=./data --gpus=4 --batch-gpu=32
     """
+    # #region agent log - H1, H3, H5: Log received kwargs to see exact argument values
+    import json
+    log_entry = {"sessionId":"debug-session","runId":"initial","hypothesisId":"H1_H3_H5","location":"train.py:296","message":"main() kwargs received","data":{"kwargs":kwargs,"cond_value":kwargs.get('cond'),"cond_type":str(type(kwargs.get('cond')))},"timestamp":int(__import__('time').time()*1000)}
+    try:
+        with open('/home/dgkagramanyan/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+    except: pass
+    # #endregion
     opts = dnnlib.EasyDict(kwargs)
     c = dnnlib.EasyDict()
 
@@ -324,7 +343,7 @@ def main(**kwargs):
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2, persistent_workers=True)
 
     # Training set (supports datasets from dataset_tool.py)
-    c.training_set_kwargs, dataset_name = init_dataset_kwargs(
+    c.training_set_kwargs, dataset_name, has_labels, label_dim = init_dataset_kwargs(
         data=opts.data, 
         resolution=opts.resolution, 
         use_labels=opts.cond
@@ -332,8 +351,8 @@ def main(**kwargs):
     c.training_set_kwargs.xflip = opts.mirror
     
     # Class-conditional settings
-    c.use_labels = opts.cond and c.training_set_kwargs.has_labels
-    c.label_dim = c.training_set_kwargs.label_dim if c.use_labels else 0
+    c.use_labels = opts.cond and has_labels
+    c.label_dim = label_dim if c.use_labels else 0
     c.cfg_scale = opts.cfg_scale
     
     # Update model with label_dim if using conditional training
@@ -343,7 +362,7 @@ def main(**kwargs):
         print(f"  Label dropout probability: {opts.label_drop}")
         print(f"  CFG scale for snapshots: {opts.cfg_scale}")
     
-    if opts.cond and not c.training_set_kwargs.has_labels:
+    if opts.cond and not has_labels:
         print("Warning: --cond specified but dataset has no labels. Training unconditionally.")
 
     # Hyperparameters & settings
