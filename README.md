@@ -72,7 +72,22 @@ torchrun --nnodes=2 --nproc_per_node=4 \
 
 ### SLURM Cluster
 
-For SLURM-managed clusters:
+For SLURM-managed clusters, use the provided sbatch scripts:
+
+```bash
+# H200 (4 GPUs)
+sbatch sbatch/h200/train_4gpu_256x256.sbatch
+
+# A100 (2 GPUs)
+sbatch sbatch/a100/train_2gpu_256x256.sbatch
+
+# List all available scripts
+./sbatch/list_scripts.sh
+```
+
+See `sbatch/README.md` for detailed documentation and customization options.
+
+Manual SLURM launch:
 
 ```bash
 # The script automatically detects SLURM environment variables
