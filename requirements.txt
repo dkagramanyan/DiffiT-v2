@@ -9,6 +9,7 @@ click>=8.0.0
 psutil>=5.9.0
 tqdm>=4.64.0
 scipy>=1.10.0
+imageio>=2.25.0
 
 # Diffusion schedulers (recommended for better performance)
 diffusers>=0.21.0

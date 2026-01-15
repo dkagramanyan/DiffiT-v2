@@ -203,13 +203,24 @@ def launch_training(c: dnnlib.EasyDict, desc: str, outdir: str, dry_run: bool):
                 torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir), nprocs=c.num_gpus)
 
 
-def init_dataset_kwargs(data: str, resolution: int | None = None):
-    """Initialize dataset configuration."""
+def init_dataset_kwargs(data: str, resolution: int | None = None, use_labels: bool = False):
+    """Initialize dataset configuration.
+    
+    Supports datasets created with dataset_tool.py:
+    - Folder with PNG images in subdirectories (00000/img00000000.png)
+    - ZIP archive with same structure
+    - Optional dataset.json with class labels
+    
+    Args:
+        data: Path to dataset folder or ZIP file.
+        resolution: Expected image resolution (optional).
+        use_labels: Whether to load class labels from dataset.json.
+    """
     try:
         dataset_kwargs = dnnlib.EasyDict(
             class_name="training.dataset.ImageFolderDataset",
             path=data,
-            use_labels=False,
+            use_labels=use_labels,
             max_size=None,
             xflip=False,
             resolution=resolution,
@@ -217,6 +228,8 @@ def init_dataset_kwargs(data: str, resolution: int | None = None):
         dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)
         dataset_kwargs.resolution = dataset_obj.resolution
         dataset_kwargs.max_size = len(dataset_obj)
+        dataset_kwargs.has_labels = dataset_obj.has_labels
+        dataset_kwargs.label_dim = dataset_obj.label_dim if dataset_obj.has_labels else 0
         return dataset_kwargs, dataset_obj.name
     except IOError as err:
         raise click.ClickException(f"--data: {err}")
@@ -246,6 +259,7 @@ def parse_comma_separated_list(s):
 @click.option("--num-blocks", help="Number of transformer blocks", metavar="INT", type=click.IntRange(min=1), default=1)
 # Optional features
 @click.option("--mirror", help="Enable dataset x-flips", metavar="BOOL", type=bool, default=False, show_default=True)
+@click.option("--cond", help="Enable class-conditional training (requires dataset.json with labels)", metavar="BOOL", type=bool, default=False, show_default=True)
 @click.option("--resume", help="Resume from given network pickle", metavar="[PATH|URL]", type=str)
 # Training parameters
 @click.option("--lr", help="Learning rate", metavar="FLOAT", type=click.FloatRange(min=0), default=1e-4, show_default=True)
@@ -304,9 +318,20 @@ def main(**kwargs):
     # Data loader configuration
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2, persistent_workers=True)
 
-    # Training set
-    c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data, resolution=opts.resolution)
+    # Training set (supports datasets from dataset_tool.py)
+    c.training_set_kwargs, dataset_name = init_dataset_kwargs(
+        data=opts.data, 
+        resolution=opts.resolution, 
+        use_labels=opts.cond
+    )
     c.training_set_kwargs.xflip = opts.mirror
+    
+    # Class-conditional settings
+    c.use_labels = opts.cond and c.training_set_kwargs.has_labels
+    c.label_dim = c.training_set_kwargs.label_dim if c.use_labels else 0
+    
+    if opts.cond and not c.training_set_kwargs.has_labels:
+        print("Warning: --cond specified but dataset has no labels. Training unconditionally.")
 
     # Hyperparameters & settings
     # Note: num_gpus and batch_size may be overridden by launch_training for torchrun

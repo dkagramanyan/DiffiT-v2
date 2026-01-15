@@ -216,13 +216,69 @@ DiffiT Transformer Block (Paper Eq. 7-8):
 
 ## Dataset Format
 
+DiffiT supports datasets in the StyleGAN/SAN format, which can be created using `dataset_tool.py`.
+
+### Preparing a Dataset
+
+Use `dataset_tool.py` to convert your images to the required format:
+
+```bash
+# From a folder of images (creates a ZIP archive)
+python dataset_tool.py --source=/path/to/images --dest=./dataset.zip \
+    --transform=center-crop --resolution=64x64
+
+# From ImageNet or other datasets
+python dataset_tool.py --source=/path/to/imagenet/train --dest=./imagenet64.zip \
+    --transform=center-crop --resolution=64x64
+
+# Keep as folder (useful for debugging)
+python dataset_tool.py --source=/path/to/images --dest=./dataset/ \
+    --transform=center-crop --resolution=256x256
 ```
-dataset/
-├── img_001.png
-├── img_002.png
-├── ...
-└── dataset.json  # Optional: {"labels": [["img_001.png", 0], ...]}
+
+### Dataset Structure
+
+The tool creates datasets in this format:
+
 ```
+dataset.zip (or folder)
+├── 00000/
+│   ├── img00000000.png
+│   ├── img00000001.png
+│   └── ...
+├── 00001/
+│   └── ...
+└── dataset.json  # Optional class labels
+```
+
+The `dataset.json` contains class labels in this format:
+```json
+{
+  "labels": [
+    ["00000/img00000000.png", 6],
+    ["00000/img00000001.png", 3],
+    ...
+  ]
+}
+```
+
+### Training with Your Dataset
+
+```bash
+# Unconditional training
+torchrun --nproc_per_node=4 train.py \
+    --outdir=./runs --data=./dataset.zip --batch-gpu=32 --resolution=64
+
+# Class-conditional training (if dataset has labels)
+torchrun --nproc_per_node=4 train.py \
+    --outdir=./runs --data=./imagenet64.zip --batch-gpu=32 --resolution=64 --cond
+```
+
+### Requirements
+
+- Images must be square (NxN)
+- Resolution must be a power of 2 (32, 64, 128, 256, etc.)
+- Supports RGB (3-channel) and grayscale (1-channel) images
 
 ## License
 

@@ -1,5 +1,13 @@
 # Copyright (c) 2024, DiffiT authors.
 # Streaming images and labels from datasets.
+#
+# Supports datasets created with dataset_tool.py:
+# - Folder or ZIP archive with PNG images
+# - Images in subdirectories (00000/img00000000.png)
+# - Optional dataset.json with class labels
+#
+# Label format in dataset.json:
+# {"labels": [["00000/img00000000.png", class_id], ...]}
 
 from __future__ import annotations
 
@@ -230,15 +238,51 @@ class ImageFolderDataset(Dataset):
         return image
 
     def _load_raw_labels(self) -> np.ndarray | None:
+        """Load class labels from dataset.json.
+        
+        Expected format (from dataset_tool.py):
+        {"labels": [["00000/img00000000.png", 6], ["00000/img00000001.png", 3], ...]}
+        
+        Labels can be:
+        - Integer class IDs (e.g., 0-999 for ImageNet)
+        - Float vectors (for embeddings)
+        """
         fname = "dataset.json"
         if fname not in self._all_fnames:
             return None
+        
         with self._open_file(fname) as f:
-            labels = json.load(f)["labels"]
-        if labels is None:
+            data = json.load(f)
+        
+        labels_list = data.get("labels", None)
+        if labels_list is None:
             return None
-        labels = dict(labels)
-        labels = [labels[fname.replace("\\", "/")] for fname in self._image_fnames]
-        labels = np.array(labels)
-        labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
+        
+        # Convert list of [filename, label] to dict
+        labels_dict = {item[0].replace("\\", "/"): item[1] for item in labels_list}
+        
+        # Get labels in the same order as image files
+        ordered_labels = []
+        for img_fname in self._image_fnames:
+            # Normalize path separators for matching
+            normalized_fname = img_fname.replace("\\", "/")
+            if normalized_fname in labels_dict:
+                ordered_labels.append(labels_dict[normalized_fname])
+            else:
+                # Try without leading directory
+                alt_fname = normalized_fname.lstrip("./")
+                if alt_fname in labels_dict:
+                    ordered_labels.append(labels_dict[alt_fname])
+                else:
+                    # Label not found, return None to indicate incomplete labels
+                    return None
+        
+        labels = np.array(ordered_labels)
+        
+        # Convert to appropriate dtype
+        if labels.ndim == 1:
+            labels = labels.astype(np.int64)  # Integer class labels
+        else:
+            labels = labels.astype(np.float32)  # Float embeddings
+        
         return labels
