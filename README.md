@@ -104,6 +104,10 @@ python train.py \
 | `--kimg` | Training duration (kimg) | 25000 |
 | `--fp32` | Disable mixed precision | False |
 | `--resume` | Resume from checkpoint | None |
+| `--metrics` | Quality metrics to compute | fid10k_full |
+| `--metrics-ticks` | How often to evaluate metrics (ticks) | None (end only) |
+| `--fid-samples` | Number of samples for FID | 10000 |
+| `--fid-steps` | DDIM steps for FID sampling | 50 |
 
 ## Generation
 
@@ -130,6 +134,48 @@ python gen_images.py \
     --seeds=0-15 \
     --ddpm
 ```
+
+## Metrics and Monitoring
+
+### TensorBoard
+
+Training automatically logs to TensorBoard:
+
+```bash
+tensorboard --logdir=./training-runs
+```
+
+Logged metrics include:
+- **Loss/train**: Training loss (MSE between predicted and actual noise)
+- **Loss/grad_norm**: Gradient norm (for monitoring training stability)
+- **Progress/kimg**: Training progress in thousands of images
+- **Metrics/fid***: FID scores when evaluated
+- **Metrics/best_fid**: Best FID achieved so far
+- **Timing/***: Training speed statistics
+- **Resources/***: CPU/GPU memory usage
+
+### FID Evaluation
+
+FID (Frechet Inception Distance) measures the quality of generated images:
+
+```bash
+# Evaluate FID every 10 ticks during training
+python train.py --outdir=./runs --data=./data --batch-gpu=32 \
+    --metrics=fid10k_full --metrics-ticks=10
+
+# Use faster FID variants for validation
+python train.py ... --metrics=fid5k  # 5k samples (faster)
+python train.py ... --metrics=fid2k  # 2k samples (very fast)
+```
+
+Available metrics:
+- `fid50k_full`: 50k samples vs full dataset (paper standard)
+- `fid10k_full`: 10k samples vs full dataset (default)
+- `fid5k`: 5k samples (fast validation)
+- `fid2k`: 2k samples (quick check)
+- `fid1k`: 1k samples (very quick)
+
+The best model (lowest FID) is automatically saved to `best_model.pkl`.
 
 ## Model Architecture
 

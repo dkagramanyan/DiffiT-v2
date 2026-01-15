@@ -261,6 +261,11 @@ def parse_comma_separated_list(s):
 @click.option("--workers", help="DataLoader worker processes", metavar="INT", type=click.IntRange(min=1), default=4, show_default=True)
 @click.option("-n", "--dry-run", help="Print training options and exit", is_flag=True)
 @click.option("--restart_every", help="Time interval in seconds to restart code", metavar="INT", type=int, default=999999999, show_default=True)
+# Metrics options
+@click.option("--metrics", help="Quality metrics to compute", metavar="[NAME|NONE,...]", type=parse_comma_separated_list, default="fid10k_full", show_default=True)
+@click.option("--metrics-ticks", help="How often to evaluate metrics (in ticks, None=only at end)", metavar="INT", type=int, default=None)
+@click.option("--fid-samples", help="Number of samples for FID computation", metavar="INT", type=click.IntRange(min=100), default=10000, show_default=True)
+@click.option("--fid-steps", help="DDIM steps for FID sampling", metavar="INT", type=click.IntRange(min=1), default=50, show_default=True)
 def main(**kwargs):
     """Train a DiffiT diffusion model.
     
@@ -317,6 +322,12 @@ def main(**kwargs):
     c.ema_kimg = opts.ema_kimg
     c.cudnn_benchmark = not opts.nobench
     c.fp32 = opts.fp32
+    
+    # Metrics configuration
+    c.metrics = opts.metrics if opts.metrics else []
+    c.metrics_ticks = opts.metrics_ticks
+    c.fid_num_samples = opts.fid_samples
+    c.fid_inference_steps = opts.fid_steps
 
     # Resume
     if opts.resume is not None:

@@ -5,6 +5,7 @@
 #   L = E[λ(t) * ||ε - ε_θ(z_0 + σ_t * ε, t)||^2]
 #
 # Multi-GPU training uses DistributedDataParallel for efficient gradient sync.
+# Includes TensorBoard logging and FID evaluation.
 
 from __future__ import annotations
 
@@ -27,6 +28,7 @@ import dnnlib
 from torch_utils import misc
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
+from metrics import metric_main
 
 
 def setup_snapshot_image_grid(training_set, random_seed: int = 0, gw: int | None = None, gh: int | None = None):
@@ -106,6 +108,11 @@ def training_loop(
     abort_fn=None,
     progress_fn=None,
     restart_every: int = -1,
+    # Metrics parameters
+    metrics: list = [],
+    metrics_ticks: int | None = None,
+    fid_num_samples: int = 10000,
+    fid_inference_steps: int = 50,
 ):
     """Main training loop for DiffiT diffusion model."""
     start_time = time.time()
@@ -220,18 +227,48 @@ def training_loop(
         initial_samples = generate_snapshot_images(diffusion_ema, grid_size, device, batch_gpu)
         save_image_grid(initial_samples, os.path.join(run_dir, "fakes_init.png"), drange=[0, 1], grid_size=grid_size)
 
-    # Initialize logs
+    # Initialize logs and TensorBoard
     stage("Initializing logs")
     stats_collector = training_stats.Collector(regex=".*")
     stats_jsonl = None
     stats_tfevents = None
+    stats_metrics = dict()  # Store metric results for logging
+    best_fid = float('inf')  # Track best FID score
+    
     if rank == 0:
         stats_jsonl = open(os.path.join(run_dir, "stats.jsonl"), "wt")
         try:
             import torch.utils.tensorboard as tensorboard
             stats_tfevents = tensorboard.SummaryWriter(run_dir)
+            
+            # Log training hyperparameters to TensorBoard
+            hparams = {
+                'batch_size': batch_size,
+                'batch_gpu': batch_gpu,
+                'learning_rate': opt_kwargs.get('lr', 0),
+                'total_kimg': total_kimg,
+                'ema_kimg': ema_kimg,
+                'num_gpus': num_gpus,
+                'resolution': training_set.image_shape[1],
+                'base_dim': model_kwargs.get('base_dim', 0),
+                'hidden_dim': model_kwargs.get('hidden_dim', 0),
+                'num_heads': model_kwargs.get('num_heads', 0),
+                'timesteps': diffusion_kwargs.get('n_times', 1000),
+                'fp32': fp32,
+            }
+            # Log hyperparameters as text
+            hparams_text = '\n'.join([f'{k}: {v}' for k, v in hparams.items()])
+            stats_tfevents.add_text('Hyperparameters', hparams_text, global_step=0)
+            
+            # Log model architecture info
+            num_params = sum(p.numel() for p in base_model.parameters())
+            num_trainable = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
+            stats_tfevents.add_text('Model/info', 
+                f'Total parameters: {num_params:,}\nTrainable: {num_trainable:,}', 
+                global_step=0)
+            
         except ImportError as err:
-            print("Skipping tfevents export:", err)
+            print("Skipping TensorBoard export:", err)
 
     # Train
     stage(f"Training start (total_kimg={total_kimg}, batch_size={batch_size}, batch_gpu={batch_gpu})")
@@ -371,16 +408,66 @@ def training_loop(
             snapshot_data = dict(model=base_model, model_ema=model_ema, training_set_kwargs=dict(training_set_kwargs))
 
         # Save checkpoint
+        snapshot_pkl_path = None
         if (rank == 0) and (restart_every > 0) and (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
-            snapshot_pkl = misc.get_ckpt_path(run_dir)
-            stage(f'Saving checkpoint "{snapshot_pkl}"')
+            snapshot_pkl_path = misc.get_ckpt_path(run_dir)
+            stage(f'Saving checkpoint "{snapshot_pkl_path}"')
             snapshot_data["progress"] = {
                 "cur_nimg": torch.tensor(cur_nimg, dtype=torch.long),
                 "cur_tick": torch.tensor(cur_tick, dtype=torch.long),
                 "batch_idx": torch.tensor(batch_idx, dtype=torch.long),
+                "best_fid": best_fid,
             }
-            with open(snapshot_pkl, "wb") as f:
+            with open(snapshot_pkl_path, "wb") as f:
                 pickle.dump(snapshot_data, f)
+
+        # Evaluate metrics (FID, etc.)
+        should_eval_metrics = (
+            (len(metrics) > 0) and 
+            (snapshot_data is not None) and
+            (metrics_ticks is None or cur_tick % metrics_ticks == 0 or done)
+        )
+        
+        if should_eval_metrics:
+            stage(f'Evaluating metrics (kimg={cur_nimg/1e3:.1f})')
+            for metric in metrics:
+                try:
+                    result_dict = metric_main.calc_metric(
+                        metric=metric,
+                        diffusion=diffusion_ema,
+                        model=model_ema,
+                        dataset_kwargs=training_set_kwargs,
+                        num_gpus=num_gpus,
+                        rank=rank,
+                        device=device,
+                        batch_size=batch_gpu,
+                        num_inference_steps=fid_inference_steps,
+                    )
+                    if rank == 0:
+                        metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl_path)
+                    stats_metrics.update(result_dict.results)
+                    
+                    # Track best FID and save best model
+                    for key, value in result_dict.results.items():
+                        if 'fid' in key.lower() and value < best_fid:
+                            best_fid = value
+                            if rank == 0:
+                                best_pkl = os.path.join(run_dir, 'best_model.pkl')
+                                stage(f'New best FID: {best_fid:.2f}, saving to {best_pkl}')
+                                with open(best_pkl, 'wb') as f:
+                                    pickle.dump(dict(
+                                        model=base_model,
+                                        model_ema=model_ema,
+                                        training_set_kwargs=dict(training_set_kwargs),
+                                        best_fid=best_fid,
+                                        cur_nimg=cur_nimg,
+                                    ), f)
+                                # Also save the current nimg for reference
+                                with open(os.path.join(run_dir, 'best_nimg.txt'), 'w') as f:
+                                    f.write(f'{cur_nimg}\n')
+                except Exception as e:
+                    if rank == 0:
+                        print(f'Warning: Failed to compute metric {metric}: {e}')
 
         del snapshot_data
 
@@ -388,17 +475,27 @@ def training_loop(
         stats_collector.update()
         stats_dict = stats_collector.as_dict()
 
-        # Update logs
+        # Update logs with training stats and metrics
         timestamp = time.time()
         if stats_jsonl is not None:
             fields = dict(stats_dict, timestamp=timestamp)
+            # Add metrics to jsonl
+            for name, value in stats_metrics.items():
+                fields[f'Metrics/{name}'] = value
             stats_jsonl.write(json.dumps(fields) + "\n")
             stats_jsonl.flush()
         if stats_tfevents is not None:
             global_step = int(cur_nimg / 1e3)
             walltime = timestamp - start_time
+            # Log training statistics
             for name, value in stats_dict.items():
                 stats_tfevents.add_scalar(name, value.mean, global_step=global_step, walltime=walltime)
+            # Log metrics (FID, etc.)
+            for name, value in stats_metrics.items():
+                stats_tfevents.add_scalar(f'Metrics/{name}', value, global_step=global_step, walltime=walltime)
+            # Log best FID
+            if best_fid < float('inf'):
+                stats_tfevents.add_scalar('Metrics/best_fid', best_fid, global_step=global_step, walltime=walltime)
             stats_tfevents.flush()
         if progress_fn is not None:
             progress_fn(cur_nimg // 1000, total_kimg)

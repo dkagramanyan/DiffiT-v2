@@ -8,15 +8,16 @@ Pillow>=9.0.0
 click>=8.0.0
 psutil>=5.9.0
 tqdm>=4.64.0
+scipy>=1.10.0
 
 # Diffusion schedulers (recommended for better performance)
 diffusers>=0.21.0
 
+# TensorBoard logging (recommended)
+tensorboard>=2.10.0
+
 # Optional: faster PNG loading
 # pyspng>=0.1.0
-
-# Optional: TensorBoard logging
-# tensorboard>=2.10.0
 
 # Optional: Weights & Biases logging
 # wandb>=0.13.0
