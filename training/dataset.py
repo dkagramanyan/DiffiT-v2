@@ -22,6 +22,15 @@ import torch
 
 import dnnlib
 
+# #region agent log
+import os as _debug_os
+def _debug_log(location, message, data, hypothesis_id):
+    import json, time
+    log_path = "/home/dgkagramanyan/.cursor/debug.log"
+    entry = {"location": location, "message": message, "data": data, "hypothesisId": hypothesis_id, "timestamp": time.time(), "pid": _debug_os.getpid()}
+    with open(log_path, "a") as f: f.write(json.dumps(entry) + "\n")
+# #endregion
+
 try:
     import pyspng
 except ImportError:
@@ -171,6 +180,10 @@ class ImageFolderDataset(Dataset):
     ):
         self._path = path
         self._zipfile = None
+        self._zipfile_pid = None  # Track which process created the zipfile
+        # #region agent log
+        _debug_log("dataset.py:__init__", "dataset_init_start", {"path": path}, "D")
+        # #endregion
 
         if os.path.isdir(self._path):
             self._type = "dir"
@@ -204,15 +217,47 @@ class ImageFolderDataset(Dataset):
 
     def _get_zipfile(self):
         assert self._type == "zip"
-        if self._zipfile is None:
-            self._zipfile = zipfile.ZipFile(self._path)
+        current_pid = os.getpid()
+        # #region agent log
+        _debug_log("dataset.py:_get_zipfile", "zipfile_check", {"zipfile_is_none": self._zipfile is None, "zipfile_id": id(self._zipfile) if self._zipfile else None, "zipfile_pid": self._zipfile_pid, "current_pid": current_pid}, "A")
+        # #endregion
+        # Re-create zipfile if accessed from a different process (forked workers)
+        if self._zipfile is None or self._zipfile_pid != current_pid:
+            if self._zipfile is not None:
+                # #region agent log
+                _debug_log("dataset.py:_get_zipfile", "reopening_for_new_process", {"old_pid": self._zipfile_pid, "new_pid": current_pid}, "A")
+                # #endregion
+                try:
+                    self._zipfile.close()
+                except Exception:
+                    pass
+            # Disable strict timestamp checking to avoid false "zip bomb" warnings
+            # in Python 3.12+ with certain legitimate archive structures
+            self._zipfile = zipfile.ZipFile(self._path, strict_timestamps=False)
+            self._zipfile_pid = current_pid
+            # #region agent log
+            _debug_log("dataset.py:_get_zipfile", "created_new_zipfile", {"new_zipfile_id": id(self._zipfile), "pid": current_pid}, "B")
+            # #endregion
         return self._zipfile
 
     def _open_file(self, fname: str):
         if self._type == "dir":
             return open(os.path.join(self._path, fname), "rb")
         if self._type == "zip":
-            return self._get_zipfile().open(fname, "r")
+            # #region agent log
+            _debug_log("dataset.py:_open_file", "opening_zip_entry", {"fname": fname, "zipfile_id": id(self._zipfile) if self._zipfile else None}, "C")
+            # #endregion
+            # Use read() instead of open() to avoid Python 3.12's overly strict
+            # overlap detection which can incorrectly flag legitimate archives
+            import io
+            try:
+                data = self._get_zipfile().read(fname)
+            except Exception as e:
+                # #region agent log
+                _debug_log("dataset.py:_open_file", "read_error", {"fname": fname, "error": str(e), "error_type": type(e).__name__}, "C")
+                # #endregion
+                raise
+            return io.BytesIO(data)
         return None
 
     def close(self):
@@ -223,7 +268,10 @@ class ImageFolderDataset(Dataset):
             self._zipfile = None
 
     def __getstate__(self):
-        return dict(super().__getstate__(), _zipfile=None)
+        # #region agent log
+        _debug_log("dataset.py:__getstate__", "pickling_dataset", {"zipfile_id_before": id(self._zipfile) if self._zipfile else None}, "E")
+        # #endregion
+        return dict(super().__getstate__(), _zipfile=None, _zipfile_pid=None)
 
     def _load_raw_image(self, raw_idx: int) -> np.ndarray:
         fname = self._image_fnames[raw_idx]

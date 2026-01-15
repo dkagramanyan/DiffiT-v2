@@ -333,6 +333,7 @@ def main(**kwargs):
     # Diffusion configuration (variance-exploding as per paper Sec. 3.1)
     c.diffusion_kwargs = dnnlib.EasyDict(
         class_name="diffusion.diffusion.Diffusion",
+        image_resolution=[3, opts.resolution, opts.resolution],
         n_times=opts.timesteps,
     )
 

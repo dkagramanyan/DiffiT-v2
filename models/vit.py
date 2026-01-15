@@ -24,15 +24,6 @@ class PatchEmbed(nn.Module):
         B, C, H, W = x.shape
         P = self.patch_size
 
-        # #region agent log - H14, H15: Log patch embed input shape and expected reshape
-        import json
-        log_entry = {"sessionId":"debug-session","runId":"post-fix-3","hypothesisId":"H14_H15","location":"vit.py:28","message":"PatchEmbed forward","data":{"input_shape":[B,C,H,W],"num_patches":num_patches,"patch_size":P,"target_shape":[B,C,num_patches,P,num_patches,P],"input_size":B*C*H*W,"expected_size":B*C*num_patches*P*num_patches*P},"timestamp":int(__import__('time').time()*1000)}
-        try:
-            with open('/home/dgkagramanyan/.cursor/debug.log', 'a') as f:
-                f.write(json.dumps(log_entry) + '\n')
-        except: pass
-        # #endregion
-
         # Patchify: (B, C, H, W) -> (B, num_patches^2, C*P*P)
         x = x.reshape(B, C, num_patches, P, num_patches, P)
         x = x.permute(0, 2, 4, 1, 3, 5).reshape(B, num_patches * num_patches, C * P * P)
@@ -76,11 +67,9 @@ class VisionTransformer(nn.Module):
     ) -> None:
         super().__init__()
         self.num_patches = num_patches
-        self.expected_image_dimension = image_dimension  # Store for debugging
 
         assert image_dimension % num_patches == 0, f"Image dim {image_dimension} not divisible by {num_patches}"
         patch_size = image_dimension // num_patches
-        self.patch_size = patch_size  # Store for debugging
 
         # Patch embedding
         self.patch_embed = PatchEmbed(dim_in, hidden_dim, patch_size)
@@ -106,15 +95,6 @@ class VisionTransformer(nn.Module):
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-
-        # #region agent log - H15: Log VisionTransformer forward input
-        import json
-        log_entry = {"sessionId":"debug-session","runId":"post-fix-3","hypothesisId":"H15","location":"vit.py:100","message":"VisionTransformer forward","data":{"input_shape":[B,C,H,W],"expected_dim":self.expected_image_dimension,"actual_dim":H,"num_patches":self.num_patches,"patch_size":self.patch_size},"timestamp":int(__import__('time').time()*1000)}
-        try:
-            with open('/home/dgkagramanyan/.cursor/debug.log', 'a') as f:
-                f.write(json.dumps(log_entry) + '\n')
-        except: pass
-        # #endregion
 
         # Embed patches
         tokens = self.patch_embed(x, self.num_patches)

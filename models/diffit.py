@@ -264,27 +264,9 @@ class DiffiT(nn.Module):
         # Downsampling
         block_idx = 0
         for i, downsample in enumerate(self.down_samples):
-            # #region agent log - H14, H15, H16: Log shapes in downsampling path
-            import json
-            log_entry_pre = {"sessionId":"debug-session","runId":"post-fix-3","hypothesisId":"H14_H15_H16","location":"diffit.py:267","message":"Before ResBlocks at downsample level","data":{"level":i,"block_idx":block_idx,"h_shape":list(h.shape)},"timestamp":int(__import__('time').time()*1000)}
-            try:
-                with open('/home/dgkagramanyan/.cursor/debug.log', 'a') as f:
-                    f.write(json.dumps(log_entry_pre) + '\n')
-            except: pass
-            # #endregion
-            
             for _ in range(len(self.down_blocks) // len(self.down_samples)):
                 h = self.down_blocks[block_idx](h, cond_emb)
                 block_idx += 1
-            
-            # #region agent log - H14, H15, H16: Log shape after ResBlocks, before downsample
-            log_entry_post = {"sessionId":"debug-session","runId":"post-fix-3","hypothesisId":"H14_H15_H16","location":"diffit.py:271","message":"After ResBlocks, before downsample","data":{"level":i,"h_shape":list(h.shape)},"timestamp":int(__import__('time').time()*1000)}
-            try:
-                with open('/home/dgkagramanyan/.cursor/debug.log', 'a') as f:
-                    f.write(json.dumps(log_entry_post) + '\n')
-            except: pass
-            # #endregion
-            
             skips.append(h)
             h = downsample(h)
 
