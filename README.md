@@ -6,6 +6,7 @@ A PyTorch implementation of DiffiT - a U-Net style diffusion model with Vision T
 
 - **Time-Dependent Multi-Head Self-Attention (TDMHSA)**: Attention mechanism that incorporates diffusion timestep information
 - **Vision Transformer Blocks**: Process image patches with time-conditioned attention
+- **Class-Conditional Generation**: Support for class labels with Classifier-Free Guidance (CFG)
 - **Efficient Sampling**: Uses `diffusers` schedulers for DDPM and DDIM sampling
 - **Multi-GPU Training**: Distributed training support with gradient accumulation
 - **Mixed Precision**: FP16/BF16 training for faster training
@@ -15,20 +16,26 @@ A PyTorch implementation of DiffiT - a U-Net style diffusion model with Vision T
 ```
 DiffiT-v2/
 ├── train.py                    # Main training entry point
-├── gen_images.py               # Image generation script
+├── generate.py                 # Image generation script with CFG support
+├── dataset_tool.py             # Dataset preparation tool
 ├── requirements.txt            # Python dependencies
 │
 ├── models/                     # Model architectures
-│   ├── diffit.py               # Main DiffiT U-Net model
+│   ├── diffit.py               # Main DiffiT U-Net model (supports class conditioning)
 │   ├── attention.py            # TDMHSA and transformer blocks
 │   └── vit.py                  # Vision Transformer components
 │
 ├── diffusion/                  # Diffusion process
-│   └── diffusion.py            # DDPM/DDIM using diffusers
+│   └── diffusion.py            # DDPM/DDIM with CFG support
 │
 ├── training/                   # Training utilities
 │   ├── training_loop.py        # Main training loop
 │   └── dataset.py              # Dataset loaders
+│
+├── metrics/                    # Evaluation metrics
+│   ├── metric_main.py          # Main metric interface
+│   ├── metric_utils.py         # Utilities for metric computation
+│   └── frechet_inception_distance.py  # FID implementation
 │
 ├── torch_utils/                # PyTorch utilities
 └── dnnlib/                     # Deep learning utilities
@@ -104,6 +111,9 @@ python train.py \
 | `--kimg` | Training duration (kimg) | 25000 |
 | `--fp32` | Disable mixed precision | False |
 | `--resume` | Resume from checkpoint | None |
+| `--cond` | Enable class-conditional training | False |
+| `--label-drop` | Label dropout probability for CFG | 0.1 |
+| `--cfg-scale` | CFG scale for snapshot generation | 1.5 |
 | `--metrics` | Quality metrics to compute | fid10k_full |
 | `--metrics-ticks` | How often to evaluate metrics (ticks) | None (end only) |
 | `--fid-samples` | Number of samples for FID | 10000 |
@@ -111,29 +121,78 @@ python train.py \
 
 ## Generation
 
-Generate images using a trained model:
+Generate images using a trained model.
+
+### Unconditional Generation
 
 ```bash
 # Generate 64 images with DDIM (fast, ~50 steps)
-python gen_images.py \
-    --network=training-runs/00000-diffit/network-snapshot.pkl \
+python generate.py \
+    --network=training-runs/00000-diffit/best_model.pkl \
     --outdir=./generated \
     --seeds=0-63
 
-# Generate a grid
-python gen_images.py \
+# Generate as a grid
+python generate.py \
     --network=model.pkl \
     --outdir=./generated \
     --seeds=0-63 \
-    --grid=8x8
+    --grid
+```
 
-# Use DDPM sampling (slower, higher quality)
-python gen_images.py \
+### Conditional Generation (Class-Conditional with CFG)
+
+For models trained with `--cond`, you can generate images conditioned on class labels:
+
+```bash
+# Generate images of a specific class (e.g., class 207 = "golden retriever" in ImageNet)
+python generate.py \
     --network=model.pkl \
     --outdir=./generated \
-    --seeds=0-15 \
-    --ddpm
+    --class=207 \
+    --cfg-scale=2.0 \
+    --seeds=0-15
+
+# Generate a grid showing all classes
+python generate.py \
+    --network=model.pkl \
+    --outdir=./generated \
+    --class-grid \
+    --cfg-scale=1.5
+
+# Generate multiple samples per class
+python generate.py \
+    --network=model.pkl \
+    --outdir=./generated \
+    --class-grid \
+    --samples-per-class=4 \
+    --cfg-scale=1.5
 ```
+
+### CFG Scale Guidelines
+
+The CFG (Classifier-Free Guidance) scale controls the trade-off between sample quality and diversity:
+
+| CFG Scale | Effect |
+|-----------|--------|
+| 1.0 | No guidance (unconditional) |
+| 1.5 | Mild guidance (recommended starting point) |
+| 2.0-3.0 | Strong guidance (higher quality, less diversity) |
+| 4.0+ | Very strong guidance (may cause artifacts) |
+
+### Generation Arguments
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--network` | Path to model pickle | Required |
+| `--outdir` | Output directory | Required |
+| `--seeds` | Random seeds (e.g., 0-31) | 0-15 |
+| `--steps` | DDIM sampling steps | 50 |
+| `--class` | Class label for conditional generation | None |
+| `--cfg-scale` | Classifier-free guidance scale | 1.5 |
+| `--class-grid` | Generate grid with all classes | False |
+| `--samples-per-class` | Samples per class in grid mode | 1 |
+| `--grid` | Save as grid instead of individual files | False |
 
 ## Metrics and Monitoring
 
@@ -177,6 +236,40 @@ Available metrics:
 
 The best model (lowest FID) is automatically saved to `best_model.pkl`.
 
+## Class-Conditional Training
+
+DiffiT supports class-conditional image generation using the approach from the latent DiffiT paper.
+
+### How It Works
+
+1. **Label Embedding**: Class labels are embedded using a learnable embedding table (similar to word embeddings)
+2. **Conditioning**: Label embeddings are added to time embeddings and used throughout the network
+3. **Classifier-Free Guidance (CFG)**: During training, labels are randomly dropped with probability `--label-drop` (default 0.1), enabling CFG at inference time
+
+### Training
+
+```bash
+# Train class-conditional model on ImageNet
+torchrun --nproc_per_node=4 train.py \
+    --outdir=./runs \
+    --data=./imagenet64.zip \
+    --batch-gpu=32 \
+    --resolution=64 \
+    --cond \
+    --label-drop=0.1 \
+    --cfg-scale=1.5
+```
+
+### Inference with CFG
+
+During generation, CFG combines conditional and unconditional predictions:
+
+```
+ε̂ = ε_uncond + cfg_scale × (ε_cond - ε_uncond)
+```
+
+Higher CFG scale values produce images that better match the class but with less diversity.
+
 ## Model Architecture
 
 DiffiT uses a U-Net architecture with Vision Transformer blocks, as described in the paper:
@@ -209,9 +302,16 @@ DiffiT Transformer Block (Paper Eq. 7-8):
    - Sinusoidal position embeddings for timesteps
    - MLP with Swish activation for projection
 
-3. **Diffusion Process** - Paper Section 3.1:
+3. **Class Conditioning** (based on latent DiffiT approach):
+   - Learnable embedding table for class labels
+   - Combined with time embedding: cond_emb = time_emb + label_emb
+   - Null embedding for unconditional generation (CFG support)
+   - Random label dropout during training (default 10%)
+
+4. **Diffusion Process** - Paper Section 3.1:
    - Training: denoising score matching (Eq. 1)
    - Sampling: SDE/ODE solvers (Eq. 2)
+   - Classifier-free guidance for conditional generation
    - Uses `diffusers` DDPMScheduler/DDIMScheduler when available
 
 ## Dataset Format

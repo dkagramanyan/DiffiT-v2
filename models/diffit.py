@@ -1,5 +1,10 @@
 # Copyright (c) 2024, DiffiT authors.
-# DiffiT model architecture.
+# DiffiT model architecture with class-conditional support.
+#
+# Based on the latent DiffiT approach described in the paper:
+# - Class labels are embedded similarly to time embeddings
+# - Embeddings are combined (time + label) for conditioning
+# - Classifier-free guidance (CFG) is supported via label dropout during training
 
 from __future__ import annotations
 
@@ -40,11 +45,17 @@ class ResBlock(nn.Module):
         )
         self.out_conv = nn.Conv2d(dim_in, dim_out, 1) if dim_in != dim_out else nn.Identity()
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cond_emb: torch.Tensor) -> torch.Tensor:
+        """Forward pass with combined time+label conditioning.
+        
+        Args:
+            x: Input features (B, C, H, W)
+            cond_emb: Combined time + label embedding (B, embed_dim)
+        """
         h = self.norm(x)
         h = self.act(h)
         h = self.conv(h)
-        h = self.transformer(h, t)
+        h = self.transformer(h, cond_emb)
         h = h + x
         h = self.act(h)
         return self.out_conv(h)
@@ -76,6 +87,15 @@ class DiffiT(nn.Module):
     """DiffiT: Diffusion Vision Transformers for Image Generation.
 
     A U-Net architecture with Vision Transformer blocks.
+    Supports class-conditional generation based on the latent DiffiT approach.
+    
+    Class conditioning is implemented by:
+    1. Embedding class labels (one-hot or learned embedding)
+    2. Combining label embedding with time embedding
+    3. Using classifier-free guidance (CFG) during inference
+    
+    During training, labels are randomly dropped (replaced with null embedding)
+    with probability `label_drop_prob` to enable CFG at inference time.
     """
 
     def __init__(
@@ -91,6 +111,9 @@ class DiffiT(nn.Module):
         num_heads: int = 4,
         num_transformer_blocks: int = 1,
         mlp_ratio: int = 4,
+        # Class conditioning parameters
+        label_dim: int = 0,  # Number of classes (0 = unconditional)
+        label_drop_prob: float = 0.1,  # Probability of dropping labels for CFG
         # Unused parameters kept for backward compatibility
         resolutions_list: list[int] | None = None,
         num_resolutions: int = 4,
@@ -105,6 +128,8 @@ class DiffiT(nn.Module):
 
         in_channels = image_shape[0]
         image_size = image_shape[1]
+        self.label_dim = label_dim
+        self.label_drop_prob = label_drop_prob
 
         # Time embedding
         time_embed_dim = base_dim * time_embed_mult
@@ -114,6 +139,18 @@ class DiffiT(nn.Module):
             nn.Linear(time_embed_dim, time_embed_dim),
         )
         self.time_embed_dim_in = base_dim
+        self.time_embed_dim = time_embed_dim
+        
+        # Label embedding (if conditional)
+        if label_dim > 0:
+            # Learnable embedding table for class labels
+            self.label_embed = nn.Embedding(label_dim, time_embed_dim)
+            # Null embedding for unconditional generation (used during CFG)
+            self.null_label_embed = nn.Parameter(torch.zeros(1, time_embed_dim))
+            nn.init.normal_(self.null_label_embed, std=0.02)
+        else:
+            self.label_embed = None
+            self.null_label_embed = None
 
         # Compute channel dimensions per level
         dims = [base_dim * m for m in channel_mults]
@@ -172,10 +209,51 @@ class DiffiT(nn.Module):
         self.act_out = nn.SiLU()
         self.conv_out = nn.Conv2d(dims[0], in_channels, 3, padding=1)
 
-    def forward(self, x: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        timesteps: torch.Tensor, 
+        labels: torch.Tensor | None = None,
+        force_drop_labels: bool = False,
+    ) -> torch.Tensor:
+        """Forward pass with optional class conditioning.
+        
+        Args:
+            x: Input images (B, C, H, W).
+            timesteps: Diffusion timesteps (B,).
+            labels: Class labels as integer indices (B,). None for unconditional.
+            force_drop_labels: If True, always use null embedding (for CFG uncond pass).
+            
+        Returns:
+            Predicted noise (B, C, H, W).
+        """
+        B = x.shape[0]
+        
         # Time embedding
         t_emb = get_timestep_embedding(timesteps, self.time_embed_dim_in)
-        t_emb = self.time_proj(t_emb)
+        t_emb = self.time_proj(t_emb)  # (B, time_embed_dim)
+        
+        # Combine with label embedding if conditional
+        if self.label_embed is not None and labels is not None:
+            if force_drop_labels:
+                # Use null embedding for unconditional branch of CFG
+                label_emb = self.null_label_embed.expand(B, -1)
+            else:
+                # Get label embeddings
+                label_emb = self.label_embed(labels)  # (B, time_embed_dim)
+                
+                # Randomly drop labels during training for CFG
+                if self.training and self.label_drop_prob > 0:
+                    # Create dropout mask
+                    drop_mask = torch.rand(B, device=x.device) < self.label_drop_prob
+                    # Replace dropped labels with null embedding
+                    null_emb = self.null_label_embed.expand(B, -1)
+                    label_emb = torch.where(drop_mask[:, None], null_emb, label_emb)
+            
+            # Combine time and label embeddings (additive, as in DiT/latent DiffiT)
+            cond_emb = t_emb + label_emb
+        else:
+            cond_emb = t_emb
 
         # Input
         h = self.conv_in(x)
@@ -185,14 +263,14 @@ class DiffiT(nn.Module):
         block_idx = 0
         for i, downsample in enumerate(self.down_samples):
             for _ in range(len(self.down_blocks) // len(self.down_samples)):
-                h = self.down_blocks[block_idx](h, t_emb)
+                h = self.down_blocks[block_idx](h, cond_emb)
                 block_idx += 1
             skips.append(h)
             h = downsample(h)
 
         # Bottleneck
-        h = self.mid_block1(h, t_emb)
-        h = self.mid_block2(h, t_emb)
+        h = self.mid_block1(h, cond_emb)
+        h = self.mid_block2(h, cond_emb)
 
         # Upsampling
         block_idx = 0
@@ -203,7 +281,7 @@ class DiffiT(nn.Module):
             h = torch.cat([h, skip], dim=1)
 
             for _ in range(len(self.up_blocks) // len(self.up_samples)):
-                h = self.up_blocks[block_idx](h, t_emb)
+                h = self.up_blocks[block_idx](h, cond_emb)
                 block_idx += 1
 
         # Output

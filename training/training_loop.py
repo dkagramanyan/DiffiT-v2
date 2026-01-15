@@ -68,8 +68,24 @@ def save_image_grid(img, fname, drange, grid_size):
 
 
 @torch.no_grad()
-def generate_snapshot_images(diffusion, grid_size, device, batch_gpu: int):
-    """Generate snapshot images using the diffusion model."""
+def generate_snapshot_images(
+    diffusion, 
+    grid_size, 
+    device, 
+    batch_gpu: int,
+    labels: np.ndarray | None = None,
+    cfg_scale: float = 1.0,
+):
+    """Generate snapshot images using the diffusion model.
+    
+    Args:
+        diffusion: Diffusion model wrapper.
+        grid_size: Tuple (width, height) of the grid.
+        device: Device to generate on.
+        batch_gpu: Batch size per GPU.
+        labels: Optional class labels for each image in the grid.
+        cfg_scale: Classifier-free guidance scale (1.0 = no guidance).
+    """
     gw, gh = grid_size
     n_samples = gw * gh
     all_images = []
@@ -77,7 +93,18 @@ def generate_snapshot_images(diffusion, grid_size, device, batch_gpu: int):
     for start_idx in range(0, n_samples, batch_gpu):
         end_idx = min(start_idx + batch_gpu, n_samples)
         batch_size = end_idx - start_idx
-        images = diffusion.sample(batch_size)
+        
+        # Get labels for this batch if provided
+        batch_labels = None
+        if labels is not None:
+            batch_labels = torch.from_numpy(labels[start_idx:end_idx]).long().to(device)
+        
+        images = diffusion.sample_ddim(
+            batch_size, 
+            labels=batch_labels, 
+            cfg_scale=cfg_scale,
+            num_inference_steps=50,
+        )
         all_images.append(images.cpu().numpy())
 
     return np.concatenate(all_images, axis=0)
@@ -113,6 +140,10 @@ def training_loop(
     metrics_ticks: int | None = None,
     fid_num_samples: int = 10000,
     fid_inference_steps: int = 50,
+    # Class conditioning parameters
+    use_labels: bool = False,
+    label_dim: int = 0,
+    cfg_scale: float = 1.5,  # CFG scale for snapshot generation
 ):
     """Main training loop for DiffiT diffusion model."""
     start_time = time.time()
@@ -150,6 +181,10 @@ def training_loop(
         print()
         print("Num images: ", len(training_set))
         print("Image shape:", training_set.image_shape)
+        print("Use labels: ", use_labels)
+        if use_labels:
+            print("Label dim:  ", label_dim)
+            print("CFG scale:  ", cfg_scale)
         print()
 
     # Construct model
@@ -218,13 +253,27 @@ def training_loop(
     # Export sample images
     grid_size = None
     stage("Exporting sample images")
-    grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
+    grid_size, images, grid_labels = setup_snapshot_image_grid(training_set=training_set)
+    
+    # Prepare labels for snapshot generation
+    snapshot_labels = None
+    if use_labels and grid_labels is not None:
+        if grid_labels.ndim == 2:
+            # One-hot encoded, convert to indices
+            snapshot_labels = np.argmax(grid_labels, axis=1)
+        else:
+            snapshot_labels = grid_labels.astype(np.int64)
+    
     if rank == 0:
         save_image_grid(images, os.path.join(run_dir, "reals.png"), drange=[0, 255], grid_size=grid_size)
 
     # Generate initial samples
     if rank == 0:
-        initial_samples = generate_snapshot_images(diffusion_ema, grid_size, device, batch_gpu)
+        initial_samples = generate_snapshot_images(
+            diffusion_ema, grid_size, device, batch_gpu,
+            labels=snapshot_labels,
+            cfg_scale=cfg_scale if use_labels else 1.0,
+        )
         save_image_grid(initial_samples, os.path.join(run_dir, "fakes_init.png"), drange=[0, 1], grid_size=grid_size)
 
     # Initialize logs and TensorBoard
@@ -255,6 +304,9 @@ def training_loop(
                 'num_heads': model_kwargs.get('num_heads', 0),
                 'timesteps': diffusion_kwargs.get('n_times', 1000),
                 'fp32': fp32,
+                'use_labels': use_labels,
+                'label_dim': label_dim,
+                'cfg_scale': cfg_scale,
             }
             # Log hyperparameters as text
             hparams_text = '\n'.join([f'{k}: {v}' for k, v in hparams.items()])
@@ -295,6 +347,16 @@ def training_loop(
         with torch.autograd.profiler.record_function("data_fetch"):
             batch_images, batch_labels = next(training_set_iterator)
             batch_images = (batch_images.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
+            
+            # Prepare labels if using conditional training
+            if use_labels:
+                # Convert labels to class indices
+                if batch_labels.ndim == 2:
+                    # One-hot encoded, convert to indices
+                    batch_labels = batch_labels.argmax(dim=1)
+                batch_labels = batch_labels.long().to(device).split(batch_gpu)
+            else:
+                batch_labels = [None] * len(batch_images)
 
         # Training step
         # DDP handles gradient sync automatically during backward pass
@@ -303,7 +365,7 @@ def training_loop(
         # Gradient accumulation: split batch and accumulate
         num_accumulation_steps = len(batch_images)
         
-        for accum_idx, real_img in enumerate(batch_images):
+        for accum_idx, (real_img, labels_batch) in enumerate(zip(batch_images, batch_labels)):
             # Scale from [-1, 1] to [0, 1] for diffusion (it will rescale internally)
             real_img_01 = (real_img + 1) / 2
             
@@ -314,7 +376,8 @@ def training_loop(
                 with torch.cuda.amp.autocast(enabled=not fp32):
                     # Forward pass: perturb and predict (paper Eq. 1)
                     # The diffusion uses the model to predict noise ε_θ
-                    _, epsilon, pred_epsilon = diffusion.perturb_and_predict(real_img_01)
+                    # Note: labels are passed for conditional training; model handles dropout internally
+                    _, epsilon, pred_epsilon = diffusion.perturb_and_predict(real_img_01, labels=labels_batch)
                     # MSE loss: ||ε - ε_θ||^2 (paper Eq. 1, with λ(t) = 1)
                     loss = F.mse_loss(epsilon, pred_epsilon)
                     # Scale loss for gradient accumulation
@@ -398,7 +461,11 @@ def training_loop(
         if (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
             stage(f"Saving image snapshot (kimg={cur_nimg/1e3:.1f})")
             if rank == 0:
-                images = generate_snapshot_images(diffusion_ema, grid_size, device, batch_gpu)
+                images = generate_snapshot_images(
+                    diffusion_ema, grid_size, device, batch_gpu,
+                    labels=snapshot_labels,
+                    cfg_scale=cfg_scale if use_labels else 1.0,
+                )
                 save_image_grid(images, os.path.join(run_dir, f"fakes{cur_nimg//1000:06d}.png"), drange=[0, 1], grid_size=grid_size)
 
         # Save network snapshot (save base_model, not the DDP wrapper)

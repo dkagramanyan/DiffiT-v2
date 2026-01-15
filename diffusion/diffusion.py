@@ -114,7 +114,11 @@ class Diffusion:
         sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[timesteps].view(-1, 1, 1, 1)
         return sqrt_alpha * x + sqrt_one_minus_alpha * noise
 
-    def perturb_and_predict(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def perturb_and_predict(
+        self, 
+        x: torch.Tensor, 
+        labels: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Add noise and predict it back (training forward pass).
         
         Implements the training objective from DiffiT paper Eq. 1:
@@ -124,10 +128,11 @@ class Diffusion:
         1. Samples random timesteps t ~ p(t) (uniform)
         2. Samples noise ε ~ N(0, I)
         3. Creates noisy samples: z_t = z_0 + σ_t·ε (in VE) or equivalent VP formulation
-        4. Predicts noise: ε̂ = ε_θ(z_t, t)
+        4. Predicts noise: ε̂ = ε_θ(z_t, t, c) where c is the class label
 
         Args:
             x: Clean images (z_0) in [0, 1] range.
+            labels: Optional class labels (B,) as integer indices.
 
         Returns:
             Tuple of (noisy_images z_t, true_noise ε, predicted_noise ε̂).
@@ -145,29 +150,42 @@ class Diffusion:
         # z_t = √α̅_t · z_0 + √(1-α̅_t) · ε (VP formulation, equivalent to VE after rescaling)
         noisy_x = self.add_noise(x, noise, timesteps)
         
-        # Predict noise: ε̂ = ε_θ(z_t, t)
-        pred_noise = self.model(noisy_x, timesteps)
+        # Predict noise: ε̂ = ε_θ(z_t, t, c)
+        # Note: model handles label dropout internally for CFG training
+        pred_noise = self.model(noisy_x, timesteps, labels=labels)
 
         return noisy_x, noise, pred_noise
 
     @torch.no_grad()
-    def sample(self, n_samples: int, return_intermediates: bool = False) -> torch.Tensor:
-        """Generate samples using DDPM reverse process.
+    def sample(
+        self, 
+        n_samples: int, 
+        labels: torch.Tensor | None = None,
+        cfg_scale: float = 1.0,
+        return_intermediates: bool = False,
+    ) -> torch.Tensor:
+        """Generate samples using DDPM reverse process with optional CFG.
         
         Implements the sampling SDE from DiffiT paper Eq. 2:
             dz = -(σ̇_t + β_t)σ_t·s_θ(z,t)dt + √(2β_t·σ_t)·dω_t
         
         When β_t > 0, this is the stochastic DDPM sampler.
         The score network s_θ relates to ε_θ via: s_θ = -ε_θ/σ_t
+        
+        Classifier-free guidance (CFG) combines conditional and unconditional:
+            ε̂ = ε_uncond + cfg_scale * (ε_cond - ε_uncond)
 
         Args:
             n_samples: Number of samples to generate.
+            labels: Optional class labels (n_samples,) for conditional generation.
+            cfg_scale: Classifier-free guidance scale (1.0 = no guidance).
             return_intermediates: Whether to return intermediate steps.
 
         Returns:
             Generated images in [0, 1] range.
         """
         self.model.eval()
+        use_cfg = labels is not None and cfg_scale != 1.0
 
         x = torch.randn(n_samples, self.img_C, self.img_H, self.img_W, device=self.device)
         intermediates = [x.clone()] if return_intermediates else None
@@ -176,14 +194,29 @@ class Diffusion:
             self.ddpm_scheduler.set_timesteps(self.n_times)
             for t in self.ddpm_scheduler.timesteps:
                 t_batch = t.expand(n_samples).to(self.device)
-                noise_pred = self.model(x, t_batch)
+                
+                if use_cfg:
+                    # Classifier-free guidance: compute both conditional and unconditional
+                    noise_pred_cond = self.model(x, t_batch, labels=labels)
+                    noise_pred_uncond = self.model(x, t_batch, labels=labels, force_drop_labels=True)
+                    noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
+                else:
+                    noise_pred = self.model(x, t_batch, labels=labels)
+                
                 x = self.ddpm_scheduler.step(noise_pred, t, x).prev_sample
                 if return_intermediates:
                     intermediates.append(x.clone())
         else:
             for t in reversed(range(self.n_times)):
                 t_batch = torch.full((n_samples,), t, device=self.device, dtype=torch.long)
-                noise_pred = self.model(x, t_batch)
+                
+                if use_cfg:
+                    # Classifier-free guidance
+                    noise_pred_cond = self.model(x, t_batch, labels=labels)
+                    noise_pred_uncond = self.model(x, t_batch, labels=labels, force_drop_labels=True)
+                    noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
+                else:
+                    noise_pred = self.model(x, t_batch, labels=labels)
 
                 alpha = self.alphas[t]
                 alpha_bar = self.alphas_cumprod[t]
@@ -210,14 +243,26 @@ class Diffusion:
         return x
 
     @torch.no_grad()
-    def sample_ddim(self, n_samples: int, num_inference_steps: int = 50, eta: float = 0.0) -> torch.Tensor:
-        """Generate samples using DDIM (faster sampling).
+    def sample_ddim(
+        self, 
+        n_samples: int, 
+        labels: torch.Tensor | None = None,
+        cfg_scale: float = 1.0,
+        num_inference_steps: int = 50, 
+        eta: float = 0.0,
+    ) -> torch.Tensor:
+        """Generate samples using DDIM (faster sampling) with optional CFG.
         
         When β_t = 0 in paper Eq. 2, the sampling becomes a probability flow ODE
         that can be solved with DDIM. This allows for faster sampling with fewer steps.
+        
+        Classifier-free guidance (CFG) combines conditional and unconditional:
+            ε̂ = ε_uncond + cfg_scale * (ε_cond - ε_uncond)
 
         Args:
             n_samples: Number of samples to generate.
+            labels: Optional class labels (n_samples,) for conditional generation.
+            cfg_scale: Classifier-free guidance scale (1.0 = no guidance).
             num_inference_steps: Number of denoising steps (can be << n_times).
             eta: DDIM eta parameter (0 = deterministic ODE, 1 = stochastic like DDPM).
 
@@ -225,6 +270,7 @@ class Diffusion:
             Generated images in [0, 1] range.
         """
         self.model.eval()
+        use_cfg = labels is not None and cfg_scale != 1.0
 
         x = torch.randn(n_samples, self.img_C, self.img_H, self.img_W, device=self.device)
 
@@ -232,7 +278,15 @@ class Diffusion:
             self.ddim_scheduler.set_timesteps(num_inference_steps)
             for t in self.ddim_scheduler.timesteps:
                 t_batch = t.expand(n_samples).to(self.device)
-                noise_pred = self.model(x, t_batch)
+                
+                if use_cfg:
+                    # Classifier-free guidance
+                    noise_pred_cond = self.model(x, t_batch, labels=labels)
+                    noise_pred_uncond = self.model(x, t_batch, labels=labels, force_drop_labels=True)
+                    noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
+                else:
+                    noise_pred = self.model(x, t_batch, labels=labels)
+                
                 x = self.ddim_scheduler.step(noise_pred, t, x, eta=eta).prev_sample
         else:
             # Simple DDIM without diffusers
@@ -241,7 +295,14 @@ class Diffusion:
 
             for i, t in enumerate(timesteps):
                 t_batch = torch.full((n_samples,), t, device=self.device, dtype=torch.long)
-                noise_pred = self.model(x, t_batch)
+                
+                if use_cfg:
+                    # Classifier-free guidance
+                    noise_pred_cond = self.model(x, t_batch, labels=labels)
+                    noise_pred_uncond = self.model(x, t_batch, labels=labels, force_drop_labels=True)
+                    noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
+                else:
+                    noise_pred = self.model(x, t_batch, labels=labels)
 
                 alpha_bar_t = self.alphas_cumprod[t]
                 alpha_bar_prev = self.alphas_cumprod[timesteps[i + 1]] if i + 1 < len(timesteps) else torch.tensor(1.0, device=self.device)

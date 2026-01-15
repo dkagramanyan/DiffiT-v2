@@ -260,6 +260,8 @@ def parse_comma_separated_list(s):
 # Optional features
 @click.option("--mirror", help="Enable dataset x-flips", metavar="BOOL", type=bool, default=False, show_default=True)
 @click.option("--cond", help="Enable class-conditional training (requires dataset.json with labels)", metavar="BOOL", type=bool, default=False, show_default=True)
+@click.option("--label-drop", help="Probability of dropping labels for CFG training", metavar="FLOAT", type=click.FloatRange(min=0, max=1), default=0.1, show_default=True)
+@click.option("--cfg-scale", help="Classifier-free guidance scale for snapshot generation", metavar="FLOAT", type=click.FloatRange(min=1), default=1.5, show_default=True)
 @click.option("--resume", help="Resume from given network pickle", metavar="[PATH|URL]", type=str)
 # Training parameters
 @click.option("--lr", help="Learning rate", metavar="FLOAT", type=click.FloatRange(min=0), default=1e-4, show_default=True)
@@ -297,6 +299,7 @@ def main(**kwargs):
     c = dnnlib.EasyDict()
 
     # Model configuration (matches DiffiT paper architecture)
+    # Note: label_dim will be set after dataset initialization
     c.model_kwargs = dnnlib.EasyDict(
         class_name="models.diffit.DiffiT",
         image_shape=[3, opts.resolution, opts.resolution],
@@ -304,6 +307,8 @@ def main(**kwargs):
         hidden_dim=opts.hidden_dim,
         num_heads=opts.num_heads,
         num_res_blocks=opts.num_blocks,
+        label_dim=0,  # Will be updated if using labels
+        label_drop_prob=opts.label_drop,
     )
 
     # Diffusion configuration (variance-exploding as per paper Sec. 3.1)
@@ -329,6 +334,14 @@ def main(**kwargs):
     # Class-conditional settings
     c.use_labels = opts.cond and c.training_set_kwargs.has_labels
     c.label_dim = c.training_set_kwargs.label_dim if c.use_labels else 0
+    c.cfg_scale = opts.cfg_scale
+    
+    # Update model with label_dim if using conditional training
+    if c.use_labels:
+        c.model_kwargs.label_dim = c.label_dim
+        print(f"Class-conditional training enabled: {c.label_dim} classes")
+        print(f"  Label dropout probability: {opts.label_drop}")
+        print(f"  CFG scale for snapshots: {opts.cfg_scale}")
     
     if opts.cond and not c.training_set_kwargs.has_labels:
         print("Warning: --cond specified but dataset has no labels. Training unconditionally.")
