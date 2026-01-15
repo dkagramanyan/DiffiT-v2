@@ -1,22 +1,27 @@
 # Copyright (c) 2024, DiffiT authors.
 # Model architectures for DiffiT.
 
-from models.diffit import DiffiT
+from models.diffit import DiffiT, ResBlock, Downsample, Upsample
 from models.attention import (
-    Head,
-    SinusoidalPositionEmbeddings,
+    get_timestep_embedding,
+    TimestepEmbedding,
     TDMHSA,
-    Tokenizer,
-    VisionTransformerBlock,
+    FeedForward,
+    TransformerBlock,
 )
-from models.vit import VisionTransformer
+from models.vit import VisionTransformer, PatchEmbed, PatchUnembed
 
 __all__ = [
     "DiffiT",
-    "Head",
-    "SinusoidalPositionEmbeddings",
+    "ResBlock",
+    "Downsample",
+    "Upsample",
+    "get_timestep_embedding",
+    "TimestepEmbedding",
     "TDMHSA",
-    "Tokenizer",
+    "FeedForward",
+    "TransformerBlock",
     "VisionTransformer",
-    "VisionTransformerBlock",
+    "PatchEmbed",
+    "PatchUnembed",
 ]

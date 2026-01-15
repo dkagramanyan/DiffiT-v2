@@ -1,26 +1,34 @@
 # Copyright (c) 2024, DiffiT authors.
-# Diffusion model for image generation.
+# Diffusion model for image generation using diffusers schedulers.
 
 from __future__ import annotations
 
-import torch
+from typing import TYPE_CHECKING
 
-from diffusion.schedule import cosine_beta_schedule
+import torch
+import torch.nn as nn
+
+# Try to import diffusers, fallback to minimal implementation
+try:
+    from diffusers import DDPMScheduler, DDIMScheduler
+    HAS_DIFFUSERS = True
+except ImportError:
+    HAS_DIFFUSERS = False
 
 
 class Diffusion:
     """Denoising Diffusion Probabilistic Model.
 
-    Implements the forward and reverse diffusion process for image generation.
+    Uses diffusers schedulers when available for efficient and well-tested implementations.
     """
 
     def __init__(
         self,
-        model: torch.nn.Module,
+        model: nn.Module,
         image_resolution: tuple[int, int, int] | list[int] = (3, 64, 64),
         n_times: int = 1000,
         device: str | torch.device = "cuda",
-        schedule: str = "cosine",
+        beta_schedule: str = "squaredcos_cap_v2",
     ) -> None:
         """Initialize the diffusion model.
 
@@ -29,184 +37,185 @@ class Diffusion:
             image_resolution: Tuple of (channels, height, width).
             n_times: Number of diffusion timesteps.
             device: Device to run computations on.
-            schedule: Noise schedule type ('cosine' or 'linear').
+            beta_schedule: Noise schedule type ('linear', 'squaredcos_cap_v2').
         """
-        self.n_times = n_times
-        self.img_C, self.img_H, self.img_W = image_resolution
         self.model = model
+        self.img_C, self.img_H, self.img_W = image_resolution
         self.device = torch.device(device) if isinstance(device, str) else device
+        self.n_times = n_times
 
-        # Compute noise schedule
-        betas = cosine_beta_schedule(timesteps=n_times).to(self.device)
-        self.register_buffer("betas", betas)
-        self.register_buffer("sqrt_betas", torch.sqrt(betas))
+        if HAS_DIFFUSERS:
+            # Use diffusers schedulers
+            self.ddpm_scheduler = DDPMScheduler(
+                num_train_timesteps=n_times,
+                beta_schedule=beta_schedule,
+                prediction_type="epsilon",
+                clip_sample=True,
+            )
+            self.ddim_scheduler = DDIMScheduler(
+                num_train_timesteps=n_times,
+                beta_schedule=beta_schedule,
+                prediction_type="epsilon",
+                clip_sample=True,
+            )
+        else:
+            # Fallback: compute schedules manually
+            self._init_schedules(n_times, beta_schedule)
+
+    def _init_schedules(self, n_times: int, schedule: str) -> None:
+        """Initialize noise schedules when diffusers is not available."""
+        if schedule == "squaredcos_cap_v2":
+            # Cosine schedule
+            s = 0.008
+            steps = n_times + 1
+            t = torch.linspace(0, n_times, steps)
+            alphas_cumprod = torch.cos(((t / n_times) + s) / (1 + s) * torch.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            betas = torch.clip(betas, 0.0001, 0.9999)
+        else:
+            # Linear schedule
+            betas = torch.linspace(0.0001, 0.02, n_times)
 
         alphas = 1 - betas
-        self.register_buffer("alphas", alphas)
-        self.register_buffer("sqrt_alphas", torch.sqrt(alphas))
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
 
-        alpha_bars = torch.cumprod(alphas, dim=0)
-        self.register_buffer("alpha_bars", alpha_bars)
-        self.register_buffer("sqrt_alpha_bars", torch.sqrt(alpha_bars))
-        self.register_buffer("sqrt_one_minus_alpha_bars", torch.sqrt(1 - alpha_bars))
+        self.betas = betas.to(self.device)
+        self.alphas = alphas.to(self.device)
+        self.alphas_cumprod = alphas_cumprod.to(self.device)
+        self.sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod).to(self.device)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1 - alphas_cumprod).to(self.device)
 
-    def register_buffer(self, name: str, tensor: torch.Tensor) -> None:
-        """Register a buffer (non-learnable parameter)."""
-        setattr(self, name, tensor)
+    def add_noise(self, x: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        """Add noise to samples using the forward diffusion process."""
+        if HAS_DIFFUSERS:
+            return self.ddpm_scheduler.add_noise(x, noise, timesteps)
 
-    def extract(self, a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tensor:
-        """Extract values from a at indices t, and reshape for broadcasting."""
-        b, *_ = t.shape
-        out = a.gather(-1, t)
-        return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+        # Manual implementation
+        sqrt_alpha = self.sqrt_alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+        return sqrt_alpha * x + sqrt_one_minus_alpha * noise
 
-    def scale_to_minus_one_to_one(self, x: torch.Tensor) -> torch.Tensor:
-        """Scale input from [0, 1] to [-1, 1]."""
-        return x * 2 - 1
-
-    def reverse_scale_to_zero_to_one(self, x: torch.Tensor) -> torch.Tensor:
-        """Scale output from [-1, 1] to [0, 1]."""
-        return (x + 1) * 0.5
-
-    def make_noisy(self, x_zeros: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Add noise to clean images using the forward diffusion process.
+    def perturb_and_predict(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Add noise and predict it back (training forward pass).
 
         Args:
-            x_zeros: Clean images in [-1, 1] range.
-            t: Timestep indices.
+            x: Clean images in [0, 1] range.
 
         Returns:
-            Tuple of (noisy_images, noise).
+            Tuple of (noisy_images, true_noise, predicted_noise).
         """
-        epsilon = torch.randn_like(x_zeros, device=self.device)
+        # Scale to [-1, 1]
+        x = x * 2 - 1
 
-        sqrt_alpha_bar = self.extract(self.sqrt_alpha_bars, t, x_zeros.shape)
-        sqrt_one_minus_alpha_bar = self.extract(self.sqrt_one_minus_alpha_bars, t, x_zeros.shape)
+        B = x.shape[0]
+        timesteps = torch.randint(0, self.n_times, (B,), device=self.device, dtype=torch.long)
+        noise = torch.randn_like(x)
 
-        noisy_sample = x_zeros * sqrt_alpha_bar + epsilon * sqrt_one_minus_alpha_bar
-        return noisy_sample.detach(), epsilon
+        noisy_x = self.add_noise(x, noise, timesteps)
+        pred_noise = self.model(noisy_x, timesteps)
 
-    def perturb_and_predict(self, x_zeros: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Forward pass: add noise and predict it back.
-
-        Args:
-            x_zeros: Clean images in [0, 1] range.
-
-        Returns:
-            Tuple of (perturbed_images, true_noise, predicted_noise).
-        """
-        x_zeros = self.scale_to_minus_one_to_one(x_zeros)
-
-        b = x_zeros.shape[0]
-        t = torch.randint(low=0, high=self.n_times, size=(b,), device=self.device).long()
-
-        perturbed_images, epsilon = self.make_noisy(x_zeros, t)
-        pred_epsilon = self.model(perturbed_images, t)
-
-        return perturbed_images, epsilon, pred_epsilon
-
-    def denoise_at_t(self, x_t: torch.Tensor, timestep: torch.Tensor, t: int) -> torch.Tensor:
-        """Single denoising step at timestep t.
-
-        Args:
-            x_t: Noisy images at timestep t.
-            timestep: Timestep tensor.
-            t: Integer timestep value.
-
-        Returns:
-            Denoised images at timestep t-1.
-        """
-        if t > 1:
-            z = torch.randn_like(x_t, device=self.device)
-        else:
-            z = torch.zeros_like(x_t, device=self.device)
-
-        epsilon_pred = self.model(x_t, timestep)
-
-        alpha = self.extract(self.alphas, timestep, x_t.shape)
-        sqrt_alpha = self.extract(self.sqrt_alphas, timestep, x_t.shape)
-        sqrt_one_minus_alpha_bar = self.extract(self.sqrt_one_minus_alpha_bars, timestep, x_t.shape)
-        sqrt_beta = self.extract(self.sqrt_betas, timestep, x_t.shape)
-
-        x_t_minus_1 = (1 / sqrt_alpha) * (
-            x_t - (1 - alpha) / sqrt_one_minus_alpha_bar * epsilon_pred
-        ) + sqrt_beta * z
-
-        return x_t_minus_1.clamp(-1.0, 1.0)
+        return noisy_x, noise, pred_noise
 
     @torch.no_grad()
-    def sample(self, n_samples: int, return_intermediate: bool = False) -> torch.Tensor:
-        """Generate samples using the reverse diffusion process.
+    def sample(self, n_samples: int, return_intermediates: bool = False) -> torch.Tensor:
+        """Generate samples using DDPM reverse process.
 
         Args:
             n_samples: Number of samples to generate.
-            return_intermediate: If True, return all intermediate denoising steps.
+            return_intermediates: Whether to return intermediate steps.
 
         Returns:
             Generated images in [0, 1] range.
         """
         self.model.eval()
 
-        x_t = torch.randn((n_samples, self.img_C, self.img_H, self.img_W), device=self.device)
+        x = torch.randn(n_samples, self.img_C, self.img_H, self.img_W, device=self.device)
+        intermediates = [x.clone()] if return_intermediates else None
 
-        if return_intermediate:
-            intermediates = [x_t.clone()]
+        if HAS_DIFFUSERS:
+            self.ddpm_scheduler.set_timesteps(self.n_times)
+            for t in self.ddpm_scheduler.timesteps:
+                t_batch = t.expand(n_samples).to(self.device)
+                noise_pred = self.model(x, t_batch)
+                x = self.ddpm_scheduler.step(noise_pred, t, x).prev_sample
+                if return_intermediates:
+                    intermediates.append(x.clone())
+        else:
+            for t in reversed(range(self.n_times)):
+                t_batch = torch.full((n_samples,), t, device=self.device, dtype=torch.long)
+                noise_pred = self.model(x, t_batch)
 
-        for t in range(self.n_times - 1, -1, -1):
-            timestep = torch.full((n_samples,), t, device=self.device, dtype=torch.long)
-            x_t = self.denoise_at_t(x_t, timestep, t)
+                alpha = self.alphas[t]
+                alpha_bar = self.alphas_cumprod[t]
+                beta = self.betas[t]
 
-            if return_intermediate:
-                intermediates.append(x_t.clone())
+                if t > 0:
+                    noise = torch.randn_like(x)
+                else:
+                    noise = 0
 
-        x_0 = self.reverse_scale_to_zero_to_one(x_t)
+                x = (1 / torch.sqrt(alpha)) * (x - (1 - alpha) / torch.sqrt(1 - alpha_bar) * noise_pred)
+                x = x + torch.sqrt(beta) * noise
+                x = x.clamp(-1, 1)
 
-        if return_intermediate:
-            return x_0, intermediates
+                if return_intermediates:
+                    intermediates.append(x.clone())
 
-        return x_0
+        # Scale to [0, 1]
+        x = (x + 1) / 2
+        x = x.clamp(0, 1)
+
+        if return_intermediates:
+            return x, intermediates
+        return x
 
     @torch.no_grad()
-    def sample_ddim(
-        self,
-        n_samples: int,
-        ddim_steps: int = 50,
-        eta: float = 0.0,
-    ) -> torch.Tensor:
+    def sample_ddim(self, n_samples: int, num_inference_steps: int = 50, eta: float = 0.0) -> torch.Tensor:
         """Generate samples using DDIM (faster sampling).
 
         Args:
             n_samples: Number of samples to generate.
-            ddim_steps: Number of DDIM sampling steps.
-            eta: DDIM stochasticity parameter (0 = deterministic, 1 = DDPM).
+            num_inference_steps: Number of denoising steps.
+            eta: DDIM eta parameter (0 = deterministic).
 
         Returns:
             Generated images in [0, 1] range.
         """
         self.model.eval()
 
-        # Compute DDIM timesteps
-        step_ratio = self.n_times // ddim_steps
-        timesteps = torch.arange(0, self.n_times, step_ratio, device=self.device).long()
-        timesteps = torch.flip(timesteps, [0])
+        x = torch.randn(n_samples, self.img_C, self.img_H, self.img_W, device=self.device)
 
-        x_t = torch.randn((n_samples, self.img_C, self.img_H, self.img_W), device=self.device)
+        if HAS_DIFFUSERS:
+            self.ddim_scheduler.set_timesteps(num_inference_steps)
+            for t in self.ddim_scheduler.timesteps:
+                t_batch = t.expand(n_samples).to(self.device)
+                noise_pred = self.model(x, t_batch)
+                x = self.ddim_scheduler.step(noise_pred, t, x, eta=eta).prev_sample
+        else:
+            # Simple DDIM without diffusers
+            step_ratio = self.n_times // num_inference_steps
+            timesteps = list(range(0, self.n_times, step_ratio))[::-1]
 
-        for i, t in enumerate(timesteps):
-            t_batch = t.repeat(n_samples)
-            epsilon_pred = self.model(x_t, t_batch)
+            for i, t in enumerate(timesteps):
+                t_batch = torch.full((n_samples,), t, device=self.device, dtype=torch.long)
+                noise_pred = self.model(x, t_batch)
 
-            alpha_bar_t = self.alpha_bars[t]
-            alpha_bar_t_prev = self.alpha_bars[timesteps[i + 1]] if i + 1 < len(timesteps) else torch.tensor(1.0, device=self.device)
+                alpha_bar_t = self.alphas_cumprod[t]
+                alpha_bar_prev = self.alphas_cumprod[timesteps[i + 1]] if i + 1 < len(timesteps) else torch.tensor(1.0, device=self.device)
 
-            # DDIM sampling formula
-            pred_x0 = (x_t - torch.sqrt(1 - alpha_bar_t) * epsilon_pred) / torch.sqrt(alpha_bar_t)
-            pred_x0 = pred_x0.clamp(-1, 1)
+                # Predict x0
+                pred_x0 = (x - torch.sqrt(1 - alpha_bar_t) * noise_pred) / torch.sqrt(alpha_bar_t)
+                pred_x0 = pred_x0.clamp(-1, 1)
 
-            sigma = eta * torch.sqrt((1 - alpha_bar_t_prev) / (1 - alpha_bar_t)) * torch.sqrt(1 - alpha_bar_t / alpha_bar_t_prev)
-            noise = torch.randn_like(x_t) if eta > 0 else 0
+                # DDIM step
+                sigma = eta * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev))
+                dir_xt = torch.sqrt(1 - alpha_bar_prev - sigma ** 2) * noise_pred
+                noise = torch.randn_like(x) if eta > 0 else 0
+                x = torch.sqrt(alpha_bar_prev) * pred_x0 + dir_xt + sigma * noise
 
-            x_t = torch.sqrt(alpha_bar_t_prev) * pred_x0 + torch.sqrt(1 - alpha_bar_t_prev - sigma ** 2) * epsilon_pred + sigma * noise
+        # Scale to [0, 1]
+        x = (x + 1) / 2
+        x = x.clamp(0, 1)
 
-        x_0 = self.reverse_scale_to_zero_to_one(x_t)
-        return x_0
+        return x

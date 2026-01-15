@@ -170,10 +170,9 @@ def main(**kwargs):
         class_name="models.diffit.DiffiT",
         image_shape=[3, opts.resolution, opts.resolution],
         base_dim=opts.base_dim,
-        resolutions_list=[opts.resolution // (2**i) for i in range(4)],
-        num_resolutions=4,
-        num_res_blocks=(1, 1, 1, 1),
-        residual_connection_level=(True, True, True, True),
+        hidden_dim=opts.hidden_dim,
+        num_heads=opts.num_heads,
+        num_res_blocks=opts.num_blocks,
     )
 
     # Diffusion configuration

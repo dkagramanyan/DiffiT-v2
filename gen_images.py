@@ -14,6 +14,7 @@ import PIL.Image
 import torch
 
 import dnnlib
+from diffusion import Diffusion
 
 
 def save_image_grid(images: np.ndarray, fname: str, grid_size: tuple[int, int]):
@@ -51,8 +52,8 @@ def num_range(s: str) -> list[int]:
 @click.option("--outdir", help="Where to save the output images", type=str, required=True)
 @click.option("--batch", help="Maximum batch size", type=int, default=32, show_default=True)
 @click.option("--grid", help="Save as grid (WxH)", type=str, default=None)
-@click.option("--steps", help="Number of sampling steps (for DDIM)", type=int, default=None)
-@click.option("--ddim", help="Use DDIM sampling", is_flag=True)
+@click.option("--steps", help="Number of DDIM sampling steps", type=int, default=50, show_default=True)
+@click.option("--ddim/--ddpm", help="Use DDIM (fast) or DDPM (slow) sampling", default=True, show_default=True)
 @click.option("--eta", help="DDIM eta parameter", type=float, default=0.0, show_default=True)
 def main(
     network: str,
@@ -60,7 +61,7 @@ def main(
     outdir: str,
     batch: int,
     grid: str | None,
-    steps: int | None,
+    steps: int,
     ddim: bool,
     eta: float,
 ):
@@ -69,7 +70,7 @@ def main(
     Examples:
 
     \b
-    # Generate 64 images with default settings
+    # Generate 64 images with DDIM (fast)
     python gen_images.py --network=model.pkl --outdir=out --seeds=0-63
 
     \b
@@ -77,8 +78,8 @@ def main(
     python gen_images.py --network=model.pkl --outdir=out --seeds=0-63 --grid=8x8
 
     \b
-    # Use DDIM sampling with 50 steps
-    python gen_images.py --network=model.pkl --outdir=out --seeds=0-15 --ddim --steps=50
+    # Use DDPM sampling (slower but higher quality)
+    python gen_images.py --network=model.pkl --outdir=out --seeds=0-15 --ddpm
     """
     print(f'Loading network from "{network}"...')
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -86,27 +87,25 @@ def main(
     with dnnlib.util.open_url(network) as f:
         data = pickle.load(f)
 
-    # Get model and diffusion from checkpoint
+    # Get model from checkpoint
     model = data.get("model_ema", data.get("model"))
     model = model.to(device).eval()
 
-    # Get training set kwargs to determine resolution
+    # Get resolution from training set kwargs
     training_set_kwargs = data.get("training_set_kwargs", {})
     resolution = training_set_kwargs.get("resolution", 64)
 
-    # Create diffusion object
-    from diffusion import Diffusion
+    # Create diffusion wrapper
     diffusion = Diffusion(
         model=model,
         image_resolution=(3, resolution, resolution),
-        n_times=1000,
         device=device,
     )
 
     os.makedirs(outdir, exist_ok=True)
 
     # Generate images
-    print(f"Generating {len(seeds)} images...")
+    print(f"Generating {len(seeds)} images using {'DDIM' if ddim else 'DDPM'}...")
     all_images = []
 
     for batch_start in range(0, len(seeds), batch):
@@ -116,10 +115,10 @@ def main(
         # Set random seed for reproducibility
         torch.manual_seed(batch_seeds[0])
 
-        print(f"  Generating batch {batch_start // batch + 1}...")
+        print(f"  Batch {batch_start // batch + 1}/{(len(seeds) + batch - 1) // batch}...")
 
-        if ddim and steps is not None:
-            images = diffusion.sample_ddim(batch_size, ddim_steps=steps, eta=eta)
+        if ddim:
+            images = diffusion.sample_ddim(batch_size, num_inference_steps=steps, eta=eta)
         else:
             images = diffusion.sample(batch_size)
 
@@ -133,7 +132,7 @@ def main(
         print(f"Saving {gw}x{gh} grid...")
         save_image_grid(all_images[: gw * gh], os.path.join(outdir, "grid.png"), (gw, gh))
     else:
-        print(f"Saving individual images...")
+        print("Saving individual images...")
         for idx, (seed, image) in enumerate(zip(seeds, all_images)):
             image = np.clip(image * 255, 0, 255).astype(np.uint8)
             image = image.transpose(1, 2, 0)  # CHW -> HWC

@@ -238,10 +238,13 @@ def training_loop(
         optimizer.zero_grad(set_to_none=True)
 
         for real_img in batch_images:
+            # Scale from [-1, 1] to [0, 1] for diffusion (it will rescale internally)
+            real_img_01 = (real_img + 1) / 2
+
             with torch.cuda.amp.autocast(enabled=not fp32):
                 # Forward pass: perturb and predict
-                _, epsilon, pred_epsilon = diffusion.perturb_and_predict(real_img)
-                loss = F.smooth_l1_loss(epsilon, pred_epsilon)
+                _, epsilon, pred_epsilon = diffusion.perturb_and_predict(real_img_01)
+                loss = F.mse_loss(epsilon, pred_epsilon)
 
             # Backward pass
             scaler.scale(loss).backward()
