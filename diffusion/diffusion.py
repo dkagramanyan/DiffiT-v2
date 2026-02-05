@@ -114,6 +114,13 @@ class Diffusion:
         sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[timesteps].view(-1, 1, 1, 1)
         return sqrt_alpha * x + sqrt_one_minus_alpha * noise
 
+    # Alias for compatibility with DDPM naming convention
+    def q_sample(self, x: torch.Tensor, timesteps: torch.Tensor, noise: torch.Tensor | None = None) -> torch.Tensor:
+        """Alias for add_noise() - samples from q(x_t | x_0)."""
+        if noise is None:
+            noise = torch.randn_like(x)
+        return self.add_noise(x, noise, timesteps)
+
     def perturb_and_predict(
         self, 
         x: torch.Tensor, 
@@ -322,3 +329,8 @@ class Diffusion:
         x = x.clamp(0, 1)
 
         return x
+
+    # Alias for compatibility
+    def sample_ddpm(self, *args, **kwargs):
+        """Alias for sample() method (DDPM sampling)."""
+        return self.sample(*args, **kwargs)
