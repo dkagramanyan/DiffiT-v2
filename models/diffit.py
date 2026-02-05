@@ -283,14 +283,6 @@ class DiffiT(nn.Module):
             h = torch.cat([h, skip], dim=1)
 
             for res_block_idx in range(len(self.up_blocks) // len(self.up_samples)):
-                # #region agent log - H10, H12: Log shape before each upsampling ResBlock
-                import json
-                log_entry = {"sessionId":"debug-session","runId":"post-fix-2","hypothesisId":"H10_H12","location":"diffit.py:290","message":"upsampling ResBlock input shape","data":{"upsample_level":i,"res_block_idx":res_block_idx,"block_idx":block_idx,"h_shape":list(h.shape)},"timestamp":int(__import__('time').time()*1000)}
-                try:
-                    with open('/home/dgkagramanyan/.cursor/debug.log', 'a') as f:
-                        f.write(json.dumps(log_entry) + '\n')
-                except: pass
-                # #endregion
                 h = self.up_blocks[block_idx](h, cond_emb)
                 block_idx += 1
 

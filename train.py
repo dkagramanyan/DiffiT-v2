@@ -231,16 +231,7 @@ def init_dataset_kwargs(data: str, resolution: int | None = None, use_labels: bo
         # Store metadata separately (don't add to dataset_kwargs to avoid passing to constructor)
         has_labels = dataset_obj.has_labels
         label_dim = dataset_obj.label_dim if dataset_obj.has_labels else 0
-        
-        # #region agent log - H6, H7: Log dataset_kwargs keys to verify no contamination
-        import json
-        log_entry = {"sessionId":"debug-session","runId":"post-fix","hypothesisId":"H6_H7","location":"train.py:233","message":"init_dataset_kwargs return values","data":{"dataset_kwargs_keys":list(dataset_kwargs.keys()),"has_labels":has_labels,"label_dim":label_dim},"timestamp":int(__import__('time').time()*1000)}
-        try:
-            with open('/home/dgkagramanyan/.cursor/debug.log', 'a') as f:
-                f.write(json.dumps(log_entry) + '\n')
-        except: pass
-        # #endregion
-        
+
         return dataset_kwargs, dataset_obj.name, has_labels, label_dim
     except IOError as err:
         raise click.ClickException(f"--data: {err}")
@@ -306,14 +297,6 @@ def main(**kwargs):
     2. Using legacy spawn (with --gpus):
        python train.py --outdir=./runs --data=./data --gpus=4 --batch-gpu=32
     """
-    # #region agent log - H1, H3, H5: Log received kwargs to see exact argument values
-    import json
-    log_entry = {"sessionId":"debug-session","runId":"initial","hypothesisId":"H1_H3_H5","location":"train.py:296","message":"main() kwargs received","data":{"kwargs":kwargs,"cond_value":kwargs.get('cond'),"cond_type":str(type(kwargs.get('cond')))},"timestamp":int(__import__('time').time()*1000)}
-    try:
-        with open('/home/dgkagramanyan/.cursor/debug.log', 'a') as f:
-            f.write(json.dumps(log_entry) + '\n')
-    except: pass
-    # #endregion
     opts = dnnlib.EasyDict(kwargs)
     c = dnnlib.EasyDict()
 
