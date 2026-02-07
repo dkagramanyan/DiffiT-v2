@@ -258,6 +258,7 @@ def parse_comma_separated_list(s):
 @click.option("--timesteps", help="Number of diffusion timesteps", metavar="INT", type=click.IntRange(min=1), default=1000)
 @click.option("--hidden-dim", help="Hidden dimension for ViT blocks", metavar="INT", type=click.IntRange(min=1), default=64)
 @click.option("--num-heads", help="Number of attention heads", metavar="INT", type=click.IntRange(min=1), default=4)
+@click.option("--num-patches", help="Number of patches per spatial dim (higher=smaller patches, less memory)", metavar="INT", type=click.IntRange(min=1), default=2)
 @click.option("--num-blocks", help="Number of transformer blocks", metavar="INT", type=click.IntRange(min=1), default=1)
 # Optional features
 @click.option("--mirror", help="Enable dataset x-flips", metavar="BOOL", type=bool, default=False, show_default=True)
@@ -308,6 +309,7 @@ def main(**kwargs):
         base_dim=opts.base_dim,
         hidden_dim=opts.hidden_dim,
         num_heads=opts.num_heads,
+        num_patches=opts.num_patches,
         num_res_blocks=opts.num_blocks,
         label_dim=0,  # Will be updated if using labels
         label_drop_prob=opts.label_drop,
