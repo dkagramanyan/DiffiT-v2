@@ -324,28 +324,38 @@ def compute_feature_stats_for_diffusion(
     diffusion = opts.diffusion
 
     # Main loop - generate samples and compute features
+    total_batches = (stats.max_items + batch_size - 1) // batch_size
+    pbar = tqdm(
+        total=stats.max_items,
+        disable=(opts.rank != 0),
+        desc="Generating images for FID",
+        unit="img",
+    )
     while not stats.is_full():
         # Generate batch of images using diffusion sampling
         with torch.no_grad():
             if hasattr(diffusion, 'sample_ddim'):
                 # Use DDIM for faster sampling during evaluation
                 images = diffusion.sample_ddim(
-                    n_samples=batch_size, 
+                    n_samples=batch_size,
                     num_inference_steps=opts.num_inference_steps,
                     eta=0.0
                 )
             else:
                 images = diffusion.sample(n_samples=batch_size)
-            
+
             # Convert from [0, 1] to uint8 format expected by inception
             images = (images * 255).clamp(0, 255).to(torch.uint8)
-            
+
             if images.shape[1] == 1:
                 images = images.repeat([1, 3, 1, 1])
 
             features = detector(images.to(opts.device), **detector_kwargs)
 
+        prev_items = stats.num_items
         stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
+        pbar.update(stats.num_items - prev_items)
         progress.update(stats.num_items)
+    pbar.close()
 
     return stats

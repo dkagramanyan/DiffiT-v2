@@ -489,9 +489,12 @@ def training_loop(
                 pickle.dump(snapshot_data, f)
 
         # Evaluate metrics (FID, etc.)
+        # Skip tick 0: model is untrained, FID is meaningless, and generating
+        # 50k images takes ~1 hour. Start evaluating from metrics_ticks onward.
         should_eval_metrics = (
-            (len(metrics) > 0) and 
+            (len(metrics) > 0) and
             (snapshot_data is not None) and
+            (cur_tick > 0) and
             (metrics_ticks is None or cur_tick % metrics_ticks == 0 or done)
         )
         
