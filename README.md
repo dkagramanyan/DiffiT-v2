@@ -1,5 +1,7 @@
 # DiffiT: Diffusion Vision Transformers for Image Generation
 
+# DOESNT WORK YET!
+
 A PyTorch implementation of DiffiT - a U-Net style diffusion model with Vision Transformer blocks for image generation.
 
 ## Features
