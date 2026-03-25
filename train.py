@@ -359,7 +359,7 @@ def training_loop(
     model_name,
     schedule_sampler_name,
     workers=4,
-    num_fid_samples=2048,
+    num_fid_samples=1024,
     **_extra,
 ):
     """Main training loop for DiffiT."""
@@ -793,7 +793,7 @@ BASE_CONFIGS = {
         ema_rate=0.9999,
         use_fp16=False,
         schedule_sampler_name="uniform",
-        num_fid_samples=2048,
+        num_fid_samples=1024,
     ),
     "diffit-512": dict(
         image_size=512,
@@ -805,7 +805,7 @@ BASE_CONFIGS = {
         ema_rate=0.9999,
         use_fp16=True,
         schedule_sampler_name="uniform",
-        num_fid_samples=2048,
+        num_fid_samples=1024,
     ),
 }
 
