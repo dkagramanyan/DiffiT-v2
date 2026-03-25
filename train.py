@@ -450,10 +450,12 @@ def training_loop(
             distributed=False,
         )
         ref_images = []
-        while len(ref_images) < num_fid_samples:
+        n_collected = 0
+        while n_collected < num_fid_samples:
             batch_ref, _ = next(ref_iter)
             batch_np = ((batch_ref + 1) * 127.5).clamp(0, 255).to(torch.uint8).numpy()
             ref_images.append(batch_np)
+            n_collected += batch_np.shape[0]
         ref_images = np.concatenate(ref_images, axis=0)[:num_fid_samples]
         ref_acts = compute_activations(ref_images, inception_extractor, batch_size=64, device=device)
         del ref_images
