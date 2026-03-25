@@ -287,9 +287,11 @@ class Logger(object):
             fmt.close()
 
     def _do_log(self, args):
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        prefixed = [f"[{timestamp}]"] + list(map(str, args))
         for fmt in self.output_formats:
             if isinstance(fmt, SeqWriter):
-                fmt.writeseq(map(str, args))
+                fmt.writeseq(prefixed)
 
 
 def configure(log_dir=None, format_strs=None, log_suffix=""):

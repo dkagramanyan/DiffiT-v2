@@ -496,7 +496,21 @@ def training_loop(
     logger.log(f"Training for {total_kimg} kimg...")
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
+    maintenance_time = start_time - time.time()  # negative initially
     cur_tick = 0
+
+    def _format_time(seconds):
+        """Format seconds into human-readable string like SAN-v2."""
+        s = int(seconds)
+        if s < 60:
+            return f"{s}s"
+        elif s < 3600:
+            return f"{s // 60}m {s % 60:02d}s"
+        else:
+            h = s // 3600
+            m = (s % 3600) // 60
+            sec = s % 60
+            return f"{h}h {m:02d}m {sec:02d}s"
 
     while cur_nimg < total_kimg * 1000:
         batch, cond = next(data_iter)
@@ -529,30 +543,65 @@ def training_loop(
 
         cur_nimg += batch_gpu * num_gpus
 
-        # Logging
-        logger.logkv("loss", loss.item())
-        logger.logkv("step", cur_nimg // (batch_gpu * num_gpus))
-        logger.logkv("kimg", cur_nimg / 1000)
+        # Accumulate loss for tick-level reporting
+        logger.logkv_mean("Loss/train", loss.item())
         if "vb" in losses:
-            logger.logkv("vb_loss", losses["vb"].mean().item())
+            logger.logkv_mean("Loss/vb", losses["vb"].mean().item())
         if "mse" in losses:
-            logger.logkv("mse_loss", losses["mse"].mean().item())
+            logger.logkv_mean("Loss/mse", losses["mse"].mean().item())
 
         # Tick
         done_kimg = (cur_nimg - tick_start_nimg) / 1000
         if done_kimg >= kimg_per_tick or cur_nimg >= total_kimg * 1000:
             tick_end_time = time.time()
-            elapsed = tick_end_time - tick_start_time
-            kimg_per_sec = done_kimg / elapsed if elapsed > 0 else 0
+            tick_elapsed = tick_end_time - tick_start_time
+            total_elapsed = tick_end_time - start_time
+            sec_per_tick = tick_elapsed
+            sec_per_kimg = tick_elapsed / done_kimg if done_kimg > 0 else 0
 
-            logger.logkv("kimg/s", kimg_per_sec)
-            logger.logkv("elapsed_sec", elapsed)
+            # Remaining time estimate
+            kimg_done = cur_nimg / 1000
+            kimg_left = total_kimg - kimg_done
+            eta_sec = sec_per_kimg * kimg_left if sec_per_kimg > 0 else 0
+
+            # Memory stats
+            cpumem = 0.0
+            gpumem = 0.0
+            reserved = 0.0
+            try:
+                import psutil
+                cpumem = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 3)
+            except ImportError:
+                pass
+            if torch.cuda.is_available():
+                gpumem = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+
+            # SAN-v2 style tick line
+            tick_line = (
+                f"tick {cur_tick:<6d} "
+                f"kimg {kimg_done:<10.1f} "
+                f"time {_format_time(total_elapsed):<14s} "
+                f"sec/tick {sec_per_tick:<9.1f} "
+                f"sec/kimg {sec_per_kimg:<9.2f} "
+                f"eta {_format_time(eta_sec):<14s} "
+                f"maintenance {abs(maintenance_time):<7.1f} "
+                f"cpumem {cpumem:<7.2f} "
+                f"gpumem {gpumem:<8.2f} "
+                f"reserved {reserved:<8.2f}"
+            )
+            logger.log(tick_line)
+
+            # Collect logged loss means
             logged_kvs = logger.dumpkvs()
+            logged_kvs["kimg"] = kimg_done
+            logged_kvs["sec/tick"] = sec_per_tick
+            logged_kvs["sec/kimg"] = sec_per_kimg
 
-            # Write stats.jsonl + TensorBoard (SAN-v2 style)
+            # Write stats.jsonl + TensorBoard
             if is_main:
                 timestamp = time.time()
-                global_step = int(cur_nimg / 1e3)
+                global_step = int(kimg_done)
                 walltime = timestamp - start_time
 
                 if stats_jsonl is not None:
@@ -562,16 +611,19 @@ def training_loop(
 
                 if stats_tfevents is not None:
                     for name, value in logged_kvs.items():
-                        if isinstance(value, (int, float)):
+                        if isinstance(value, (int, float, float)):
                             stats_tfevents.add_scalar(f"Train/{name}", value, global_step=global_step, walltime=walltime)
                     stats_tfevents.flush()
 
             cur_tick += 1
             tick_start_nimg = cur_nimg
             tick_start_time = time.time()
+            maintenance_time = 0.0
 
-            # Save image snapshot + evaluate metrics (SAN-v2 style: every `snap` ticks)
+            # Save image snapshot + evaluate metrics + checkpoint (every `snap` ticks)
             if is_main and cur_tick % snap == 0:
+                snap_start = time.time()
+
                 logger.log(f"Saving image snapshot (kimg={cur_nimg / 1e3:.1f})...")
                 fakes = generate_snapshot_images(
                     ema_model, vae, diffusion, grid_z, grid_classes,
@@ -581,9 +633,11 @@ def training_loop(
                     fakes, os.path.join(run_dir, f"fakes{cur_nimg // 1000:06d}.png"),
                     drange=[0, 255], grid_size=grid_size,
                 )
+                logger.log(f"Image snapshot saved (kimg={cur_nimg / 1e3:.1f})")
 
                 # Evaluate quality metrics
                 if ref_acts is not None:
+                    logger.log("Evaluating metrics...")
                     stats_metrics = evaluate_metrics(
                         ema_model, vae, diffusion, ref_acts, inception_extractor,
                         num_fid_samples, batch_gpu, latent_size, device,
@@ -600,23 +654,25 @@ def training_loop(
                             stats_tfevents.add_scalar(f"Metrics/{name}", value, global_step=global_step, walltime=walltime)
                         stats_tfevents.flush()
 
-        # Snapshot (checkpoint)
-        if (cur_nimg // 1000) % (snap * kimg_per_tick) == 0 and cur_nimg > 0 and is_main:
-            save_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}.pt")
-            logger.log(f"Saving snapshot to {save_path}...")
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "ema": ema_model.state_dict(),
-                    "opt": opt.state_dict(),
-                    "cur_nimg": cur_nimg,
-                    "config": {
-                        "image_size": image_size,
-                        "model_name": model_name,
+                # Save checkpoint
+                save_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}.pt")
+                logger.log(f"Saving checkpoint to {save_path}...")
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "ema": ema_model.state_dict(),
+                        "opt": opt.state_dict(),
+                        "cur_nimg": cur_nimg,
+                        "config": {
+                            "image_size": image_size,
+                            "model_name": model_name,
+                        },
                     },
-                },
-                save_path,
-            )
+                    save_path,
+                )
+                logger.log(f"Checkpoint saved (kimg={cur_nimg / 1e3:.1f})")
+
+                maintenance_time = time.time() - snap_start
 
     # Final save
     if is_main:
