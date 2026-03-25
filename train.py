@@ -76,9 +76,9 @@ def save_image_grid(img, fname, drange, grid_size):
 def setup_snapshot_image_grid(image_size, gw=None, gh=None):
     """Determine grid dimensions for snapshot images."""
     if gw is None:
-        gw = max(np.clip(2560 // image_size, 7, 32), 1)
+        gw = int(max(np.clip(2560 // image_size, 7, 32), 1))
     if gh is None:
-        gh = max(np.clip(1440 // image_size, 4, 32), 1)
+        gh = int(max(np.clip(1440 // image_size, 4, 32), 1))
     return gw, gh
 
 
