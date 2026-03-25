@@ -26,6 +26,7 @@ import time
 
 import click
 import numpy as np
+import PIL.Image
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -41,6 +42,83 @@ from diffit.fp16_util import MixedPrecisionTrainer
 from diffit.nn import update_ema
 from diffit import logger
 from diffit.timestep_sampler import create_named_schedule_sampler
+
+
+# ---------------------------------------------------------------------------
+# Image grid utilities (matching SAN-v2 style)
+# ---------------------------------------------------------------------------
+
+
+def save_image_grid(img, fname, drange, grid_size):
+    """Save a grid of images as a single PNG (SAN-v2 style)."""
+    lo, hi = drange
+    img = np.asarray(img, dtype=np.float32)
+    img = (img - lo) * (255 / (hi - lo))
+    img = np.rint(img).clip(0, 255).astype(np.uint8)
+
+    gw, gh = grid_size
+    _N, C, H, W = img.shape
+    img = img.reshape([gh, gw, C, H, W])
+    img = img.transpose(0, 3, 1, 4, 2)
+    img = img.reshape([gh * H, gw * W, C])
+
+    assert C in [1, 3]
+    if C == 1:
+        PIL.Image.fromarray(img[:, :, 0], "L").save(fname)
+    if C == 3:
+        PIL.Image.fromarray(img, "RGB").save(fname)
+
+
+def setup_snapshot_image_grid(image_size, gw=None, gh=None):
+    """Determine grid dimensions for snapshot images."""
+    if gw is None:
+        gw = max(np.clip(2560 // image_size, 7, 32), 1)
+    if gh is None:
+        gh = max(np.clip(1440 // image_size, 4, 32), 1)
+    return gw, gh
+
+
+@torch.no_grad()
+def generate_snapshot_images(
+    ema_model, vae, diffusion, grid_z, grid_classes, batch_gpu, device,
+    cfg_scale=4.4, num_sampling_steps=50, scale_pow=4.0,
+):
+    """Generate a batch of images from the EMA model for snapshot grids."""
+    diff_config = diffusion_defaults()
+    diff_config["timestep_respacing"] = f"ddim{num_sampling_steps}"
+    snap_diffusion = create_diffusion(**diff_config)
+
+    all_samples = []
+    for z_chunk, c_chunk in zip(grid_z.split(batch_gpu), grid_classes.split(batch_gpu)):
+        bs = z_chunk.shape[0]
+        z_cfg = torch.cat([z_chunk, z_chunk], 0)
+        classes_null = torch.full((bs,), NUM_CLASSES, device=device, dtype=torch.long)
+        model_kwargs = {
+            "y": torch.cat([c_chunk, classes_null], 0),
+            "cfg_scale": cfg_scale,
+            "diffusion_steps": diff_config["diffusion_steps"],
+            "scale_pow": scale_pow,
+        }
+        sample = snap_diffusion.ddim_sample_loop(
+            ema_model.forward_with_cfg,
+            z_cfg.shape,
+            z_cfg,
+            clip_denoised=False,
+            progress=False,
+            model_kwargs=model_kwargs,
+            device=device,
+        )
+        sample, _ = sample.chunk(2, dim=0)
+        # Decode latent -> image
+        decoded = vae.decode(sample / 0.18215).sample
+        decoded = ((decoded + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+        all_samples.append(decoded.permute(0, 2, 3, 1).cpu().numpy())
+
+    # Return as NCHW uint8 for save_image_grid
+    images = np.concatenate(all_samples, axis=0)
+    # Convert NHWC -> NCHW
+    images = images.transpose(0, 3, 1, 2)
+    return images
 
 
 # ---------------------------------------------------------------------------
@@ -154,10 +232,60 @@ def training_loop(
         distributed=(num_gpus > 1),
     )
 
+    # --- Initialize logs: stats.jsonl + TensorBoard (SAN-v2 style) ---
+    stats_jsonl = None
+    stats_tfevents = None
+    if is_main:
+        stats_jsonl = open(os.path.join(run_dir, "stats.jsonl"), "at")
+        try:
+            import torch.utils.tensorboard as tensorboard
+            stats_tfevents = tensorboard.SummaryWriter(run_dir)
+        except ImportError as err:
+            logger.log(f"Skipping TensorBoard export: {err}")
+
+    # --- Setup snapshot image grid (SAN-v2 style) ---
+    start_time = time.time()
+    gw, gh = setup_snapshot_image_grid(image_size)
+    grid_size = (gw, gh)
+    n_grid = gw * gh
+
+    # Save real training images grid
+    if is_main:
+        logger.log("Exporting sample images (reals.png, fakes_init.png)...")
+        real_images = []
+        real_iter = load_data(
+            data_dir=data, batch_size=n_grid, image_size=image_size,
+            class_cond=True, random_flip=False, num_workers=2,
+            distributed=False,
+        )
+        real_batch, _ = next(real_iter)
+        # real_batch is [-1, 1] float tensor NCHW
+        real_np = ((real_batch + 1) * 127.5).clamp(0, 255).to(torch.uint8).numpy()
+        save_image_grid(real_np, os.path.join(run_dir, "reals.png"), drange=[0, 255], grid_size=grid_size)
+
+    # Fixed latents + classes for consistent snapshot generation
+    grid_z = torch.randn(
+        n_grid, 4, latent_size, latent_size, device=device,
+        generator=torch.Generator(device=device).manual_seed(seed * max(num_gpus, 1)),
+    )
+    grid_classes = torch.randint(
+        0, NUM_CLASSES, (n_grid,), device=device,
+        generator=torch.Generator(device=device).manual_seed(seed * max(num_gpus, 1)),
+    )
+
+    # Save initial fakes
+    if is_main:
+        fakes_init = generate_snapshot_images(
+            ema_model, vae, diffusion, grid_z, grid_classes,
+            batch_gpu=batch_gpu, device=device,
+        )
+        save_image_grid(fakes_init, os.path.join(run_dir, "fakes_init.png"), drange=[0, 255], grid_size=grid_size)
+
     # Training
     logger.log(f"Training for {total_kimg} kimg...")
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
+    cur_tick = 0
 
     while cur_nimg < total_kimg * 1000:
         batch, cond = next(data_iter)
@@ -208,12 +336,42 @@ def training_loop(
 
             logger.logkv("kimg/s", kimg_per_sec)
             logger.logkv("elapsed_sec", elapsed)
-            logger.dumpkvs()
+            logged_kvs = logger.dumpkvs()
 
+            # Write stats.jsonl + TensorBoard (SAN-v2 style)
+            if is_main:
+                timestamp = time.time()
+                global_step = int(cur_nimg / 1e3)
+                walltime = timestamp - start_time
+
+                if stats_jsonl is not None:
+                    fields = dict(logged_kvs, timestamp=timestamp)
+                    stats_jsonl.write(json.dumps(fields) + "\n")
+                    stats_jsonl.flush()
+
+                if stats_tfevents is not None:
+                    for name, value in logged_kvs.items():
+                        if isinstance(value, (int, float)):
+                            stats_tfevents.add_scalar(f"Train/{name}", value, global_step=global_step, walltime=walltime)
+                    stats_tfevents.flush()
+
+            cur_tick += 1
             tick_start_nimg = cur_nimg
             tick_start_time = time.time()
 
-        # Snapshot
+            # Save image snapshot (SAN-v2 style: every `snap` ticks)
+            if is_main and cur_tick % snap == 0:
+                logger.log(f"Saving image snapshot (kimg={cur_nimg / 1e3:.1f})...")
+                fakes = generate_snapshot_images(
+                    ema_model, vae, diffusion, grid_z, grid_classes,
+                    batch_gpu=batch_gpu, device=device,
+                )
+                save_image_grid(
+                    fakes, os.path.join(run_dir, f"fakes{cur_nimg // 1000:06d}.png"),
+                    drange=[0, 255], grid_size=grid_size,
+                )
+
+        # Snapshot (checkpoint)
         if (cur_nimg // 1000) % (snap * kimg_per_tick) == 0 and cur_nimg > 0 and is_main:
             save_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}.pt")
             logger.log(f"Saving snapshot to {save_path}...")
@@ -248,6 +406,23 @@ def training_loop(
             },
             save_path,
         )
+
+        # Final image snapshot
+        logger.log("Saving final image snapshot...")
+        fakes = generate_snapshot_images(
+            ema_model, vae, diffusion, grid_z, grid_classes,
+            batch_gpu=batch_gpu, device=device,
+        )
+        save_image_grid(
+            fakes, os.path.join(run_dir, f"fakes{cur_nimg // 1000:06d}.png"),
+            drange=[0, 255], grid_size=grid_size,
+        )
+
+    # Close logs
+    if stats_jsonl is not None:
+        stats_jsonl.close()
+    if stats_tfevents is not None:
+        stats_tfevents.close()
 
     logger.log("Training complete.")
 
