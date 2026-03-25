@@ -172,10 +172,10 @@ class InceptionFeatureExtractor(torch.nn.Module):
 
 
 @torch.no_grad()
-def compute_activations(images_uint8_nchw, extractor, batch_size, device):
+def compute_activations(images_uint8_nchw, extractor, batch_size, device, desc="Computing Inception features"):
     """Compute inception activations from NCHW uint8 numpy array."""
     all_pool, all_spatial, all_logits = [], [], []
-    for i in range(0, len(images_uint8_nchw), batch_size):
+    for i in tqdm(range(0, len(images_uint8_nchw), batch_size), desc=desc, unit="batch"):
         batch = torch.from_numpy(images_uint8_nchw[i : i + batch_size]).float().to(device) / 255.0
         feats = extractor(batch)
         all_pool.append(feats["pool"].cpu().numpy())
@@ -200,6 +200,8 @@ def generate_eval_samples(
 
     all_images = []
     generated = 0
+    num_batches = (num_samples + batch_gpu - 1) // batch_gpu
+    pbar = tqdm(total=num_samples, desc="Generating eval samples", unit="img")
     while generated < num_samples:
         bs = min(batch_gpu, num_samples - generated)
         z = torch.randn(bs, 4, latent_size, latent_size, device=device)
@@ -223,6 +225,8 @@ def generate_eval_samples(
         decoded = ((decoded + 1) * 127.5).clamp(0, 255).to(torch.uint8)
         all_images.append(decoded.cpu().numpy())  # NCHW
         generated += bs
+        pbar.update(bs)
+    pbar.close()
 
     return np.concatenate(all_images, axis=0)[:num_samples]
 
