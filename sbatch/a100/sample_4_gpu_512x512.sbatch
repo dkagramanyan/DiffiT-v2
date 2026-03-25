@@ -31,10 +31,3 @@ torchrun --nproc_per_node=4 sample.py \
     --cfg-cond
 
 echo "Sampling complete at $(date)"
-echo "Running FID evaluation..."
-
-python evaluator.py \
-    --ref-batch ./VIRTUAL_imagenet512_labeled.npz \
-    --sample-batch ${OUTDIR}/samples_50000x512x512x3.npz
-
-echo "All tasks completed at $(date)"

@@ -168,6 +168,7 @@ python train.py --outdir=./training-runs \
 | `--ema-rate` | from cfg | EMA decay rate override |
 | `--resume` | None | Path to checkpoint for resuming |
 | `--schedule-sampler` | from cfg | Timestep sampler override |
+| `--num-fid-samples` | 2048 | Samples for FID/IS eval during training (0=disable) |
 | `--workers` | 4 | DataLoader worker processes |
 
 ### Training output
@@ -192,6 +193,8 @@ training-runs/00000-diffit-256-gpus4-batch256/
 ├── ...
 └── network-final.pt              # Final trained model
 ```
+
+Quality metrics (**IS**, **FID**, **sFID**, **Precision**, **Recall**) are computed automatically every `snap` ticks during training using 2048 samples by default. Results are logged to TensorBoard under `Metrics/` and to `stats.jsonl`. Adjust with `--num-fid-samples` (set to 0 to disable).
 
 Monitor training with TensorBoard:
 
@@ -273,20 +276,21 @@ sbatch sbatch/h200/sample_4_gpu_512x512.sbatch
 
 ## Quality Metrics
 
-Compute FID-50K and other metrics using the PyTorch-based evaluator:
+Quality metrics are computed **inline during training** every `snap` ticks. The following metrics are evaluated and logged to TensorBoard (`Metrics/`) and `stats.jsonl`:
+
+- **Inception Score (IS)** — diversity and quality of generated classes
+- **FID** — Frechet Inception Distance (pool features)
+- **sFID** — spatial FID (captures spatial structure)
+- **Precision** — fraction of generated samples in the real data manifold
+- **Recall** — fraction of real samples covered by the generated manifold
+
+By default, 2048 samples are generated for each evaluation (configurable via `--num-fid-samples`). For a full FID-50K evaluation, use the standalone evaluator:
 
 ```bash
 python evaluator.py \
     --ref-batch ./VIRTUAL_imagenet256_labeled.npz \
     --sample-batch ./samples/256/samples_50000x256x256x3.npz
 ```
-
-Or use the convenience script:
-```bash
-bash eval_run.sh 256 ./samples/256
-```
-
-Metrics computed: **Inception Score**, **FID**, **sFID**, **Precision**, **Recall**.
 
 ### Expected Results
 
