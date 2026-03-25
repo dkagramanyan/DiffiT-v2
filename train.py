@@ -82,7 +82,7 @@ def setup_snapshot_image_grid(image_size, gw=None, gh=None):
     return gw, gh
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def generate_snapshot_images(
     ema_model, vae, diffusion, grid_z, grid_classes, batch_gpu, device,
     cfg_scale=4.4, num_sampling_steps=50, scale_pow=4.0,
@@ -103,18 +103,18 @@ def generate_snapshot_images(
             "diffusion_steps": diff_config["diffusion_steps"],
             "scale_pow": scale_pow,
         }
-        sample = snap_diffusion.ddim_sample_loop(
-            ema_model.forward_with_cfg,
-            z_cfg.shape,
-            z_cfg,
-            clip_denoised=False,
-            progress=False,
-            model_kwargs=model_kwargs,
-            device=device,
-        )
-        sample, _ = sample.chunk(2, dim=0)
-        # Decode latent -> image
-        decoded = vae.decode(sample / 0.18215).sample
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            sample = snap_diffusion.ddim_sample_loop(
+                ema_model.forward_with_cfg,
+                z_cfg.shape,
+                z_cfg,
+                clip_denoised=False,
+                progress=False,
+                model_kwargs=model_kwargs,
+                device=device,
+            )
+            sample, _ = sample.chunk(2, dim=0)
+            decoded = vae.decode(sample.float() / 0.18215).sample
         decoded = ((decoded + 1) * 127.5).clamp(0, 255).to(torch.uint8)
         all_samples.append(decoded.permute(0, 2, 3, 1).cpu().numpy())
 
@@ -171,7 +171,7 @@ class InceptionFeatureExtractor(torch.nn.Module):
         return {"pool": pool, "spatial": spatial, "logits": logits}
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def compute_activations(images_uint8_nchw, extractor, batch_size, device, desc="Computing Inception features"):
     """Compute inception activations from NCHW uint8 numpy array."""
     all_pool, all_spatial, all_logits = [], [], []
@@ -188,20 +188,23 @@ def compute_activations(images_uint8_nchw, extractor, batch_size, device, desc="
     }
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def generate_eval_samples(
     ema_model, vae, diffusion, num_samples, batch_gpu, latent_size, device,
     cfg_scale=4.4, num_sampling_steps=50, scale_pow=4.0,
 ):
-    """Generate N random images for metric evaluation (NCHW uint8 numpy)."""
+    """Generate N random images for metric evaluation (NCHW uint8 numpy).
+
+    Uses fp16 autocast and fewer DDIM steps (default 25) for speed.
+    This is for trend monitoring, not final-quality evaluation.
+    """
     diff_config = diffusion_defaults()
     diff_config["timestep_respacing"] = f"ddim{num_sampling_steps}"
     eval_diffusion = create_diffusion(**diff_config)
 
     all_images = []
     generated = 0
-    num_batches = (num_samples + batch_gpu - 1) // batch_gpu
-    pbar = tqdm(total=num_samples, desc="Generating eval samples", unit="img")
+    pbar = tqdm(total=num_samples, desc=f"Generating eval samples (ddim{num_sampling_steps})", unit="img")
     while generated < num_samples:
         bs = min(batch_gpu, num_samples - generated)
         z = torch.randn(bs, 4, latent_size, latent_size, device=device)
@@ -215,13 +218,14 @@ def generate_eval_samples(
             "diffusion_steps": diff_config["diffusion_steps"],
             "scale_pow": scale_pow,
         }
-        sample = eval_diffusion.ddim_sample_loop(
-            ema_model.forward_with_cfg, z_cfg.shape, z_cfg,
-            clip_denoised=False, progress=False,
-            model_kwargs=model_kwargs, device=device,
-        )
-        sample, _ = sample.chunk(2, dim=0)
-        decoded = vae.decode(sample / 0.18215).sample
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            sample = eval_diffusion.ddim_sample_loop(
+                ema_model.forward_with_cfg, z_cfg.shape, z_cfg,
+                clip_denoised=False, progress=False,
+                model_kwargs=model_kwargs, device=device,
+            )
+            sample, _ = sample.chunk(2, dim=0)
+            decoded = vae.decode(sample.float() / 0.18215).sample
         decoded = ((decoded + 1) * 127.5).clamp(0, 255).to(torch.uint8)
         all_images.append(decoded.cpu().numpy())  # NCHW
         generated += bs
