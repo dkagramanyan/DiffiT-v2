@@ -1,71 +1,40 @@
 #!/bin/bash
-#SBATCH --nodes=16
-#SBATCH --ntasks-per-node=1
-#SBATCH --time=0:30:00
-#SBATCH --exclusive
-#SBATCH --gres=gpu:8
-#SBATCH --dependency=singleton
-#SBATCH --job-name=diffit_sample_256
+#SBATCH --job-name=DiffiT-sample-256
+#SBATCH --gpus=4
+#SBATCH --cpus-per-task=4
+#SBATCH --time=0-6:0
+#SBATCH --nodes=1
+#SBATCH --partition=normal
+#SBATCH --account=proj_1631
+#SBATCH --constraint="type_e"
 
-IMAGE="./images/diffit.sqsh"
+module purge
+module load Python/Anaconda
+module load CUDA/12.4
+module load gnu13/13.3
+
+source activate diffit
+
+nvidia-smi
+
 MODEL="./ckpts/diffit_256.safetensors"
+OUTDIR="./samples/256"
 
-LOG_DIR="./log_dir/256_1"
-# Set WORK_DIR to wherever sample.py lives
-WORK_DIR="./diffit_code"
+torchrun --nproc_per_node=4 sample.py \
+    --model-path $MODEL \
+    --outdir $OUTDIR \
+    --image-size 256 \
+    --cfg-scale 4.4 \
+    --num-samples 50000 \
+    --batch-size 16 \
+    --num-sampling-steps 250 \
+    --cfg-cond
 
-SAVE_DIR="./job_logs"
-mkdir -p "${SAVE_DIR}"
-mkdir -p "${LOG_DIR}"
-DATETIME=$(date +'%Y-%m-%d_%H-%M-%S')
+echo "Sampling complete at $(date)"
+echo "Running FID evaluation..."
 
-# -----------------
-# 2) SLURM Node Info
-# -----------------
-NODELIST=($(scontrol show hostnames $SLURM_JOB_NODELIST))
-TOTAL_NODES=$SLURM_NNODES
-MASTER_NODE="${NODELIST[0]}"
-MASTER_ADDR="$MASTER_NODE"
-MASTER_PORT=6000
-WORLD_SIZE=$((TOTAL_NODES * GPUS_PER_NODE))
-
-echo "============================="
-echo "  Total Nodes:      $TOTAL_NODES"
-echo "  MASTER_ADDR:      $MASTER_ADDR"
-echo "  MASTER_PORT:      $MASTER_PORT"
-echo "  GPUS_PER_NODE:    $GPUS_PER_NODE"
-echo "  WORLD_SIZE:       $WORLD_SIZE"
-echo "============================="
-
-# -----------------
-# 3) Launch Sampling
-# -----------------
-srun \
-  --nodes="$TOTAL_NODES" \
-  --ntasks-per-node="$GPUS_PER_NODE" \
-  --container-image="$IMAGE" \
-  --container-env=ALL \
-  --container-mounts="/lustre:/lustre,/home/${USER}:/home/${USER}" \
-  --container-workdir="$WORK_DIR" \
-  --output="${SAVE_DIR}/sample_%x_${DATETIME}.log" \
-bash -c "
-  export MASTER_ADDR=$MASTER_ADDR
-  export MASTER_PORT=$MASTER_PORT
-  export WORLD_SIZE=$WORLD_SIZE
-  export RANK=\$SLURM_PROCID
-  export LOCAL_RANK=\$SLURM_LOCALID
-
-  echo \"[Proc] \$(hostname -s) RANK=\$RANK LOCAL_RANK=\$LOCAL_RANK\"
-
-  python sample.py \
-    --log_dir $LOG_DIR \
-    --cfg_scale 4.4 \
-    --model_path $MODEL \
-    --image_size 256 \
-    --model Diffit \
-    --num_sampling_steps 250 \
-    --num_samples 50000 \
-    --cfg_cond True
-"
+python evaluator.py \
+    --ref-batch ./VIRTUAL_imagenet256_labeled.npz \
+    --sample-batch ${OUTDIR}/samples_50000x256x256x3.npz
 
 echo "All tasks completed at $(date)"

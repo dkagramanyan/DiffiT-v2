@@ -1,0 +1,381 @@
+"""
+Train DiffiT: Diffusion Vision Transformers for Image Generation.
+
+Uses PyTorch DDP for multi-GPU training with the same interface style
+as StyleGAN-XL / SAN-v2.
+
+Usage (multi-GPU):
+    torchrun --nproc_per_node=4 train.py \
+        --outdir ./training-runs \
+        --data ./datasets/imagenet_256x256.zip \
+        --image-size 256 --gpus 4 --batch 256
+
+Single GPU:
+    python train.py \
+        --outdir ./training-runs \
+        --data ./datasets/imagenet_256x256.zip \
+        --image-size 256 --gpus 1 --batch 64
+"""
+
+import copy
+import json
+import os
+import re
+import tempfile
+import time
+
+import click
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from diffusers.models import AutoencoderKL
+from torch.nn.parallel import DistributedDataParallel as DDP
+from tqdm import tqdm
+
+import diffit.diffit as diffit_module
+from diffit import create_diffusion, diffusion_defaults, NUM_CLASSES
+from diffit.dist_util import setup_dist, dev, get_rank, get_world_size, synchronize
+from diffit.image_datasets import load_data
+from diffit.fp16_util import MixedPrecisionTrainer
+from diffit.nn import update_ema
+from diffit import logger
+from diffit.timestep_sampler import create_named_schedule_sampler
+
+
+# ---------------------------------------------------------------------------
+
+
+def subprocess_fn(rank, c, temp_dir):
+    """Entry point for each DDP worker."""
+    logger.configure(log_dir=c["run_dir"])
+
+    if c["num_gpus"] > 1:
+        init_file = os.path.abspath(os.path.join(temp_dir, ".torch_distributed_init"))
+        init_method = f"file://{init_file}"
+        dist.init_process_group(
+            backend="nccl", init_method=init_method, rank=rank, world_size=c["num_gpus"]
+        )
+
+    torch.cuda.set_device(rank)
+    torch.backends.cuda.matmul.allow_tf32 = c.get("allow_tf32", True)
+
+    training_loop(rank=rank, **c)
+
+    if c["num_gpus"] > 1 and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+# ---------------------------------------------------------------------------
+
+
+def training_loop(
+    rank,
+    run_dir,
+    data,
+    image_size,
+    num_gpus,
+    batch_size,
+    batch_gpu,
+    total_kimg,
+    kimg_per_tick,
+    snap,
+    seed,
+    lr,
+    use_fp16,
+    ema_rate,
+    log_interval,
+    save_interval,
+    resume,
+    model_name,
+    schedule_sampler_name,
+    **_extra,
+):
+    """Main training loop for DiffiT."""
+    device = torch.device("cuda", rank)
+    is_main = rank == 0
+
+    # Seeding
+    torch.manual_seed(seed + rank)
+    np.random.seed(seed + rank)
+
+    # Build model
+    latent_size = image_size // 8
+    model = diffit_module.__dict__[model_name](input_size=latent_size)
+    model.to(device)
+
+    # EMA model
+    ema_model = copy.deepcopy(model)
+    ema_model.requires_grad_(False)
+    ema_model.eval()
+
+    # Create diffusion
+    diff_config = diffusion_defaults()
+    diffusion = create_diffusion(**diff_config)
+    schedule_sampler = create_named_schedule_sampler(schedule_sampler_name, diffusion)
+
+    # Mixed precision
+    mp_trainer = MixedPrecisionTrainer(model=model, use_fp16=use_fp16)
+
+    # Optimizer
+    opt = torch.optim.AdamW(mp_trainer.master_params, lr=lr, weight_decay=0.0)
+
+    # DDP wrapper
+    if num_gpus > 1:
+        ddp_model = DDP(model, device_ids=[rank])
+    else:
+        ddp_model = model
+
+    # VAE encoder (for latent diffusion)
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
+    vae.eval()
+    vae.requires_grad_(False)
+
+    # Resume
+    cur_nimg = 0
+    if resume is not None:
+        logger.log(f"Resuming from {resume}...")
+        ckpt = torch.load(resume, map_location="cpu")
+        model.load_state_dict(ckpt["model"])
+        ema_model.load_state_dict(ckpt["ema"])
+        opt.load_state_dict(ckpt["opt"])
+        cur_nimg = ckpt.get("cur_nimg", 0)
+        logger.log(f"Resumed at {cur_nimg // 1000} kimg")
+
+    # Data loader
+    logger.log("Loading data...")
+    data_iter = load_data(
+        data_dir=data,
+        batch_size=batch_gpu,
+        image_size=image_size,
+        class_cond=True,
+        random_flip=True,
+        num_workers=4,
+        distributed=(num_gpus > 1),
+    )
+
+    # Training
+    logger.log(f"Training for {total_kimg} kimg...")
+    tick_start_nimg = cur_nimg
+    tick_start_time = time.time()
+
+    while cur_nimg < total_kimg * 1000:
+        batch, cond = next(data_iter)
+        batch = batch.to(device)
+
+        # Encode to latent space
+        with torch.no_grad():
+            latent = vae.encode(batch).latent_dist.sample() * 0.18215
+
+        # Sample timesteps
+        t, weights = schedule_sampler.sample(latent.shape[0], device)
+
+        # Model kwargs
+        model_kwargs = {}
+        if "y" in cond:
+            model_kwargs["y"] = cond["y"].to(device)
+
+        # Compute losses
+        losses = diffusion.training_losses(ddp_model, latent, t, model_kwargs=model_kwargs)
+        loss = (losses["loss"] * weights).mean()
+
+        # Backward
+        mp_trainer.zero_grad()
+        mp_trainer.backward(loss)
+        took_step = mp_trainer.optimize(opt)
+
+        # Update EMA
+        if took_step:
+            update_ema(ema_model.parameters(), model.parameters(), rate=ema_rate)
+
+        cur_nimg += batch_gpu * num_gpus
+
+        # Logging
+        logger.logkv("loss", loss.item())
+        logger.logkv("step", cur_nimg // (batch_gpu * num_gpus))
+        logger.logkv("kimg", cur_nimg / 1000)
+        if "vb" in losses:
+            logger.logkv("vb_loss", losses["vb"].mean().item())
+        if "mse" in losses:
+            logger.logkv("mse_loss", losses["mse"].mean().item())
+
+        # Tick
+        done_kimg = (cur_nimg - tick_start_nimg) / 1000
+        if done_kimg >= kimg_per_tick or cur_nimg >= total_kimg * 1000:
+            tick_end_time = time.time()
+            elapsed = tick_end_time - tick_start_time
+            kimg_per_sec = done_kimg / elapsed if elapsed > 0 else 0
+
+            logger.logkv("kimg/s", kimg_per_sec)
+            logger.logkv("elapsed_sec", elapsed)
+            logger.dumpkvs()
+
+            tick_start_nimg = cur_nimg
+            tick_start_time = time.time()
+
+        # Snapshot
+        if (cur_nimg // 1000) % (snap * kimg_per_tick) == 0 and cur_nimg > 0 and is_main:
+            save_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}.pt")
+            logger.log(f"Saving snapshot to {save_path}...")
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "ema": ema_model.state_dict(),
+                    "opt": opt.state_dict(),
+                    "cur_nimg": cur_nimg,
+                    "config": {
+                        "image_size": image_size,
+                        "model_name": model_name,
+                    },
+                },
+                save_path,
+            )
+
+    # Final save
+    if is_main:
+        save_path = os.path.join(run_dir, "network-final.pt")
+        logger.log(f"Saving final model to {save_path}...")
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "ema": ema_model.state_dict(),
+                "opt": opt.state_dict(),
+                "cur_nimg": cur_nimg,
+                "config": {
+                    "image_size": image_size,
+                    "model_name": model_name,
+                },
+            },
+            save_path,
+        )
+
+    logger.log("Training complete.")
+
+
+# ---------------------------------------------------------------------------
+
+
+def launch_training(c, desc, outdir, dry_run):
+    """Set up run directory and launch training processes."""
+    # Pick output directory
+    prev_run_dirs = []
+    if os.path.isdir(outdir):
+        prev_run_dirs = [x for x in os.listdir(outdir) if os.path.isdir(os.path.join(outdir, x))]
+
+    prev_run_ids = [re.match(r"^\d+", x) for x in prev_run_dirs]
+    prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
+    cur_run_id = max(prev_run_ids, default=-1) + 1
+
+    if c.get("resume") is not None:
+        # Try to find matching directory
+        matching = [x for x in prev_run_dirs if re.fullmatch(r"\d{5}-" + re.escape(desc), x)]
+        if matching:
+            c["run_dir"] = os.path.join(outdir, matching[0])
+        else:
+            c["run_dir"] = os.path.join(outdir, f"{cur_run_id:05d}-{desc}")
+    else:
+        c["run_dir"] = os.path.join(outdir, f"{cur_run_id:05d}-{desc}")
+
+    # Print options
+    print()
+    print("Training options:")
+    print(json.dumps(c, indent=2, default=str))
+    print()
+    print(f"Output directory:    {c['run_dir']}")
+    print(f"Number of GPUs:      {c['num_gpus']}")
+    print(f"Batch size:          {c['batch_size']} images")
+    print(f"Training duration:   {c['total_kimg']} kimg")
+    print(f"Image size:          {c['image_size']}")
+    print()
+
+    if dry_run:
+        print("Dry run; exiting.")
+        return
+
+    # Create output directory
+    print("Creating output directory...")
+    os.makedirs(c["run_dir"], exist_ok=True)
+    with open(os.path.join(c["run_dir"], "training_options.json"), "wt") as f:
+        json.dump(c, f, indent=2, default=str)
+
+    # Launch processes
+    print("Launching processes...")
+    torch.multiprocessing.set_start_method("spawn", force=True)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        if c["num_gpus"] == 1:
+            subprocess_fn(rank=0, c=c, temp_dir=temp_dir)
+        else:
+            torch.multiprocessing.spawn(
+                fn=subprocess_fn, args=(c, temp_dir), nprocs=c["num_gpus"]
+            )
+
+
+# ---------------------------------------------------------------------------
+
+
+@click.command()
+# Required
+@click.option("--outdir", required=True, type=str, help="Where to save training runs", metavar="DIR")
+@click.option("--data", required=True, type=str, help="Training data path (directory or .zip)", metavar="PATH")
+@click.option("--gpus", required=True, type=click.IntRange(min=1), help="Number of GPUs", metavar="INT")
+@click.option("--batch", required=True, type=click.IntRange(min=1), help="Total batch size", metavar="INT")
+# Model
+@click.option("--image-size", type=int, default=256, show_default=True, help="Image resolution")
+@click.option("--model", "model_name", type=str, default="Diffit", show_default=True, help="Model constructor name")
+# Training
+@click.option("--kimg", type=click.IntRange(min=1), default=400000, show_default=True, help="Total training duration in kimg")
+@click.option("--tick", type=click.IntRange(min=1), default=4, show_default=True, help="How often to print progress (kimg)")
+@click.option("--snap", type=click.IntRange(min=1), default=50, show_default=True, help="How often to save snapshots (ticks)")
+@click.option("--seed", type=click.IntRange(min=0), default=0, show_default=True, help="Random seed")
+@click.option("--batch-gpu", type=click.IntRange(min=1), default=None, help="Limit batch size per GPU")
+@click.option("--lr", type=float, default=1e-4, show_default=True, help="Learning rate")
+@click.option("--fp32/--fp16", "use_fp32", default=True, show_default=True, help="Precision mode")
+@click.option("--ema-rate", type=float, default=0.9999, show_default=True, help="EMA decay rate")
+@click.option("--resume", type=str, default=None, help="Resume from checkpoint path")
+@click.option("--schedule-sampler", "schedule_sampler_name", type=str, default="uniform", show_default=True, help="Timestep sampler (uniform or loss-second-moment)")
+# Misc
+@click.option("--tf32/--no-tf32", "allow_tf32", default=True, show_default=True, help="Enable TF32 for matmul/conv")
+@click.option("--desc", type=str, default=None, help="String to include in result dir name")
+@click.option("--metrics", type=str, default="fid50k", show_default=True, help="Quality metrics")
+@click.option("-n", "--dry-run", is_flag=True, help="Print training options and exit")
+def main(**kwargs):
+    """Train DiffiT on class-conditional ImageNet."""
+    opts = kwargs
+
+    c = dict(
+        data=opts["data"],
+        image_size=opts["image_size"],
+        num_gpus=opts["gpus"],
+        batch_size=opts["batch"],
+        batch_gpu=opts["batch_gpu"] or opts["batch"] // opts["gpus"],
+        total_kimg=opts["kimg"],
+        kimg_per_tick=opts["tick"],
+        snap=opts["snap"],
+        seed=opts["seed"],
+        lr=opts["lr"],
+        use_fp16=not opts["use_fp32"],
+        ema_rate=opts["ema_rate"],
+        resume=opts["resume"],
+        model_name=opts["model_name"],
+        schedule_sampler_name=opts["schedule_sampler_name"],
+        allow_tf32=opts["allow_tf32"],
+        log_interval=10,
+        save_interval=10000,
+    )
+
+    # Sanity checks
+    if c["batch_size"] % c["num_gpus"] != 0:
+        raise click.ClickException("--batch must be a multiple of --gpus")
+    if c["batch_size"] % (c["num_gpus"] * c["batch_gpu"]) != 0:
+        raise click.ClickException("--batch must be a multiple of --gpus times --batch-gpu")
+
+    # Description string
+    desc = f"diffit-img{c['image_size']}-gpus{c['num_gpus']}-batch{c['batch_size']}"
+    if opts["desc"] is not None:
+        desc += f"-{opts['desc']}"
+
+    launch_training(c=c, desc=desc, outdir=opts["outdir"], dry_run=opts["dry_run"])
+
+
+if __name__ == "__main__":
+    main()

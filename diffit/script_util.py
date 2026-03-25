@@ -1,10 +1,14 @@
+"""
+Utility functions for scripts.
+"""
+
 import argparse
-import inspect
 
 from . import gaussian_diffusion as gd
 from .respace import SpacedDiffusion, space_timesteps
 
 NUM_CLASSES = 1000
+
 
 def add_dict_to_argparser(parser, default_dict):
     for k, v in default_dict.items():
@@ -21,9 +25,6 @@ def args_to_dict(args, keys):
 
 
 def str2bool(v):
-    """
-    https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse
-    """
     if isinstance(v, bool):
         return v
     if v.lower() in ("yes", "true", "t", "y", "1"):

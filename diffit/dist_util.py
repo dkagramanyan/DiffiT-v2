@@ -1,39 +1,15 @@
 """
-Helpers for distributed training.
+Helpers for distributed training using PyTorch DDP.
 """
 
-import io
 import os
 import socket
+import datetime
 
-import blobfile as bf
-from mpi4py import MPI
+import builtins
 import torch as th
 import torch.distributed as dist
-import builtins
-import datetime
 from safetensors.torch import load_file as safe_load_file
-
-# Change this to reflect your cluster layout.
-# The GPU for a given rank is (rank % GPUS_PER_NODE).
-GPUS_PER_NODE = 8
-
-SETUP_RETRY_COUNT = 3
-
-
-def synchronize():
-    if not dist.is_available():
-        return
-
-    if not dist.is_initialized():
-        return
-
-    world_size = dist.get_world_size()
-
-    if world_size == 1:
-        return
-
-    dist.barrier()
 
 
 def is_dist_avail_and_initialized():
@@ -50,57 +26,68 @@ def get_world_size():
     return dist.get_world_size()
 
 
+def get_rank():
+    if not is_dist_avail_and_initialized():
+        return 0
+    return dist.get_rank()
+
+
+def synchronize():
+    if not is_dist_avail_and_initialized():
+        return
+    if dist.get_world_size() == 1:
+        return
+    dist.barrier()
+
+
 def setup_for_distributed(is_master):
-    """
-    This function disables printing when not in master process
-    """
+    """Disable printing when not in master process."""
     builtin_print = builtins.print
 
     def print(*args, **kwargs):
         force = kwargs.pop("force", False)
-        force = force or (get_world_size() > 8)
         if is_master or force:
             now = datetime.datetime.now().time()
-            builtin_print("[{}] ".format(now), end="")  # print with time stamp
+            builtin_print(f"[{now}] ", end="")
             builtin_print(*args, **kwargs)
 
     builtins.print = print
 
 
-def setup_dist_multinode(args):
-    """
-    Setup a distributed process group.
-    """
-    if not dist.is_available() or not dist.is_initialized():
-        th.distributed.init_process_group(backend="nccl", init_method="env://")
-        world_size = dist.get_world_size()
-        local_rank = int(os.getenv("LOCAL_RANK"))
-        print("rank", local_rank)
-        device = local_rank
-        th.cuda.set_device(device)
-        setup_for_distributed(device == 0)
-
-        synchronize()
-    else:
-        print("ddp failed!")
-        exit()
-
-
 def setup_dist():
     """
-    Setup a distributed process group.
+    Initialize a distributed process group using environment variables
+    (MASTER_ADDR, MASTER_PORT, WORLD_SIZE, RANK, LOCAL_RANK).
+    Works with torchrun, srun, or manual env-var setup.
     """
     if dist.is_initialized():
         return
-    th.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    th.distributed.init_process_group(backend="nccl", init_method="env://")
-    synchronize()
+
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    th.cuda.set_device(local_rank)
+
+    if world_size > 1:
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            world_size=world_size,
+            rank=rank,
+        )
+        setup_for_distributed(rank == 0)
+        synchronize()
+
+    print(
+        f"[dist] rank={rank}, local_rank={local_rank}, "
+        f"world_size={world_size}, device=cuda:{local_rank}",
+        force=True,
+    )
 
 
 def dev():
-    """
-    Get the device to use for torch.distributed.
-    """
+    """Get the device for the current process."""
     if th.cuda.is_available():
         return th.device("cuda")
     return th.device("cpu")
@@ -108,32 +95,20 @@ def dev():
 
 def load_state_dict(path, **kwargs):
     """
-    Load either a PyTorch checkpoint (.pt/.pth/etc.) or a SafeTensors file.
-
-    SafeTensors files are loaded with safetensors.torch.load_file.
-    Other files are loaded with torch.load.
+    Load either a PyTorch checkpoint (.pt/.pth) or a SafeTensors file.
     """
     _, ext = os.path.splitext(path)
     ext = ext.lower()
 
     if ext == ".safetensors":
         map_location = kwargs.pop("map_location", "cpu")
-
-        if isinstance(map_location, th.device):
-            device = str(map_location)
-        else:
-            device = str(map_location)
-
-        # SafeTensors expects a device string such as "cpu" or "cuda".
-        return safe_load_file(path, device=device)
+        return safe_load_file(path, device=str(map_location))
 
     return th.load(path, **kwargs)
 
 
 def sync_params(params):
-    """
-    Synchronize a sequence of Tensors across ranks from rank 0.
-    """
+    """Synchronize a sequence of Tensors across ranks from rank 0."""
     for p in params:
         with th.no_grad():
             dist.broadcast(p, 0)

@@ -6,16 +6,18 @@
 from . import gaussian_diffusion as gd
 from .respace import SpacedDiffusion, space_timesteps
 
+NUM_CLASSES = 1000
+
 
 def create_diffusion(
     timestep_respacing,
-    noise_schedule="linear", 
+    noise_schedule="linear",
     use_kl=False,
     sigma_small=False,
     predict_xstart=False,
     learn_sigma=True,
     rescale_learned_sigmas=False,
-    diffusion_steps=1000
+    diffusion_steps=1000,
 ):
     betas = gd.get_named_beta_schedule(noise_schedule, diffusion_steps)
     if use_kl:
@@ -41,13 +43,12 @@ def create_diffusion(
             if not learn_sigma
             else gd.ModelVarType.LEARNED_RANGE
         ),
-        loss_type=loss_type
+        loss_type=loss_type,
     )
 
+
 def diffusion_defaults():
-    """
-    Defaults for image and classifier training.
-    """
+    """Defaults for diffusion process."""
     return dict(
         learn_sigma=True,
         diffusion_steps=1000,
@@ -59,10 +60,9 @@ def diffusion_defaults():
         rescale_learned_sigmas=False,
     )
 
+
 def model_and_diffusion_defaults():
-    """
-    Defaults for image training.
-    """
+    """Defaults for model + diffusion."""
     res = dict(
         image_size=256,
         mask_ratio=None,
