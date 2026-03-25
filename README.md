@@ -60,6 +60,22 @@ conda list | grep -E "torch|cuda|cudnn"
 ```
 
 
+## Pre-download Models (Offline Nodes)
+
+The training script downloads two external models on first run. If your compute nodes have no internet access, run this **on a login node** first:
+
+```bash
+python download_models.py
+```
+
+This caches the following models locally:
+- **stabilityai/sd-vae-ft-ema** (335 MB) — VAE for latent diffusion (`~/.cache/huggingface/`)
+- **stabilityai/sd-vae-ft-mse** (335 MB) — VAE variant for `gen_images.py --vae-decoder mse`
+- **InceptionV3** (104 MB) — for IS/FID metrics during training (`~/.cache/torch/hub/`)
+
+> If your compute nodes use a shared filesystem with the login node, the cached files will be available automatically. Otherwise, ensure `~/.cache/huggingface/` and `~/.cache/torch/hub/` are synced.
+
+
 ## Data Preparation
 
 Use `dataset_tool_for_imagenet.py` to convert an ImageNet-style directory into a ZIP archive with resized images and a `dataset.json` containing class labels.
@@ -331,6 +347,7 @@ DiffiT-v2/
 ├── gen_images.py                    # Individual PNG generation (click CLI)
 ├── evaluator.py                     # FID/IS evaluation (PyTorch)
 ├── dataset_tool_for_imagenet.py     # ImageNet -> ZIP dataset converter
+├── download_models.py               # Pre-download VAE + InceptionV3 for offline nodes
 ├── eval_run.sh                      # Evaluation convenience script
 ├── sbatch/                          # SLURM job scripts
 │   ├── a100/                       # A100 cluster (2 GPU)
