@@ -266,7 +266,7 @@ class Logger(object):
         d = self.name2val
         out = d.copy()
         for fmt in self.output_formats:
-            if isinstance(fmt, KVWriter):
+            if isinstance(fmt, KVWriter) and not isinstance(fmt, HumanOutputFormat):
                 fmt.writekvs(d)
         self.name2val.clear()
         self.name2cnt.clear()
