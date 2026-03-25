@@ -18,12 +18,8 @@ source activate diffit
 cd ..
 
 python train.py --outdir=./training-runs \
+        --cfg=diffit-512 \
         --data=./datasets/imagenet_512x512.zip \
-        --image-size 512 \
         --gpus=2 \
-        --batch=20 \
         --batch-gpu 10 \
-        --kimg 400000 \
-        --snap 75 \
-        --seed 0 \
-        --lr 1e-4
+        --snap 75

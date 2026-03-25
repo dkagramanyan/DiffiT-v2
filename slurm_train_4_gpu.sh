@@ -20,12 +20,8 @@ gcc --version
 conda list | grep cuda
 
 python train.py --outdir=./training-runs \
+        --cfg=diffit-256 \
         --data=./datasets/imagenet_256x256.zip \
-        --image-size 256 \
         --gpus=4 \
-        --batch=256 \
         --batch-gpu 64 \
-        --kimg 400000 \
-        --snap 50 \
-        --seed 0 \
-        --lr 1e-4
+        --snap 50

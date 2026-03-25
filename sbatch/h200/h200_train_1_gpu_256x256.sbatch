@@ -38,12 +38,8 @@ export TORCH_EXTENSIONS_DIR="${HOME}/.cache/torch_extensions"
 export CUDA_CACHE_PATH="${HOME}/.cache/cuda_cache"
 
 python train.py --outdir=./runs/diffit_h200_50 \
+        --cfg=diffit-256 \
         --data=./datasets/imagenet_256x256.zip \
-        --image-size 256 \
         --gpus=1 \
-        --batch=42 \
         --batch-gpu 42 \
-        --kimg 400000 \
-        --snap 100 \
-        --seed 0 \
-        --lr 1e-4
+        --snap 100

@@ -83,36 +83,37 @@ For custom datasets, point `--source` at a directory with the ImageNet folder st
 
 ## Training
 
+### Base configurations
+
+The `--cfg` flag selects a base configuration that sets model architecture,
+resolution, learning rate, diffusion settings, etc. Individual CLI options
+can still override any preset value.
+
+| Config | Resolution | Model | LR | FP16 | kimg | Schedule Sampler |
+|--------|-----------|-------|------|------|------|------------------|
+| `diffit-256` | 256 | Diffit (XL/2) | 1e-4 | off | 400000 | uniform |
+| `diffit-512` | 512 | Diffit (XL/2) | 1e-4 | on | 400000 | uniform |
+
 ### Single command
 
 Train DiffiT on ImageNet-256 with multi-GPU DDP:
 
 ```bash
 python train.py --outdir=./training-runs \
+    --cfg=diffit-256 \
     --data=./datasets/imagenet_256x256.zip \
-    --image-size 256 \
     --gpus 4 \
-    --batch 256 \
-    --batch-gpu 64 \
-    --kimg 400000 \
-    --snap 50 \
-    --seed 0 \
-    --lr 1e-4
+    --batch-gpu 64
 ```
 
 Train on ImageNet-512:
 
 ```bash
 python train.py --outdir=./training-runs \
+    --cfg=diffit-512 \
     --data=./datasets/imagenet_512x512.zip \
-    --image-size 512 \
     --gpus 4 \
-    --batch 100 \
-    --batch-gpu 25 \
-    --kimg 400000 \
-    --snap 50 \
-    --seed 0 \
-    --lr 1e-4
+    --batch-gpu 25
 ```
 
 ### SLURM sbatch scripts
@@ -140,12 +141,11 @@ sbatch sbatch/h200/h200_train_1_gpu_256x256.sbatch
 
 ```bash
 python train.py --outdir=./training-runs \
+    --cfg=diffit-256 \
     --data=./datasets/imagenet_256x256.zip \
-    --image-size 256 \
     --gpus 4 \
-    --batch 256 \
     --batch-gpu 64 \
-    --resume ./training-runs/00000-diffit-img256-gpus4-batch256/network-snapshot-001000.pt
+    --resume ./training-runs/00000-diffit-256-gpus4-batch256/network-snapshot-001000.pt
 ```
 
 ### Training options
@@ -153,28 +153,29 @@ python train.py --outdir=./training-runs \
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--outdir` | required | Output directory for training runs |
+| `--cfg` | required | Base configuration (`diffit-256`, `diffit-512`) |
 | `--data` | required | Path to dataset directory or .zip |
 | `--gpus` | required | Number of GPUs |
-| `--batch` | required | Total batch size |
-| `--image-size` | 256 | Image resolution (256 or 512) |
-| `--model` | Diffit | Model constructor name |
-| `--kimg` | 400000 | Total training duration in kimg |
-| `--tick` | 4 | Progress print interval (kimg) |
-| `--snap` | 50 | Snapshot save interval (ticks) |
+| `--batch-gpu` | required | Batch size per GPU (total batch = batch-gpu * gpus) |
+| `--image-size` | from cfg | Image resolution override |
+| `--model` | from cfg | Model constructor name override |
+| `--kimg` | from cfg | Total training duration in kimg |
+| `--tick` | from cfg | Progress print interval (kimg) |
+| `--snap` | from cfg | Snapshot save interval (ticks) |
 | `--seed` | 0 | Random seed |
-| `--batch-gpu` | auto | Batch size limit per GPU |
-| `--lr` | 1e-4 | Learning rate |
-| `--fp16` | off | Enable mixed precision (use `--fp16`, default is `--fp32`) |
-| `--ema-rate` | 0.9999 | EMA decay rate |
+| `--lr` | from cfg | Learning rate override |
+| `--fp32` | from cfg | Disable mixed precision |
+| `--ema-rate` | from cfg | EMA decay rate override |
 | `--resume` | None | Path to checkpoint for resuming |
-| `--schedule-sampler` | uniform | Timestep sampler (`uniform` or `loss-second-moment`) |
+| `--schedule-sampler` | from cfg | Timestep sampler override |
+| `--workers` | 4 | DataLoader worker processes |
 
 ### Training output
 
 Each run creates a directory with the following structure:
 
 ```
-training-runs/00000-diffit-img256-gpus4-batch256/
+training-runs/00000-diffit-256-gpus4-batch256/
 ├── training_options.json         # All training hyperparameters
 ├── log.txt                       # Human-readable training log
 ├── progress.csv                  # CSV training metrics
@@ -207,7 +208,7 @@ Generate individual PNG images for visual inspection:
 
 ```bash
 python gen_images.py \
-    --model-path ./training-runs/00000-diffit-img256-gpus4-batch256/network-final.pt \
+    --model-path ./training-runs/00000-diffit-256-gpus4-batch256/network-final.pt \
     --seeds 0-49 \
     --outdir ./generated/256 \
     --image-size 256 \
@@ -238,7 +239,7 @@ Generate 50K samples as `.npz` for FID evaluation:
 **ImageNet-256:**
 ```bash
 torchrun --nproc_per_node=4 sample.py \
-    --model-path ./training-runs/00000-diffit-img256-gpus4-batch256/network-final.pt \
+    --model-path ./training-runs/00000-diffit-256-gpus4-batch256/network-final.pt \
     --outdir ./samples/256 \
     --image-size 256 \
     --cfg-scale 4.4 \
@@ -251,7 +252,7 @@ torchrun --nproc_per_node=4 sample.py \
 **ImageNet-512:**
 ```bash
 torchrun --nproc_per_node=4 sample.py \
-    --model-path ./training-runs/00000-diffit-img512-gpus4-batch100/network-final.pt \
+    --model-path ./training-runs/00000-diffit-512-gpus4-batch100/network-final.pt \
     --outdir ./samples/512 \
     --image-size 512 \
     --cfg-scale 1.49 \

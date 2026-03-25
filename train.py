@@ -2,19 +2,21 @@
 Train DiffiT: Diffusion Vision Transformers for Image Generation.
 
 Uses PyTorch DDP for multi-GPU training with the same interface style
-as StyleGAN-XL / SAN-v2.
+as StyleGAN-XL / SAN-v2.  The --cfg flag selects a base configuration
+that sets model, resolution, learning rate, diffusion settings, etc.
+Individual options can still override any preset value.
 
 Usage (multi-GPU):
-    torchrun --nproc_per_node=4 train.py \
-        --outdir ./training-runs \
+    python train.py --outdir ./training-runs \
+        --cfg diffit-256 \
         --data ./datasets/imagenet_256x256.zip \
-        --image-size 256 --gpus 4 --batch 256
+        --gpus 4 --batch-gpu 64
 
 Single GPU:
-    python train.py \
-        --outdir ./training-runs \
+    python train.py --outdir ./training-runs \
+        --cfg diffit-256 \
         --data ./datasets/imagenet_256x256.zip \
-        --image-size 256 --gpus 1 --batch 64
+        --gpus 1 --batch-gpu 64
 """
 
 import copy
@@ -167,6 +169,7 @@ def training_loop(
     resume,
     model_name,
     schedule_sampler_name,
+    workers=4,
     **_extra,
 ):
     """Main training loop for DiffiT."""
@@ -228,7 +231,7 @@ def training_loop(
         image_size=image_size,
         class_cond=True,
         random_flip=True,
-        num_workers=4,
+        num_workers=workers,
         distributed=(num_gpus > 1),
     )
 
@@ -486,66 +489,119 @@ def launch_training(c, desc, outdir, dry_run):
 
 
 # ---------------------------------------------------------------------------
+# Base configurations (selected via --cfg, like SAN-v2)
+# ---------------------------------------------------------------------------
+
+BASE_CONFIGS = {
+    "diffit-256": dict(
+        image_size=256,
+        model_name="Diffit",
+        lr=1e-4,
+        total_kimg=400000,
+        kimg_per_tick=4,
+        snap=50,
+        ema_rate=0.9999,
+        use_fp16=False,
+        schedule_sampler_name="uniform",
+    ),
+    "diffit-512": dict(
+        image_size=512,
+        model_name="Diffit",
+        lr=1e-4,
+        total_kimg=400000,
+        kimg_per_tick=4,
+        snap=50,
+        ema_rate=0.9999,
+        use_fp16=True,
+        schedule_sampler_name="uniform",
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
 
 
 @click.command()
-# Required
-@click.option("--outdir", required=True, type=str, help="Where to save training runs", metavar="DIR")
-@click.option("--data", required=True, type=str, help="Training data path (directory or .zip)", metavar="PATH")
-@click.option("--gpus", required=True, type=click.IntRange(min=1), help="Number of GPUs", metavar="INT")
-@click.option("--batch", required=True, type=click.IntRange(min=1), help="Total batch size", metavar="INT")
-# Model
-@click.option("--image-size", type=int, default=256, show_default=True, help="Image resolution")
-@click.option("--model", "model_name", type=str, default="Diffit", show_default=True, help="Model constructor name")
-# Training
-@click.option("--kimg", type=click.IntRange(min=1), default=400000, show_default=True, help="Total training duration in kimg")
-@click.option("--tick", type=click.IntRange(min=1), default=4, show_default=True, help="How often to print progress (kimg)")
-@click.option("--snap", type=click.IntRange(min=1), default=50, show_default=True, help="How often to save snapshots (ticks)")
-@click.option("--seed", type=click.IntRange(min=0), default=0, show_default=True, help="Random seed")
-@click.option("--batch-gpu", type=click.IntRange(min=1), default=None, help="Limit batch size per GPU")
-@click.option("--lr", type=float, default=1e-4, show_default=True, help="Learning rate")
-@click.option("--fp32/--fp16", "use_fp32", default=True, show_default=True, help="Precision mode")
-@click.option("--ema-rate", type=float, default=0.9999, show_default=True, help="EMA decay rate")
-@click.option("--resume", type=str, default=None, help="Resume from checkpoint path")
-@click.option("--schedule-sampler", "schedule_sampler_name", type=str, default="uniform", show_default=True, help="Timestep sampler (uniform or loss-second-moment)")
-# Misc
-@click.option("--tf32/--no-tf32", "allow_tf32", default=True, show_default=True, help="Enable TF32 for matmul/conv")
-@click.option("--desc", type=str, default=None, help="String to include in result dir name")
-@click.option("--metrics", type=str, default="fid50k", show_default=True, help="Quality metrics")
-@click.option("-n", "--dry-run", is_flag=True, help="Print training options and exit")
+
+# Required.
+@click.option("--outdir",       help="Where to save training runs", metavar="DIR",             type=str, required=True)
+@click.option("--cfg",          help="Base configuration",                                      type=click.Choice(list(BASE_CONFIGS.keys())), required=True)
+@click.option("--data",         help="Training data path (directory or .zip)", metavar="PATH",  type=str, required=True)
+@click.option("--gpus",         help="Number of GPUs", metavar="INT",                          type=click.IntRange(min=1), required=True)
+@click.option("--batch-gpu",    help="Batch size per GPU (total batch = batch-gpu * gpus)", metavar="INT", type=click.IntRange(min=1), required=True)
+
+# Optional overrides (cfg provides defaults).
+@click.option("--image-size",   help="Image resolution [default: from cfg]",                    type=int, default=None)
+@click.option("--model",        "model_name", help="Model constructor name [default: from cfg]", type=str, default=None)
+@click.option("--kimg",         help="Total training duration [default: from cfg]", metavar="KIMG", type=click.IntRange(min=1), default=None)
+@click.option("--tick",         help="How often to print progress [default: from cfg]", metavar="KIMG", type=click.IntRange(min=1), default=None)
+@click.option("--snap",         help="How often to save snapshots [default: from cfg]", metavar="TICKS", type=click.IntRange(min=1), default=None)
+@click.option("--seed",         help="Random seed", metavar="INT",                             type=click.IntRange(min=0), default=0, show_default=True)
+@click.option("--lr",           help="Learning rate [default: from cfg]", metavar="FLOAT",     type=float, default=None)
+@click.option("--fp32",         help="Disable mixed-precision", metavar="BOOL",                type=bool, default=None)
+@click.option("--ema-rate",     help="EMA decay rate [default: from cfg]", metavar="FLOAT",    type=float, default=None)
+@click.option("--resume",       help="Resume from checkpoint path", metavar="PATH",            type=str, default=None)
+@click.option("--schedule-sampler", "schedule_sampler_name", help="Timestep sampler [default: from cfg]", type=str, default=None)
+
+# Misc settings.
+@click.option("--desc",         help="String to include in result dir name", metavar="STR",    type=str, default=None)
+@click.option("--metrics",      help="Quality metrics", metavar="NAME",                        type=str, default="fid50k", show_default=True)
+@click.option("--tf32/--no-tf32", "allow_tf32", help="Enable TF32 for matmul/conv",            default=True, show_default=True)
+@click.option("--workers",      help="DataLoader worker processes", metavar="INT",             type=click.IntRange(min=1), default=4, show_default=True)
+@click.option("-n", "--dry-run", help="Print training options and exit",                        is_flag=True)
+
 def main(**kwargs):
     """Train DiffiT on class-conditional ImageNet."""
     opts = kwargs
 
+    # Start from base configuration.
+    cfg = dict(BASE_CONFIGS[opts["cfg"]])
+
+    # CLI overrides: any explicitly provided option takes precedence.
+    if opts["image_size"] is not None:
+        cfg["image_size"] = opts["image_size"]
+    if opts["model_name"] is not None:
+        cfg["model_name"] = opts["model_name"]
+    if opts["kimg"] is not None:
+        cfg["total_kimg"] = opts["kimg"]
+    if opts["tick"] is not None:
+        cfg["kimg_per_tick"] = opts["tick"]
+    if opts["snap"] is not None:
+        cfg["snap"] = opts["snap"]
+    if opts["lr"] is not None:
+        cfg["lr"] = opts["lr"]
+    if opts["fp32"] is not None:
+        cfg["use_fp16"] = not opts["fp32"]
+    if opts["ema_rate"] is not None:
+        cfg["ema_rate"] = opts["ema_rate"]
+    if opts["schedule_sampler_name"] is not None:
+        cfg["schedule_sampler_name"] = opts["schedule_sampler_name"]
+
+    # Build full config dict.
     c = dict(
         data=opts["data"],
-        image_size=opts["image_size"],
+        image_size=cfg["image_size"],
         num_gpus=opts["gpus"],
-        batch_size=opts["batch"],
-        batch_gpu=opts["batch_gpu"] or opts["batch"] // opts["gpus"],
-        total_kimg=opts["kimg"],
-        kimg_per_tick=opts["tick"],
-        snap=opts["snap"],
+        batch_size=opts["batch_gpu"] * opts["gpus"],
+        batch_gpu=opts["batch_gpu"],
+        total_kimg=cfg["total_kimg"],
+        kimg_per_tick=cfg["kimg_per_tick"],
+        snap=cfg["snap"],
         seed=opts["seed"],
-        lr=opts["lr"],
-        use_fp16=not opts["use_fp32"],
-        ema_rate=opts["ema_rate"],
+        lr=cfg["lr"],
+        use_fp16=cfg["use_fp16"],
+        ema_rate=cfg["ema_rate"],
         resume=opts["resume"],
-        model_name=opts["model_name"],
-        schedule_sampler_name=opts["schedule_sampler_name"],
+        model_name=cfg["model_name"],
+        schedule_sampler_name=cfg["schedule_sampler_name"],
         allow_tf32=opts["allow_tf32"],
+        workers=opts["workers"],
         log_interval=10,
         save_interval=10000,
     )
 
-    # Sanity checks
-    if c["batch_size"] % c["num_gpus"] != 0:
-        raise click.ClickException("--batch must be a multiple of --gpus")
-    if c["batch_size"] % (c["num_gpus"] * c["batch_gpu"]) != 0:
-        raise click.ClickException("--batch must be a multiple of --gpus times --batch-gpu")
-
-    # Description string
-    desc = f"diffit-img{c['image_size']}-gpus{c['num_gpus']}-batch{c['batch_size']}"
+    # Description string.
+    desc = f"{opts['cfg']}-gpus{c['num_gpus']}-batch{c['batch_size']}"
     if opts["desc"] is not None:
         desc += f"-{opts['desc']}"
 
