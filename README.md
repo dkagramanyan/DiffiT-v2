@@ -34,58 +34,211 @@ For business inquiries, please visit our website and submit the form: [NVIDIA Re
 
 ## Installation
 
-```bash
+Create conda env with python=3.12
+
+```
 pip install -r requirements.txt
 ```
 
-## Dataset Preparation
+Uninstall old anaconda and cuda
 
-To prepare an ImageNet dataset for training, use the dataset tool:
+```
+pip uninstall torch torchvision -y
+pip uninstall nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12 nvidia-cudnn-cu12 -y
+```
 
-```bash
+Install new versions
+
+```
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+```
+
+Check
+
+```
+conda list | grep -E "torch|cuda|cudnn"
+```
+
+
+## Data Preparation
+
+Use `dataset_tool_for_imagenet.py` to convert an ImageNet-style directory into a ZIP archive with resized images and a `dataset.json` containing class labels.
+
+```
 python dataset_tool_for_imagenet.py \
     --source /path/to/ILSVRC \
     --dest ./datasets/imagenet_256x256.zip \
     --resolution 256x256 \
     --transform center-crop
+
+python dataset_tool_for_imagenet.py \
+    --source /path/to/ILSVRC \
+    --dest ./datasets/imagenet_512x512.zip \
+    --resolution 512x512 \
+    --transform center-crop
 ```
 
-This creates a ZIP archive with resized images and a `dataset.json` containing class labels.
+For custom datasets, point `--source` at a directory with the ImageNet folder structure (`train/<class_id>/image.JPEG`). The tool will create a ZIP with resized images and a JSON with class labels.
+
 
 ## Training
 
-Train DiffiT on ImageNet with multi-GPU DDP:
+### Single command
+
+Train DiffiT on ImageNet-256 with multi-GPU DDP:
 
 ```bash
-python train.py \
-    --outdir ./training-runs \
-    --data ./datasets/imagenet_256x256.zip \
+python train.py --outdir=./training-runs \
+    --data=./datasets/imagenet_256x256.zip \
     --image-size 256 \
     --gpus 4 \
     --batch 256 \
     --batch-gpu 64 \
     --kimg 400000 \
-    --snap 50
+    --snap 50 \
+    --seed 0 \
+    --lr 1e-4
 ```
 
-Or use the provided SLURM script:
+Train on ImageNet-512:
 
 ```bash
-sbatch slurm_train_4_gpu.sh
+python train.py --outdir=./training-runs \
+    --data=./datasets/imagenet_512x512.zip \
+    --image-size 512 \
+    --gpus 4 \
+    --batch 100 \
+    --batch-gpu 25 \
+    --kimg 400000 \
+    --snap 50 \
+    --seed 0 \
+    --lr 1e-4
 ```
 
-Training uses PyTorch DDP for multi-GPU parallelization, mixed precision via `MixedPrecisionTrainer`, and EMA weight averaging.
+### SLURM sbatch scripts
 
-## Sampling
+Pre-configured sbatch files are provided for A100 and H200 clusters:
 
-### Bulk Sampling for FID Evaluation
+**A100 (2 GPU):**
+```bash
+sbatch sbatch/a100/train_2_gpu_256x256.sbatch
+sbatch sbatch/a100/train_2_gpu_512x512.sbatch
+```
+
+**H200 (4 GPU):**
+```bash
+sbatch sbatch/h200/h200_train_4_gpu_256x256.sbatch
+sbatch sbatch/h200/h200_train_4_gpu_512x512.sbatch
+```
+
+**H200 (1 GPU):**
+```bash
+sbatch sbatch/h200/h200_train_1_gpu_256x256.sbatch
+```
+
+### Resume from checkpoint
+
+```bash
+python train.py --outdir=./training-runs \
+    --data=./datasets/imagenet_256x256.zip \
+    --image-size 256 \
+    --gpus 4 \
+    --batch 256 \
+    --batch-gpu 64 \
+    --resume ./training-runs/00000-diffit-img256-gpus4-batch256/network-snapshot-001000.pt
+```
+
+### Training options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--outdir` | required | Output directory for training runs |
+| `--data` | required | Path to dataset directory or .zip |
+| `--gpus` | required | Number of GPUs |
+| `--batch` | required | Total batch size |
+| `--image-size` | 256 | Image resolution (256 or 512) |
+| `--model` | Diffit | Model constructor name |
+| `--kimg` | 400000 | Total training duration in kimg |
+| `--tick` | 4 | Progress print interval (kimg) |
+| `--snap` | 50 | Snapshot save interval (ticks) |
+| `--seed` | 0 | Random seed |
+| `--batch-gpu` | auto | Batch size limit per GPU |
+| `--lr` | 1e-4 | Learning rate |
+| `--fp16` | off | Enable mixed precision (use `--fp16`, default is `--fp32`) |
+| `--ema-rate` | 0.9999 | EMA decay rate |
+| `--resume` | None | Path to checkpoint for resuming |
+| `--schedule-sampler` | uniform | Timestep sampler (`uniform` or `loss-second-moment`) |
+
+### Training output
+
+Each run creates a directory with the following structure:
+
+```
+training-runs/00000-diffit-img256-gpus4-batch256/
+├── training_options.json         # All training hyperparameters
+├── log.txt                       # Human-readable training log
+├── progress.csv                  # CSV training metrics
+├── progress.json                 # JSON training metrics
+├── stats.jsonl                   # JSON Lines stats (SAN-v2 style)
+├── events.out.tfevents.*         # TensorBoard event files
+├── reals.png                     # Real training image grid
+├── fakes_init.png                # Initial generated images (before training)
+├── fakes000200.png               # Generated images at 200 kimg
+├── fakes000400.png               # Generated images at 400 kimg
+├── ...
+├── network-snapshot-001000.pt    # Periodic checkpoint
+├── network-snapshot-002000.pt
+├── ...
+└── network-final.pt              # Final trained model
+```
+
+Monitor training with TensorBoard:
+
+```bash
+tensorboard --logdir ./training-runs
+```
+
+
+## Generating Samples
+
+### Individual image generation
+
+Generate individual PNG images for visual inspection:
+
+```bash
+python gen_images.py \
+    --model-path ./training-runs/00000-diffit-img256-gpus4-batch256/network-final.pt \
+    --seeds 0-49 \
+    --outdir ./generated/256 \
+    --image-size 256 \
+    --cfg-scale 4.4 \
+    --num-sampling-steps 250
+```
+
+Options:
+- `--seeds`: Comma-separated list or ranges (e.g., `0,1,4-6`)
+- `--class-idx`: Specific class label (random if not specified)
+- `--batch-sz`: Batch size per seed
+- `--use-ddim`: Use DDIM sampling instead of DDPM
+- `--cfg-scale`: Classifier-free guidance scale (4.4 for 256, 1.49 for 512)
+- `--scale-pow`: Power for cosine CFG schedule
+
+SLURM:
+```bash
+sbatch sbatch/a100/generate_1_gpu_256x256.sbatch
+sbatch sbatch/a100/generate_1_gpu_512x512.sbatch
+sbatch sbatch/h200/generate_4_gpu_256x256.sbatch
+sbatch sbatch/h200/generate_4_gpu_512x512.sbatch
+```
+
+### Bulk sampling for FID evaluation
 
 Generate 50K samples as `.npz` for FID evaluation:
 
 **ImageNet-256:**
 ```bash
 torchrun --nproc_per_node=4 sample.py \
-    --model-path ./ckpts/diffit_256.safetensors \
+    --model-path ./training-runs/00000-diffit-img256-gpus4-batch256/network-final.pt \
     --outdir ./samples/256 \
     --image-size 256 \
     --cfg-scale 4.4 \
@@ -98,7 +251,7 @@ torchrun --nproc_per_node=4 sample.py \
 **ImageNet-512:**
 ```bash
 torchrun --nproc_per_node=4 sample.py \
-    --model-path ./ckpts/diffit_512.safetensors \
+    --model-path ./training-runs/00000-diffit-img512-gpus4-batch100/network-final.pt \
     --outdir ./samples/512 \
     --image-size 512 \
     --cfg-scale 1.49 \
@@ -108,33 +261,16 @@ torchrun --nproc_per_node=4 sample.py \
     --cfg-cond
 ```
 
-### Individual Image Generation
-
-Generate individual PNG images for visual inspection:
-
+SLURM:
 ```bash
-python gen_images.py \
-    --model-path ./ckpts/diffit_256.safetensors \
-    --seeds 0-49 \
-    --outdir ./out \
-    --image-size 256 \
-    --cfg-scale 4.4 \
-    --num-sampling-steps 250
+sbatch sbatch/a100/sample_4_gpu_256x256.sbatch
+sbatch sbatch/a100/sample_4_gpu_512x512.sbatch
+sbatch sbatch/h200/sample_4_gpu_256x256.sbatch
+sbatch sbatch/h200/sample_4_gpu_512x512.sbatch
 ```
 
-Options:
-- `--seeds`: Comma-separated list or ranges (e.g., `0,1,4-6`)
-- `--class-idx`: Specific class label (random if not specified)
-- `--batch-sz`: Batch size per seed
-- `--use-ddim`: Use DDIM sampling instead of DDPM
 
-SLURM scripts are also provided:
-```bash
-sbatch slurm_sample_256.sh
-sbatch slurm_sample_512.sh
-```
-
-## Evaluation (FID-50K)
+## Quality Metrics
 
 Compute FID-50K and other metrics using the PyTorch-based evaluator:
 
@@ -167,6 +303,7 @@ Metrics computed: **Inception Score**, **FID**, **sFID**, **Precision**, **Recal
 
 > **Note:** Small variations in the reported numbers are expected depending on the device used for sampling and due to numerical precision differences.
 
+
 ## Project Structure
 
 ```
@@ -178,7 +315,7 @@ DiffiT-v2/
 │   ├── respace.py                  # Timestep respacing
 │   ├── dist_util.py                # Distributed training (PyTorch DDP)
 │   ├── image_datasets.py           # Dataset loading (dir/zip + DistributedSampler)
-│   ├── logger.py                   # Logging (stdout, JSON, CSV)
+│   ├── logger.py                   # Logging (stdout, JSON, CSV, TensorBoard)
 │   ├── fp16_util.py                # Mixed precision training
 │   ├── nn.py                       # Neural network utilities
 │   ├── timestep_sampler.py         # Timestep sampling strategies
@@ -188,11 +325,24 @@ DiffiT-v2/
 ├── sample.py                        # Bulk sampling for FID (.npz output)
 ├── gen_images.py                    # Individual PNG generation (click CLI)
 ├── evaluator.py                     # FID/IS evaluation (PyTorch)
-├── dataset_tool_for_imagenet.py     # ImageNet → ZIP dataset converter
+├── dataset_tool_for_imagenet.py     # ImageNet -> ZIP dataset converter
 ├── eval_run.sh                      # Evaluation convenience script
-├── slurm_train_4_gpu.sh             # SLURM: 4-GPU training
-├── slurm_sample_256.sh              # SLURM: 256x256 sampling + eval
-├── slurm_sample_512.sh              # SLURM: 512x512 sampling + eval
+├── sbatch/                          # SLURM job scripts
+│   ├── a100/                       # A100 cluster (2 GPU)
+│   │   ├── train_2_gpu_256x256.sbatch
+│   │   ├── train_2_gpu_512x512.sbatch
+│   │   ├── generate_1_gpu_256x256.sbatch
+│   │   ├── generate_1_gpu_512x512.sbatch
+│   │   ├── sample_4_gpu_256x256.sbatch
+│   │   └── sample_4_gpu_512x512.sbatch
+│   └── h200/                       # H200 cluster (4 GPU)
+│       ├── h200_train_4_gpu_256x256.sbatch
+│       ├── h200_train_4_gpu_512x512.sbatch
+│       ├── h200_train_1_gpu_256x256.sbatch
+│       ├── generate_4_gpu_256x256.sbatch
+│       ├── generate_4_gpu_512x512.sbatch
+│       ├── sample_4_gpu_256x256.sbatch
+│       └── sample_4_gpu_512x512.sbatch
 ├── requirements.txt                 # Python dependencies
 └── README.md
 ```
