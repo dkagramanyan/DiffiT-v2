@@ -34,29 +34,10 @@ For business inquiries, please visit our website and submit the form: [NVIDIA Re
 
 ## Installation
 
-Create conda env with python=3.12
-
-```
+```bash
+conda create -n diffit python=3.11 -y
+conda activate diffit
 pip install -r requirements.txt
-```
-
-Uninstall old anaconda and cuda
-
-```
-pip uninstall torch torchvision -y
-pip uninstall nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12 nvidia-cudnn-cu12 -y
-```
-
-Install new versions
-
-```
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
-```
-
-Check
-
-```
-conda list | grep -E "torch|cuda|cudnn"
 ```
 
 
