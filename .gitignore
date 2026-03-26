@@ -2,3 +2,4 @@
 datasets/*
 diffit/__pycache__/*
 training-runs/*
+*.log

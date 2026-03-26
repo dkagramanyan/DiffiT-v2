@@ -469,28 +469,80 @@ def training_loop(
         del ref_images
         logger.log("Reference features computed.")
 
-    # Save real training images grid
+    # Discover number of classes in dataset
+    probe_iter = load_data(
+        data_dir=data, batch_size=64, image_size=image_size,
+        class_cond=True, random_flip=False, num_workers=2,
+        distributed=False,
+    )
+    discovered_classes = set()
+    for _ in range(50):  # probe up to 3200 samples
+        _, cond_probe = next(probe_iter)
+        if "y" in cond_probe:
+            discovered_classes.update(cond_probe["y"].numpy().tolist())
+    num_dataset_classes = max(len(discovered_classes), 1)
+    sorted_class_list = sorted(discovered_classes)
+    del probe_iter
+    logger.log(f"Discovered {num_dataset_classes} classes in dataset.")
+
+    # Build class-sorted grid: each row cycles through classes
+    # Row 0 → class 0, row 1 → class 1, ..., row K → class K % num_classes
+    grid_row_classes = [sorted_class_list[r % num_dataset_classes] for r in range(gh)]
+
+    # Save real training images grid (sorted by class)
     if is_main:
         logger.log("Exporting sample images (reals.png, fakes_init.png)...")
-        real_iter = load_data(
-            data_dir=data, batch_size=n_grid, image_size=image_size,
+        # Collect images per class
+        class_images = {c: [] for c in sorted_class_list}
+        images_per_class_needed = gw
+        collect_iter = load_data(
+            data_dir=data, batch_size=64, image_size=image_size,
             class_cond=True, random_flip=False, num_workers=2,
             distributed=False,
         )
-        real_batch, _ = next(real_iter)
-        # real_batch is [-1, 1] float tensor NCHW
-        real_np = ((real_batch + 1) * 127.5).clamp(0, 255).to(torch.uint8).numpy()
-        save_image_grid(real_np, os.path.join(run_dir, "reals.png"), drange=[0, 255], grid_size=grid_size)
+        # How many images we need per class (some classes appear in multiple rows)
+        class_count_needed = {}
+        for c in grid_row_classes:
+            class_count_needed[c] = class_count_needed.get(c, 0) + gw
 
-    # Fixed latents + classes for consistent snapshot generation
+        while any(len(class_images[c]) < class_count_needed.get(c, 0) for c in sorted_class_list):
+            img_batch, cond_batch = next(collect_iter)
+            if "y" not in cond_batch:
+                break
+            for i in range(img_batch.shape[0]):
+                c = int(cond_batch["y"][i].item())
+                if c in class_images and len(class_images[c]) < class_count_needed.get(c, 0):
+                    img_np = ((img_batch[i:i+1] + 1) * 127.5).clamp(0, 255).to(torch.uint8).numpy()
+                    class_images[c].append(img_np)
+
+        # Assemble grid: row by row
+        grid_images = []
+        class_cursors = {c: 0 for c in sorted_class_list}
+        for r in range(gh):
+            c = grid_row_classes[r]
+            for col in range(gw):
+                idx = class_cursors[c]
+                if idx < len(class_images[c]):
+                    grid_images.append(class_images[c][idx])
+                    class_cursors[c] += 1
+                else:
+                    # Fallback: black image
+                    grid_images.append(np.zeros((1, 3, image_size, image_size), dtype=np.uint8))
+        real_np = np.concatenate(grid_images, axis=0)
+        save_image_grid(real_np, os.path.join(run_dir, "reals.png"), drange=[0, 255], grid_size=grid_size)
+        del class_images, collect_iter
+
+    # Fixed latents + class-sorted classes for consistent snapshot generation
     grid_z = torch.randn(
         n_grid, 4, latent_size, latent_size, device=device,
         generator=torch.Generator(device=device).manual_seed(seed * max(num_gpus, 1)),
     )
-    grid_classes = torch.randint(
-        0, NUM_CLASSES, (n_grid,), device=device,
-        generator=torch.Generator(device=device).manual_seed(seed * max(num_gpus, 1)),
-    )
+    # Each row gets a single class, cycling through discovered classes
+    grid_classes_list = []
+    for r in range(gh):
+        c = grid_row_classes[r]
+        grid_classes_list.extend([c] * gw)
+    grid_classes = torch.tensor(grid_classes_list, device=device, dtype=torch.long)
 
     # Save initial fakes
     if is_main:
