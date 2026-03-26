@@ -92,6 +92,12 @@ python dataset_tool_for_imagenet.py \
     --dest ./datasets/imagenet_512x512.zip \
     --resolution 512x512 \
     --transform center-crop
+
+python dataset_tool_for_imagenet.py \
+    --source /path/to/ILSVRC \
+    --dest ./datasets/imagenet_1024x1024.zip \
+    --resolution 1024x1024 \
+    --transform center-crop
 ```
 
 For custom datasets, point `--source` at a directory with the ImageNet folder structure (`train/<class_id>/image.JPEG`). The tool will create a ZIP with resized images and a JSON with class labels.
@@ -109,6 +115,7 @@ can still override any preset value.
 |--------|-----------|-------|------|------|------|------------------|
 | `diffit-256` | 256 | Diffit (XL/2) | 1e-4 | off | 400000 | uniform |
 | `diffit-512` | 512 | Diffit (XL/2) | 1e-4 | on | 400000 | uniform |
+| `diffit-1024` | 1024 | Diffit (XL/2) | 1e-4 | on | 400000 | uniform |
 
 ### Single command
 

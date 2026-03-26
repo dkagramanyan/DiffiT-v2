@@ -859,6 +859,18 @@ BASE_CONFIGS = {
         schedule_sampler_name="uniform",
         num_fid_samples=1024,
     ),
+    "diffit-1024": dict(
+        image_size=1024,
+        model_name="Diffit",
+        lr=1e-4,
+        total_kimg=400000,
+        kimg_per_tick=4,
+        snap=50,
+        ema_rate=0.9999,
+        use_fp16=True,
+        schedule_sampler_name="uniform",
+        num_fid_samples=512,
+    ),
 }
 
 

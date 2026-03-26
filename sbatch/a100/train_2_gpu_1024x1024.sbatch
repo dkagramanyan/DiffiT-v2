@@ -1,0 +1,25 @@
+#!/bin/bash
+#SBATCH --job-name=DiffiT-1024
+#SBATCH --gpus=2
+#SBATCH --cpus-per-task=4
+#SBATCH --time=4-0:0
+#SBATCH --nodes=1
+#SBATCH --partition=normal
+#SBATCH --account=proj_1631
+#SBATCH --constraint="type_e"
+
+module purge
+module load Python/Anaconda
+module load CUDA/12.4
+module load gnu13/13.3
+
+source activate diffit
+
+cd ..
+
+python train.py --outdir=./training-runs \
+        --cfg=diffit-1024 \
+        --data=./datasets/imagenet_1024x1024.zip \
+        --gpus=2 \
+        --batch-gpu 4 \
+        --snap 100
