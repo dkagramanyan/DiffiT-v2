@@ -1,7 +1,5 @@
---index-url https://download.pytorch.org/whl/cu130
-torch
-torchvision
---extra-index-url https://pypi.org/simple
+torch>=2.0.0
+torchvision>=0.15.0
 timm==0.9.16
 diffusers>=0.26.3
 tqdm>=4.64.1
@@ -12,3 +10,4 @@ safetensors>=0.3.0
 scipy>=1.10.0,<=1.14.1
 accelerate>=0.27.2
 tensorboard>=2.14.0
+psutil>=5.9.0
