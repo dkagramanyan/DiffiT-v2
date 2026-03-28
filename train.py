@@ -42,7 +42,6 @@ import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults, NUM_CLASSES
 from diffit.dist_util import setup_dist, dev, get_rank, get_world_size, synchronize
 from diffit.image_datasets import load_data
-from diffit.fp16_util import MixedPrecisionTrainer
 from diffit.nn import update_ema
 from diffit import logger
 from diffit.timestep_sampler import create_named_schedule_sampler
@@ -328,6 +327,8 @@ def subprocess_fn(rank, c, temp_dir):
 
     torch.cuda.set_device(rank)
     torch.backends.cuda.matmul.allow_tf32 = c.get("allow_tf32", True)
+    torch.backends.cudnn.allow_tf32 = c.get("allow_tf32", True)
+    torch.backends.cudnn.benchmark = True
 
     training_loop(rank=rank, **c)
 
@@ -358,6 +359,7 @@ def training_loop(
     resume,
     model_name,
     schedule_sampler_name,
+    amp_dtype="fp16",
     workers=4,
     num_fid_samples=1024,
     **_extra,
@@ -369,6 +371,16 @@ def training_loop(
     # Seeding
     torch.manual_seed(seed + rank)
     np.random.seed(seed + rank)
+
+    # Resolve AMP dtype: bf16 preferred on Ampere+ (A100, H100), fp16 fallback
+    if amp_dtype == "bf16" and torch.cuda.is_bf16_supported():
+        amp_dtype_torch = torch.bfloat16
+    else:
+        amp_dtype_torch = torch.float16
+    amp_enabled = use_fp16
+    use_grad_scaler = amp_enabled and (amp_dtype_torch == torch.float16)
+    if is_main:
+        logger.log(f"AMP: enabled={amp_enabled}, dtype={amp_dtype_torch}, grad_scaler={use_grad_scaler}")
 
     # Build model
     latent_size = image_size // 8
@@ -385,17 +397,25 @@ def training_loop(
     diffusion = create_diffusion(**diff_config)
     schedule_sampler = create_named_schedule_sampler(schedule_sampler_name, diffusion)
 
-    # Mixed precision
-    mp_trainer = MixedPrecisionTrainer(model=model, use_fp16=use_fp16)
+    # Optimizer (directly on model parameters — torch.amp handles precision)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
 
-    # Optimizer
-    opt = torch.optim.AdamW(mp_trainer.master_params, lr=lr, weight_decay=0.0)
+    # GradScaler for fp16 (not needed for bf16)
+    scaler = torch.amp.GradScaler(device="cuda", enabled=use_grad_scaler)
 
-    # DDP wrapper
+    # DDP wrapper with modern optimizations
     if num_gpus > 1:
-        ddp_model = DDP(model, device_ids=[rank])
+        ddp_model = DDP(
+            model,
+            device_ids=[rank],
+            gradient_as_bucket_view=True,
+            static_graph=True,
+        )
     else:
         ddp_model = model
+
+    # torch.compile for kernel fusion (PyTorch 2.x)
+    compiled_model = torch.compile(ddp_model)
 
     # VAE encoder (for latent diffusion)
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
@@ -410,6 +430,8 @@ def training_loop(
         model.load_state_dict(ckpt["model"])
         ema_model.load_state_dict(ckpt["ema"])
         opt.load_state_dict(ckpt["opt"])
+        if "scaler" in ckpt and use_grad_scaler:
+            scaler.load_state_dict(ckpt["scaler"])
         cur_nimg = ckpt.get("cur_nimg", 0)
         logger.log(f"Resumed at {cur_nimg // 1000} kimg")
 
@@ -574,10 +596,10 @@ def training_loop(
 
     while cur_nimg < total_kimg * 1000:
         batch, cond = next(data_iter)
-        batch = batch.to(device)
+        batch = batch.to(device, non_blocking=True)
 
-        # Encode to latent space
-        with torch.no_grad():
+        # Encode to latent space (under autocast for VAE convolutions)
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype_torch, enabled=amp_enabled):
             latent = vae.encode(batch).latent_dist.sample() * 0.18215
 
         # Sample timesteps
@@ -586,20 +608,21 @@ def training_loop(
         # Model kwargs
         model_kwargs = {}
         if "y" in cond:
-            model_kwargs["y"] = cond["y"].to(device)
+            model_kwargs["y"] = cond["y"].to(device, non_blocking=True)
 
-        # Compute losses
-        losses = diffusion.training_losses(ddp_model, latent, t, model_kwargs=model_kwargs)
-        loss = (losses["loss"] * weights).mean()
+        # Forward under autocast
+        with torch.amp.autocast("cuda", dtype=amp_dtype_torch, enabled=amp_enabled):
+            losses = diffusion.training_losses(compiled_model, latent, t, model_kwargs=model_kwargs)
+            loss = (losses["loss"] * weights).mean()
 
-        # Backward
-        mp_trainer.zero_grad()
-        mp_trainer.backward(loss)
-        took_step = mp_trainer.optimize(opt)
+        # Backward with GradScaler (no-op when using bf16)
+        opt.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
 
         # Update EMA
-        if took_step:
-            update_ema(ema_model.parameters(), model.parameters(), rate=ema_rate)
+        update_ema(ema_model.parameters(), model.parameters(), rate=ema_rate)
 
         cur_nimg += batch_gpu * num_gpus
 
@@ -717,19 +740,19 @@ def training_loop(
                 # Save checkpoint
                 save_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}.pt")
                 logger.log(f"Saving checkpoint to {save_path}...")
-                torch.save(
-                    {
-                        "model": model.state_dict(),
-                        "ema": ema_model.state_dict(),
-                        "opt": opt.state_dict(),
-                        "cur_nimg": cur_nimg,
-                        "config": {
-                            "image_size": image_size,
-                            "model_name": model_name,
-                        },
+                ckpt_data = {
+                    "model": model.state_dict(),
+                    "ema": ema_model.state_dict(),
+                    "opt": opt.state_dict(),
+                    "cur_nimg": cur_nimg,
+                    "config": {
+                        "image_size": image_size,
+                        "model_name": model_name,
                     },
-                    save_path,
-                )
+                }
+                if use_grad_scaler:
+                    ckpt_data["scaler"] = scaler.state_dict()
+                torch.save(ckpt_data, save_path)
                 logger.log(f"Checkpoint saved (kimg={cur_nimg / 1e3:.1f})")
 
                 maintenance_time = time.time() - snap_start
@@ -738,19 +761,19 @@ def training_loop(
     if is_main:
         save_path = os.path.join(run_dir, "network-final.pt")
         logger.log(f"Saving final model to {save_path}...")
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "ema": ema_model.state_dict(),
-                "opt": opt.state_dict(),
-                "cur_nimg": cur_nimg,
-                "config": {
-                    "image_size": image_size,
-                    "model_name": model_name,
-                },
+        ckpt_data = {
+            "model": model.state_dict(),
+            "ema": ema_model.state_dict(),
+            "opt": opt.state_dict(),
+            "cur_nimg": cur_nimg,
+            "config": {
+                "image_size": image_size,
+                "model_name": model_name,
             },
-            save_path,
-        )
+        }
+        if use_grad_scaler:
+            ckpt_data["scaler"] = scaler.state_dict()
+        torch.save(ckpt_data, save_path)
 
         # Final image snapshot
         logger.log("Saving final image snapshot...")
@@ -806,6 +829,7 @@ def launch_training(c, desc, outdir, dry_run):
     print(f"Batch size:          {c['batch_size']} images")
     print(f"Training duration:   {c['total_kimg']} kimg")
     print(f"Image size:          {c['image_size']}")
+    print(f"Mixed precision:     {c['use_fp16']} (dtype={c['amp_dtype']})")
     print()
 
     if dry_run:
@@ -843,7 +867,7 @@ BASE_CONFIGS = {
         kimg_per_tick=4,
         snap=50,
         ema_rate=0.9999,
-        use_fp16=False,
+        use_fp16=True,
         schedule_sampler_name="uniform",
         num_fid_samples=1024,
     ),
@@ -895,6 +919,7 @@ BASE_CONFIGS = {
 @click.option("--seed",         help="Random seed", metavar="INT",                             type=click.IntRange(min=0), default=0, show_default=True)
 @click.option("--lr",           help="Learning rate [default: from cfg]", metavar="FLOAT",     type=float, default=None)
 @click.option("--fp32",         help="Disable mixed-precision", metavar="BOOL",                type=bool, default=None)
+@click.option("--amp-dtype",   help="AMP dtype: fp16 or bf16 (bf16 preferred on A100/H100)",   type=click.Choice(["fp16", "bf16"]), default="bf16", show_default=True)
 @click.option("--ema-rate",     help="EMA decay rate [default: from cfg]", metavar="FLOAT",    type=float, default=None)
 @click.option("--resume",       help="Resume from checkpoint path", metavar="PATH",            type=str, default=None)
 @click.option("--schedule-sampler", "schedule_sampler_name", help="Timestep sampler [default: from cfg]", type=str, default=None)
@@ -949,6 +974,7 @@ def main(**kwargs):
         seed=opts["seed"],
         lr=cfg["lr"],
         use_fp16=cfg["use_fp16"],
+        amp_dtype=opts["amp_dtype"],
         ema_rate=cfg["ema_rate"],
         resume=opts["resume"],
         model_name=cfg["model_name"],
