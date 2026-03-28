@@ -7,6 +7,6 @@ click>=8.0
 numpy>=1.24.0
 Pillow>=9.0
 safetensors>=0.3.0
-scipy>=1.10.0
+scipy>=1.10.0,<=1.14.1
 accelerate>=0.27.2
 tensorboard>=2.14.0
