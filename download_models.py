@@ -88,7 +88,7 @@ def check_cuda():
     print(f"  GPUs:         {torch.cuda.device_count()}")
     for i in range(torch.cuda.device_count()):
         name = torch.cuda.get_device_name(i)
-        mem = torch.cuda.get_device_properties(i).total_mem / (1024 ** 3)
+        mem = torch.cuda.get_device_properties(i).total_memory / (1024 ** 3)
         print(f"    [{i}] {name}  ({mem:.1f} GiB)")
 
     print()
