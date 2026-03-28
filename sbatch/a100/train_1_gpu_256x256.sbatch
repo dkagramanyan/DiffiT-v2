@@ -4,7 +4,7 @@
 #SBATCH --account=proj_1793
 #SBATCH --nodes=1
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --time=0-00:30:00
 #SBATCH --output=/home/dgkagramanyan/DiffiT-v2/logs/slurm_%j.out
 #SBATCH --error=/home/dgkagramanyan/DiffiT-v2/logs/slurm_%j.err
@@ -39,6 +39,8 @@ python "$PROJECT_DIR/train.py" \
     --data="$DATASET" \
     --gpus=1 \
     --batch-gpu=96 \
+    --amp-dtype bf16 \
+    --workers=8 \
     --snap=100
 
 EXIT_CODE=$?

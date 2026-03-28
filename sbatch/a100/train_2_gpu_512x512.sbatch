@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=DiffiT-512
 #SBATCH --gpus=2
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --time=4-0:0
 #SBATCH --nodes=1
 #SBATCH --partition=normal
@@ -21,5 +21,7 @@ python train.py --outdir=./training-runs \
         --cfg=diffit-512 \
         --data=./datasets/imagenet_512x512.zip \
         --gpus=2 \
-        --batch-gpu 10 \
+        --batch-gpu 20 \
+        --amp-dtype bf16 \
+        --workers 8 \
         --snap 75
