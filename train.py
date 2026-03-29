@@ -99,7 +99,7 @@ def generate_snapshot_images(
             "diffusion_steps": 1000,
             "scale_pow": scale_pow,
         }
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.amp.autocast("cuda", dtype=torch.float16):
             sample = dpm_solver_sample(
                 ema_model.forward_with_cfg,
                 diffusion,
@@ -209,7 +209,7 @@ def generate_eval_samples(
             "diffusion_steps": 1000,
             "scale_pow": scale_pow,
         }
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.amp.autocast("cuda", dtype=torch.float16):
             sample = dpm_solver_sample(
                 ema_model.forward_with_cfg,
                 diffusion,
@@ -707,7 +707,8 @@ def training_loop(
             maintenance_time = 0.0
 
             # Save image snapshot + evaluate metrics + checkpoint (every `snap` ticks)
-            if is_main and cur_tick % snap == 0:
+            do_snap = cur_tick % snap == 0
+            if is_main and do_snap:
                 snap_start = time.time()
 
                 logger.log(f"Saving image snapshot (kimg={cur_nimg / 1e3:.1f})...")
@@ -759,6 +760,11 @@ def training_loop(
                 logger.log(f"Checkpoint saved (kimg={cur_nimg / 1e3:.1f})")
 
                 maintenance_time = time.time() - snap_start
+
+            # Synchronize all ranks after snapshot/eval so rank 1 doesn't
+            # race ahead into DDP training while rank 0 is still evaluating.
+            if num_gpus > 1 and do_snap:
+                dist.barrier()
 
     # Final save
     if is_main:
