@@ -73,7 +73,7 @@ def _predict_x0(model_output, x_t, alpha_t, sigma_t):
     C = x_t.shape[1]
     eps = model_output[:, :C]
     # x_t = alpha_t * x_0 + sigma_t * eps  =>  x_0 = (x_t - sigma_t * eps) / alpha_t
-    dims = [1] + [1] * (x_t.ndim - 1)  # broadcast shape for (B, 1, 1, 1)
+    dims = [-1] + [1] * (x_t.ndim - 1)  # broadcast shape for (B, 1, 1, 1)
     alpha = alpha_t.view(*dims)
     sigma = sigma_t.view(*dims)
     return (x_t - sigma * eps) / alpha
@@ -176,7 +176,7 @@ def dpm_solver_sample(
         lambda_next = 0.5 * torch.log(alpha_next ** 2 / sigma_next ** 2 + 1e-12).mean()
 
         # Reshape for broadcasting
-        dims = [1] + [1] * (x.ndim - 1)
+        dims = [-1] + [1] * (x.ndim - 1)
         a_next = alpha_next.view(*dims)
         s_next = sigma_next.view(*dims)
 
