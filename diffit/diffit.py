@@ -520,5 +520,5 @@ class DiffiT(nn.Module):
 # ---------------------------------------------------------------------------
 
 def Diffit(**kwargs):
-    """DiffiT-XL/2 configuration (depth 28, dim 1152, patch 2, 16 heads)."""
-    return DiffiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+    """DiffiT-XL/2 configuration (depth 30, dim 1152, patch 2, 16 heads)."""
+    return DiffiT(depth=30, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
