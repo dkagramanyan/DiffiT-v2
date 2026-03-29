@@ -301,19 +301,21 @@ def compute_inception_score(logits, split_size=5000):
 
 def compute_precision_recall(ref_acts, sample_acts, k=3):
     """Precision and Recall via k-NN manifold estimation."""
+    BATCH = 256  # keep memory bounded: BATCH * n * 4 bytes
+
     def knn_radii(feats, k):
         n = len(feats)
         radii = np.zeros(n, dtype=np.float32)
-        for i in range(0, n, 10000):
-            batch = feats[i : i + 10000]
+        for i in range(0, n, BATCH):
+            batch = feats[i : i + BATCH]
             dists = np.sum((batch[:, None, :] - feats[None, :, :]) ** 2, axis=-1)
-            radii[i : i + 10000] = np.partition(dists, k + 1, axis=1)[:, k]
+            radii[i : i + BATCH] = np.partition(dists, k + 1, axis=1)[:, k]
         return radii
 
     def manifold_coverage(ref_f, ref_r, eval_f):
         count = 0
-        for i in range(0, len(eval_f), 10000):
-            batch = eval_f[i : i + 10000]
+        for i in range(0, len(eval_f), BATCH):
+            batch = eval_f[i : i + BATCH]
             dists = np.sum((batch[:, None, :] - ref_f[None, :, :]) ** 2, axis=-1)
             count += np.sum(np.any(dists <= ref_r[None, :], axis=1))
         return count / len(eval_f)
