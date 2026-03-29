@@ -870,7 +870,7 @@ BASE_CONFIGS = {
         ema_rate=0.9999,
         use_fp16=True,
         schedule_sampler_name="uniform",
-        num_fid_samples=50000,
+        num_fid_samples=10000,
     ),
     "diffit-512": dict(
         image_size=512,
@@ -882,7 +882,7 @@ BASE_CONFIGS = {
         ema_rate=0.9999,
         use_fp16=True,
         schedule_sampler_name="uniform",
-        num_fid_samples=50000,
+        num_fid_samples=10000,
     ),
     "diffit-1024": dict(
         image_size=1024,
