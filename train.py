@@ -188,16 +188,25 @@ def compute_activations(images_uint8_nchw, extractor, batch_size, device, desc="
 def generate_eval_samples(
     ema_model, vae, diffusion, num_samples, batch_gpu, latent_size, device,
     cfg_scale=4.4, num_sampling_steps=25, scale_pow=4.0,
+    rank=0, world_size=1,
 ):
     """Generate N random images for metric evaluation (NCHW uint8 numpy).
 
     Uses DPM-Solver++(2M) with 25 steps for fast evaluation during training.
+    When world_size > 1, each rank generates its share and results are
+    gathered to rank 0.
     """
+    # Each rank generates a roughly equal share
+    samples_per_rank = (num_samples + world_size - 1) // world_size
+    local_target = min(samples_per_rank, num_samples - rank * samples_per_rank)
+    local_target = max(local_target, 0)
+
     all_images = []
     generated = 0
-    pbar = tqdm(total=num_samples, desc=f"Generating eval samples (dpm++{num_sampling_steps})", unit="img")
-    while generated < num_samples:
-        bs = min(batch_gpu, num_samples - generated)
+    show_progress = (rank == 0)
+    pbar = tqdm(total=local_target, desc=f"Generating eval samples (dpm++{num_sampling_steps})", unit="img") if show_progress else None
+    while generated < local_target:
+        bs = min(batch_gpu, local_target - generated)
         z = torch.randn(bs, 4, latent_size, latent_size, device=device)
         classes = torch.randint(0, NUM_CLASSES, (bs,), device=device)
 
@@ -224,10 +233,43 @@ def generate_eval_samples(
         decoded = ((decoded + 1) * 127.5).clamp(0, 255).to(torch.uint8)
         all_images.append(decoded.cpu().numpy())  # NCHW
         generated += bs
-        pbar.update(bs)
-    pbar.close()
+        if pbar is not None:
+            pbar.update(bs)
+    if pbar is not None:
+        pbar.close()
 
-    return np.concatenate(all_images, axis=0)[:num_samples]
+    local_images = np.concatenate(all_images, axis=0)[:local_target] if all_images else np.empty((0, 3, 0, 0), dtype=np.uint8)
+
+    # Gather all images to rank 0
+    if world_size > 1:
+        local_tensor = torch.from_numpy(local_images).to(device)
+        # Gather sizes first (ranks may have slightly different counts)
+        local_count = torch.tensor([local_tensor.shape[0]], device=device, dtype=torch.long)
+        all_counts = [torch.zeros_like(local_count) for _ in range(world_size)]
+        dist.all_gather(all_counts, local_count)
+
+        if rank == 0:
+            max_count = max(c.item() for c in all_counts)
+            # Pad local tensors to max_count for all_gather
+            if local_tensor.shape[0] < max_count:
+                pad = torch.zeros(max_count - local_tensor.shape[0], *local_tensor.shape[1:], device=device, dtype=local_tensor.dtype)
+                local_tensor = torch.cat([local_tensor, pad], 0)
+            gathered = [torch.zeros_like(local_tensor) for _ in range(world_size)]
+            dist.gather(local_tensor, gathered, dst=0)
+            # Trim padding and concatenate
+            result = []
+            for i, g in enumerate(gathered):
+                result.append(g[:all_counts[i].item()].cpu().numpy())
+            return np.concatenate(result, axis=0)[:num_samples]
+        else:
+            max_count = max(c.item() for c in all_counts)
+            if local_tensor.shape[0] < max_count:
+                pad = torch.zeros(max_count - local_tensor.shape[0], *local_tensor.shape[1:], device=device, dtype=local_tensor.dtype)
+                local_tensor = torch.cat([local_tensor, pad], 0)
+            dist.gather(local_tensor, dst=0)
+            return None  # only rank 0 needs the result
+
+    return local_images[:num_samples]
 
 
 def compute_fid(acts1, acts2, eps=1e-6):
@@ -286,12 +328,20 @@ def compute_precision_recall(ref_acts, sample_acts, k=3):
 def evaluate_metrics(
     ema_model, vae, diffusion, ref_acts, inception_extractor,
     num_fid_samples, batch_gpu, latent_size, device,
+    rank=0, world_size=1,
 ):
-    """Generate samples, compute all metrics, return dict."""
-    logger.log(f"Evaluating metrics ({num_fid_samples} samples)...")
+    """Generate samples across all ranks, compute metrics on rank 0."""
+    if rank == 0:
+        logger.log(f"Evaluating metrics ({num_fid_samples} samples across {world_size} GPU(s))...")
     fake_images = generate_eval_samples(
         ema_model, vae, diffusion, num_fid_samples, batch_gpu, latent_size, device,
+        rank=rank, world_size=world_size,
     )
+
+    # Only rank 0 has the gathered images and computes metrics
+    if rank != 0:
+        return None
+
     fake_acts = compute_activations(fake_images, inception_extractor, batch_size=64, device=device)
 
     metrics = {}
@@ -708,63 +758,63 @@ def training_loop(
 
             # Save image snapshot + evaluate metrics + checkpoint (every `snap` ticks)
             do_snap = cur_tick % snap == 0
-            if is_main and do_snap:
+            if do_snap:
                 snap_start = time.time()
 
-                logger.log(f"Saving image snapshot (kimg={cur_nimg / 1e3:.1f})...")
-                fakes = generate_snapshot_images(
-                    ema_model, vae, diffusion, grid_z, grid_classes,
-                    batch_gpu=batch_gpu, device=device,
-                )
-                save_image_grid(
-                    fakes, os.path.join(run_dir, f"fakes{cur_nimg // 1000:06d}.png"),
-                    drange=[0, 255], grid_size=grid_size,
-                )
-                logger.log(f"Image snapshot saved (kimg={cur_nimg / 1e3:.1f})")
+                # Snapshot grid (rank 0 only, fast)
+                if is_main:
+                    logger.log(f"Saving image snapshot (kimg={cur_nimg / 1e3:.1f})...")
+                    fakes = generate_snapshot_images(
+                        ema_model, vae, diffusion, grid_z, grid_classes,
+                        batch_gpu=batch_gpu, device=device,
+                    )
+                    save_image_grid(
+                        fakes, os.path.join(run_dir, f"fakes{cur_nimg // 1000:06d}.png"),
+                        drange=[0, 255], grid_size=grid_size,
+                    )
+                    logger.log(f"Image snapshot saved (kimg={cur_nimg / 1e3:.1f})")
 
-                # Evaluate quality metrics
-                if ref_acts is not None:
-                    logger.log("Evaluating metrics...")
+                # Evaluate quality metrics (ALL ranks generate samples)
+                if num_fid_samples > 0:
                     stats_metrics = evaluate_metrics(
                         ema_model, vae, diffusion, ref_acts, inception_extractor,
                         num_fid_samples, batch_gpu, latent_size, device,
+                        rank=rank, world_size=num_gpus,
                     )
-                    timestamp = time.time()
-                    global_step = int(cur_nimg / 1e3)
-                    walltime = timestamp - start_time
-                    if stats_jsonl is not None:
-                        fields = dict(stats_metrics, timestamp=timestamp, kimg=cur_nimg / 1000)
-                        stats_jsonl.write(json.dumps(fields) + "\n")
-                        stats_jsonl.flush()
-                    if stats_tfevents is not None:
-                        for name, value in stats_metrics.items():
-                            stats_tfevents.add_scalar(f"Metrics/{name}", value, global_step=global_step, walltime=walltime)
-                        stats_tfevents.flush()
+                    # Only rank 0 logs and saves metrics
+                    if is_main and stats_metrics is not None:
+                        timestamp = time.time()
+                        global_step = int(cur_nimg / 1e3)
+                        walltime = timestamp - start_time
+                        if stats_jsonl is not None:
+                            fields = dict(stats_metrics, timestamp=timestamp, kimg=cur_nimg / 1000)
+                            stats_jsonl.write(json.dumps(fields) + "\n")
+                            stats_jsonl.flush()
+                        if stats_tfevents is not None:
+                            for name, value in stats_metrics.items():
+                                stats_tfevents.add_scalar(f"Metrics/{name}", value, global_step=global_step, walltime=walltime)
+                            stats_tfevents.flush()
 
-                # Save checkpoint
-                save_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}.pt")
-                logger.log(f"Saving checkpoint to {save_path}...")
-                ckpt_data = {
-                    "model": model.state_dict(),
-                    "ema": ema_model.state_dict(),
-                    "opt": opt.state_dict(),
-                    "cur_nimg": cur_nimg,
-                    "config": {
-                        "image_size": image_size,
-                        "model_name": model_name,
-                    },
-                }
-                if use_grad_scaler:
-                    ckpt_data["scaler"] = scaler.state_dict()
-                torch.save(ckpt_data, save_path)
-                logger.log(f"Checkpoint saved (kimg={cur_nimg / 1e3:.1f})")
+                # Save checkpoint (rank 0 only)
+                if is_main:
+                    save_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}.pt")
+                    logger.log(f"Saving checkpoint to {save_path}...")
+                    ckpt_data = {
+                        "model": model.state_dict(),
+                        "ema": ema_model.state_dict(),
+                        "opt": opt.state_dict(),
+                        "cur_nimg": cur_nimg,
+                        "config": {
+                            "image_size": image_size,
+                            "model_name": model_name,
+                        },
+                    }
+                    if use_grad_scaler:
+                        ckpt_data["scaler"] = scaler.state_dict()
+                    torch.save(ckpt_data, save_path)
+                    logger.log(f"Checkpoint saved (kimg={cur_nimg / 1e3:.1f})")
 
-                maintenance_time = time.time() - snap_start
-
-            # Synchronize all ranks after snapshot/eval so rank 1 doesn't
-            # race ahead into DDP training while rank 0 is still evaluating.
-            if num_gpus > 1 and do_snap:
-                dist.barrier()
+                    maintenance_time = time.time() - snap_start
 
     # Final save
     if is_main:
