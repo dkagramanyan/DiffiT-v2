@@ -14,69 +14,26 @@ import torch
 from tqdm import tqdm
 
 
-def _log_snr_from_alpha_cumprod(alpha_cumprod):
-    """Compute log-SNR = log(alpha_cumprod / (1 - alpha_cumprod))."""
-    return np.log(alpha_cumprod / (1.0 - alpha_cumprod))
-
-
 def _build_time_schedule(alpha_cumprod, num_steps):
     """Build a time schedule with uniformly-spaced log-SNR values.
 
-    Returns an array of *continuous* timesteps in [0, T-1] (float64)
-    corresponding to the endpoints of ``num_steps`` intervals that are
-    equally spaced in log-SNR space.  The schedule goes from high noise
-    (t = T-1) to low noise (t = 0).
+    Returns an array of integer timesteps of length ``num_steps + 1``,
+    going from t = T-1 (high noise) to t = 0 (low noise).
     """
     T = len(alpha_cumprod)
-    log_snr = _log_snr_from_alpha_cumprod(alpha_cumprod)
+    log_snr = np.log(alpha_cumprod / (1.0 - alpha_cumprod))
 
-    # log-SNR at the two extremes of the schedule
-    log_snr_max = log_snr[0]    # low noise (t=0)
-    log_snr_min = log_snr[-1]   # high noise (t=T-1)
+    # Uniform grid in log-SNR, from high noise (min log-SNR) to low noise (max log-SNR)
+    target_log_snr = np.linspace(log_snr[-1], log_snr[0], num_steps + 1)
 
-    # Uniform grid in log-SNR, from high noise to low noise
-    target_log_snr = np.linspace(log_snr_min, log_snr_max, num_steps + 1)
-
-    # Map each target log-SNR to a continuous timestep via interpolation
-    # log_snr is *decreasing* in t, so we flip for np.interp (needs increasing x)
-    ts_float = np.interp(target_log_snr, np.flip(log_snr), np.flip(np.arange(T, dtype=np.float64)))
-
-    return ts_float  # shape (num_steps + 1,), from t_max to t_min
-
-
-def _alpha_sigma_at_t(alpha_cumprod_torch, t_continuous):
-    """Interpolate alpha and sigma at a continuous timestep.
-
-    ``t_continuous`` is a float tensor of shape (B,) with values in [0, T-1].
-    Returns sqrt(alpha_cumprod) and sqrt(1 - alpha_cumprod) at those times.
-    """
-    # Linear interpolation between the two nearest discrete timesteps
-    t_low = t_continuous.long().clamp(0, len(alpha_cumprod_torch) - 1)
-    t_high = (t_low + 1).clamp(0, len(alpha_cumprod_torch) - 1)
-    frac = (t_continuous - t_low.float()).clamp(0, 1)
-
-    ac_low = alpha_cumprod_torch[t_low]
-    ac_high = alpha_cumprod_torch[t_high]
-    alpha_cumprod_t = ac_low + frac * (ac_high - ac_low)
-
-    alpha_t = alpha_cumprod_t.sqrt()
-    sigma_t = (1.0 - alpha_cumprod_t).sqrt()
-    return alpha_t, sigma_t, alpha_cumprod_t
-
-
-def _predict_x0(model_output, x_t, alpha_t, sigma_t):
-    """Convert eps-prediction to x0-prediction.
-
-    model_output may have extra variance channels (learned sigma); we only
-    use the first C channels for the noise prediction.
-    """
-    C = x_t.shape[1]
-    eps = model_output[:, :C]
-    # x_t = alpha_t * x_0 + sigma_t * eps  =>  x_0 = (x_t - sigma_t * eps) / alpha_t
-    dims = [-1] + [1] * (x_t.ndim - 1)  # broadcast shape for (B, 1, 1, 1)
-    alpha = alpha_t.view(*dims)
-    sigma = sigma_t.view(*dims)
-    return (x_t - sigma * eps) / alpha
+    # Map each target log-SNR to a continuous timestep via interpolation.
+    # log_snr is *decreasing* in t, so flip for np.interp (needs increasing x).
+    ts = np.interp(
+        target_log_snr,
+        np.flip(log_snr),
+        np.flip(np.arange(T, dtype=np.float64)),
+    )
+    return ts  # shape (num_steps + 1,), from t_max to t_min
 
 
 def dpm_solver_sample(
@@ -97,8 +54,7 @@ def dpm_solver_sample(
         The denoising model.  Called as ``model(x, t, **model_kwargs)``
         where *t* is an integer timestep tensor (values in 0 .. T-1).
     diffusion : GaussianDiffusion or SpacedDiffusion
-        Diffusion object that carries ``alphas_cumprod`` (numpy, length T)
-        and ``num_timesteps``.
+        Diffusion object that carries ``alphas_cumprod`` (numpy, length T).
     shape : tuple
         Shape of the sample tensor, e.g. ``(B, C, H, W)``.
     device : torch.device
@@ -120,85 +76,95 @@ def dpm_solver_sample(
     if model_kwargs is None:
         model_kwargs = {}
 
-    # --- Noise schedule from the *base* (1000-step) diffusion object -------
-    # SpacedDiffusion re-indexes alphas_cumprod to its sub-set of timesteps,
-    # but we want the *original* 1000-step schedule so that the log-SNR grid
-    # covers the full range.  We reconstruct it from betas in the base case,
-    # or access it directly.
-    alpha_cumprod_np = np.cumprod(1.0 - diffusion.betas, axis=0) if not hasattr(
-        diffusion, '_base_alphas_cumprod'
-    ) else diffusion._base_alphas_cumprod
-    # Actually, diffusion.alphas_cumprod always stores the schedule for the
-    # timesteps this object works with.  For the *unspaced* (training)
-    # diffusion object this is the full 1000-step schedule.  We just use it.
+    B = shape[0]
+    C_in = shape[1]  # input channels (before learned sigma doubling)
+
+    # --- Noise schedule (full 1000-step) ----------------------------------
     alpha_cumprod_np = np.asarray(diffusion.alphas_cumprod, dtype=np.float64)
     T = len(alpha_cumprod_np)
+    ac = torch.from_numpy(alpha_cumprod_np).float().to(device)
 
-    alpha_cumprod_torch = torch.from_numpy(alpha_cumprod_np).float().to(device)
+    # Precompute useful quantities
+    # lambda(t) = log(alpha(t) / sigma(t))
+    log_alpha = 0.5 * torch.log(ac)
+    log_sigma = 0.5 * torch.log(1.0 - ac)
+    lam = log_alpha - log_sigma  # log-SNR, decreasing in t
 
-    # --- Time schedule (log-SNR uniform) -----------------------------------
+    def get_coeffs(t_continuous):
+        """Get alpha, sigma, lambda at a continuous timestep (scalar)."""
+        t_low = int(max(0, min(T - 1, int(t_continuous))))
+        t_high = min(t_low + 1, T - 1)
+        frac = t_continuous - t_low
+        frac = max(0.0, min(1.0, frac))
+
+        ac_t = ac[t_low] + frac * (ac[t_high] - ac[t_low])
+        la_t = log_alpha[t_low] + frac * (log_alpha[t_high] - log_alpha[t_low])
+        ls_t = log_sigma[t_low] + frac * (log_sigma[t_high] - log_sigma[t_low])
+        lam_t = la_t - ls_t
+        alpha_t = la_t.exp()
+        sigma_t = ls_t.exp()
+        return alpha_t, sigma_t, lam_t
+
+    def predict_x0(model_out, x_t, alpha_t, sigma_t):
+        """Convert eps-prediction to x0-prediction."""
+        eps = model_out[:, :C_in]
+        return (x_t - sigma_t * eps) / alpha_t
+
+    # --- Time schedule (log-SNR uniform) ----------------------------------
     t_schedule = _build_time_schedule(alpha_cumprod_np, num_steps)
-    # t_schedule[0] = high noise  ...  t_schedule[-1] = low noise
 
-    # --- Initial noise -----------------------------------------------------
+    # --- Initial noise ----------------------------------------------------
     if noise is not None:
         x = noise.to(device)
     else:
         x = torch.randn(*shape, device=device)
 
-    # --- DPM-Solver++(2M) loop --------------------------------------------
-    x0_prev = None  # previous x0 prediction (for 2nd-order multistep)
+    # --- DPM-Solver++(2M) loop -------------------------------------------
+    x0_prev = None
+    lam_prev = None
 
     steps = range(num_steps)
     if progress:
         steps = tqdm(steps, desc="DPM-Solver++", total=num_steps)
 
     for i in steps:
-        t_cur = t_schedule[i]       # current (higher noise)
-        t_next = t_schedule[i + 1]  # next    (lower noise)
+        t_cur = t_schedule[i]
+        t_next = t_schedule[i + 1]
 
-        # Integer timestep for the model (round to nearest discrete step)
+        # Integer timestep for the model
         t_int = max(0, min(T - 1, round(t_cur)))
-        t_tensor = torch.full((shape[0],), t_int, device=device, dtype=torch.long)
+        t_tensor = torch.full((B,), t_int, device=device, dtype=torch.long)
 
-        # --- Model evaluation ---
-        model_output = model(x, t_tensor, **model_kwargs)
+        # Model evaluation
+        with torch.no_grad():
+            model_output = model(x, t_tensor, **model_kwargs)
 
-        # --- Convert eps -> x0 ---
-        alpha_t, sigma_t, _ = _alpha_sigma_at_t(alpha_cumprod_torch, torch.full((shape[0],), t_cur, device=device))
-        x0_pred = _predict_x0(model_output, x, alpha_t, sigma_t)
+        # Get coefficients
+        alpha_cur, sigma_cur, lam_cur = get_coeffs(t_cur)
+        alpha_next, sigma_next, lam_next = get_coeffs(t_next)
 
-        # --- Coefficients at the *next* timestep ---
-        alpha_next, sigma_next, _ = _alpha_sigma_at_t(alpha_cumprod_torch, torch.full((shape[0],), t_next, device=device))
+        # Predict x0 from eps
+        x0_pred = predict_x0(model_output, x, alpha_cur, sigma_cur)
 
-        # log-SNR values (lambda in the DPM-Solver++ paper)
-        lambda_cur = 0.5 * torch.log(alpha_t ** 2 / sigma_t ** 2 + 1e-12).mean()
-        lambda_next = 0.5 * torch.log(alpha_next ** 2 / sigma_next ** 2 + 1e-12).mean()
-
-        # Reshape for broadcasting
-        dims = [-1] + [1] * (x.ndim - 1)
-        a_next = alpha_next.view(*dims)
-        s_next = sigma_next.view(*dims)
+        h = lam_next - lam_cur  # step size in lambda space (negative since lam decreases)
 
         if i == 0 or x0_prev is None:
-            # --- 1st-order update (DPM-Solver++1) for the first step ---
-            x = (a_next / alpha_t.view(*dims)) * x - s_next * (torch.expm1(lambda_cur - lambda_next)) * x0_pred
+            # 1st-order update (DPM-Solver++1):
+            # x_{s} = (sigma_s / sigma_t) * x_t + alpha_s * (1 - exp(-(h))) * x0
+            # where h = lam_next - lam_cur (negative)
+            x = (sigma_next / sigma_cur) * x + alpha_next * (1.0 - torch.exp(h)) * x0_pred
         else:
-            # --- 2nd-order multistep update (DPM-Solver++2M) ---
-            lambda_prev = 0.5 * torch.log(alpha_prev_saved ** 2 / sigma_prev_saved ** 2 + 1e-12).mean()
-            h = lambda_next - lambda_cur
-            h_prev = lambda_cur - lambda_prev
+            # 2nd-order multistep update (DPM-Solver++2M):
+            h_prev = lam_cur - lam_prev
             r = h_prev / h
 
-            # D0 = x0_pred,  D1 = (1 + 1/(2r)) * x0_pred - (1/(2r)) * x0_prev
-            D0 = x0_pred
+            # Corrected x0 prediction using linear extrapolation
             D1 = (1.0 + 0.5 / r) * x0_pred - (0.5 / r) * x0_prev
 
-            x = (a_next / alpha_t.view(*dims)) * x - s_next * torch.expm1(lambda_cur - lambda_next) * D1
+            x = (sigma_next / sigma_cur) * x + alpha_next * (1.0 - torch.exp(h)) * D1
 
-        # Save for next multistep
+        # Save for next step
         x0_prev = x0_pred
-        alpha_prev_saved = alpha_t
-        sigma_prev_saved = sigma_t
+        lam_prev = lam_cur
 
     return x
