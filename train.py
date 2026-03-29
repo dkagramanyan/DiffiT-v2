@@ -572,6 +572,11 @@ def training_loop(
         )
         save_image_grid(fakes_init, os.path.join(run_dir, "fakes_init.png"), drange=[0, 255], grid_size=grid_size)
 
+    # Synchronize all ranks before entering the training loop (rank 0 may
+    # still be generating snapshot images / computing reference features).
+    if num_gpus > 1:
+        dist.barrier()
+
     # Training
     logger.log(f"Training for {total_kimg} kimg...")
     tick_start_nimg = cur_nimg
