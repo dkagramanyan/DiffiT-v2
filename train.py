@@ -300,25 +300,28 @@ def compute_inception_score(logits, split_size=5000):
 
 
 def compute_precision_recall(ref_acts, sample_acts, k=3):
-    """Precision and Recall via k-NN manifold estimation."""
-    BATCH = 256  # keep memory bounded: BATCH * n * 4 bytes
+    """Precision and Recall via k-NN manifold estimation (GPU-accelerated)."""
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    BATCH = 512
 
-    def knn_radii(feats, k):
-        n = len(feats)
-        radii = np.zeros(n, dtype=np.float32)
+    def knn_radii(feats_np, k):
+        feats = torch.from_numpy(feats_np).to(device)
+        n = feats.shape[0]
+        radii = torch.zeros(n, device=device)
         for i in range(0, n, BATCH):
-            batch = feats[i : i + BATCH]
-            dists = np.sum((batch[:, None, :] - feats[None, :, :]) ** 2, axis=-1)
-            radii[i : i + BATCH] = np.partition(dists, k + 1, axis=1)[:, k]
+            # cdist computes pairwise L2 without materializing (B, N, D)
+            dists_sq = torch.cdist(feats[i : i + BATCH], feats).square()
+            radii[i : i + BATCH] = torch.kthvalue(dists_sq, k + 1, dim=1).values
         return radii
 
-    def manifold_coverage(ref_f, ref_r, eval_f):
+    def manifold_coverage(ref_f_np, ref_r, eval_f_np):
+        ref_f = torch.from_numpy(ref_f_np).to(device)
+        eval_f = torch.from_numpy(eval_f_np).to(device)
         count = 0
-        for i in range(0, len(eval_f), BATCH):
-            batch = eval_f[i : i + BATCH]
-            dists = np.sum((batch[:, None, :] - ref_f[None, :, :]) ** 2, axis=-1)
-            count += np.sum(np.any(dists <= ref_r[None, :], axis=1))
-        return count / len(eval_f)
+        for i in range(0, eval_f.shape[0], BATCH):
+            dists_sq = torch.cdist(eval_f[i : i + BATCH], ref_f).square()
+            count += int((dists_sq <= ref_r.unsqueeze(0)).any(dim=1).sum())
+        return count / eval_f.shape[0]
 
     ref_r = knn_radii(ref_acts, k)
     sample_r = knn_radii(sample_acts, k)
