@@ -361,6 +361,7 @@ def training_loop(
     schedule_sampler_name,
     amp_dtype="fp16",
     workers=4,
+    cache_in_ram=False,
     num_fid_samples=1024,
     **_extra,
 ):
@@ -445,6 +446,7 @@ def training_loop(
         random_flip=True,
         num_workers=workers,
         distributed=(num_gpus > 1),
+        cache_in_ram=cache_in_ram,
     )
 
     # --- Initialize logs: stats.jsonl + TensorBoard (SAN-v2 style) ---
@@ -930,6 +932,7 @@ BASE_CONFIGS = {
 @click.option("--metrics",      help="Quality metrics", metavar="NAME",                        type=str, default="fid50k", show_default=True)
 @click.option("--tf32/--no-tf32", "allow_tf32", help="Enable TF32 for matmul/conv",            default=True, show_default=True)
 @click.option("--workers",      help="DataLoader worker processes", metavar="INT",             type=click.IntRange(min=1), default=4, show_default=True)
+@click.option("--cache-in-ram/--no-cache-in-ram", help="Cache entire dataset in RAM to reduce disk I/O", default=True, show_default=True)
 @click.option("-n", "--dry-run", help="Print training options and exit",                        is_flag=True)
 
 def main(**kwargs):
@@ -981,6 +984,7 @@ def main(**kwargs):
         schedule_sampler_name=cfg["schedule_sampler_name"],
         allow_tf32=opts["allow_tf32"],
         workers=opts["workers"],
+        cache_in_ram=opts["cache_in_ram"],
         num_fid_samples=cfg["num_fid_samples"],
         log_interval=10,
         save_interval=10000,

@@ -9,6 +9,8 @@ import random
 import zipfile
 import json
 
+import io
+
 import numpy as np
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
@@ -25,6 +27,7 @@ def load_data(
     random_flip=True,
     num_workers=4,
     distributed=False,
+    cache_in_ram=False,
 ):
     """
     Create a generator over (images, kwargs) pairs.
@@ -52,6 +55,7 @@ def load_data(
             class_cond=class_cond,
             random_crop=random_crop,
             random_flip=random_flip,
+            cache_in_ram=cache_in_ram,
         )
     else:
         all_files = _list_image_files_recursively(data_dir)
@@ -66,6 +70,7 @@ def load_data(
             classes=classes,
             random_crop=random_crop,
             random_flip=random_flip,
+            cache_in_ram=cache_in_ram,
         )
 
     sampler = None
@@ -110,6 +115,7 @@ class ImageDataset(Dataset):
         classes=None,
         random_crop=False,
         random_flip=True,
+        cache_in_ram=False,
     ):
         super().__init__()
         self.resolution = resolution
@@ -117,15 +123,30 @@ class ImageDataset(Dataset):
         self.classes = classes
         self.random_crop = random_crop
         self.random_flip = random_flip
+        self._cache = None
+
+        if cache_in_ram:
+            print(f"Caching {len(image_paths)} images in RAM...")
+            self._cache = []
+            for i, path in enumerate(image_paths):
+                with open(path, "rb") as f:
+                    self._cache.append(f.read())
+                if (i + 1) % 10000 == 0:
+                    print(f"  cached {i + 1}/{len(image_paths)} images")
+            print(f"All {len(image_paths)} images cached in RAM.")
 
     def __len__(self):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        path = self.image_paths[idx]
-        with open(path, "rb") as f:
-            pil_image = Image.open(f)
+        if self._cache is not None:
+            pil_image = Image.open(io.BytesIO(self._cache[idx]))
             pil_image.load()
+        else:
+            path = self.image_paths[idx]
+            with open(path, "rb") as f:
+                pil_image = Image.open(f)
+                pil_image.load()
         pil_image = pil_image.convert("RGB")
 
         if self.random_crop:
@@ -154,6 +175,7 @@ class ZipImageDataset(Dataset):
         class_cond=False,
         random_crop=False,
         random_flip=True,
+        cache_in_ram=False,
     ):
         super().__init__()
         self.zip_path = zip_path
@@ -165,6 +187,7 @@ class ZipImageDataset(Dataset):
         self._zipfile = None
         self._image_fnames = []
         self._labels = {}
+        self._cache = None
 
         with zipfile.ZipFile(zip_path, "r") as zf:
             self._all_names = set(zf.namelist())
@@ -181,6 +204,16 @@ class ZipImageDataset(Dataset):
                         fname: label for fname, label in meta["labels"]
                     }
 
+            if cache_in_ram:
+                print(f"Caching {len(self._image_fnames)} images in RAM from {zip_path}...")
+                self._cache = {}
+                for i, fname in enumerate(self._image_fnames):
+                    with zf.open(fname) as f:
+                        self._cache[fname] = f.read()
+                    if (i + 1) % 10000 == 0:
+                        print(f"  cached {i + 1}/{len(self._image_fnames)} images")
+                print(f"All {len(self._image_fnames)} images cached in RAM.")
+
     def _open_zip(self):
         if self._zipfile is None:
             self._zipfile = zipfile.ZipFile(self.zip_path, "r")
@@ -191,10 +224,14 @@ class ZipImageDataset(Dataset):
 
     def __getitem__(self, idx):
         fname = self._image_fnames[idx]
-        zf = self._open_zip()
-        with zf.open(fname) as f:
-            pil_image = Image.open(f)
+        if self._cache is not None:
+            pil_image = Image.open(io.BytesIO(self._cache[fname]))
             pil_image.load()
+        else:
+            zf = self._open_zip()
+            with zf.open(fname) as f:
+                pil_image = Image.open(f)
+                pil_image.load()
         pil_image = pil_image.convert("RGB")
 
         if self.random_crop:
