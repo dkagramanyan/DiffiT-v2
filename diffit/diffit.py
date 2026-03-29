@@ -198,8 +198,6 @@ class DiffiTAttention(nn.Module):
     ):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
 
         # Time-embedding projection ------------------------------------------
         if temb_dim is not None:
@@ -232,7 +230,6 @@ class DiffiTAttention(nn.Module):
 
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
-        self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x: torch.Tensor, temb: Optional[torch.Tensor]) -> torch.Tensor:
         B, N, C = x.shape
@@ -246,18 +243,20 @@ class DiffiTAttention(nn.Module):
         qkv = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)                          # each: (B, heads, N, head_dim)
 
-        attn = (q * self.scale) @ k.transpose(-2, -1)    # (B, heads, N, N)
-
-        # Add relative position bias
+        # Relative position bias as attention mask: (1, num_heads, N, N)
         ws = self.window_size
         rpb = self.relative_position_bias_table[
             self.relative_position_index.view(-1)
         ].view(ws[0] * ws[1], ws[0] * ws[1], -1)
-        attn = attn + rpb.permute(2, 0, 1).contiguous().unsqueeze(0)
+        attn_bias = rpb.permute(2, 0, 1).contiguous().unsqueeze(0)  # (1, heads, N, N)
 
-        attn = self.attn_drop(self.softmax(attn))
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_bias,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+        )
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj_drop(self.proj(x))
         return x
 

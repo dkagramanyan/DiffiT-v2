@@ -45,6 +45,7 @@ from diffit.image_datasets import load_data
 from diffit.nn import update_ema
 from diffit import logger
 from diffit.timestep_sampler import create_named_schedule_sampler
+from diffit.dpm_solver import dpm_solver_sample
 
 
 # ---------------------------------------------------------------------------
@@ -84,13 +85,9 @@ def setup_snapshot_image_grid(image_size, gw=None, gh=None):
 @torch.inference_mode()
 def generate_snapshot_images(
     ema_model, vae, diffusion, grid_z, grid_classes, batch_gpu, device,
-    cfg_scale=4.4, num_sampling_steps=250, scale_pow=4.0,
+    cfg_scale=4.4, num_sampling_steps=25, scale_pow=4.0,
 ):
     """Generate a batch of images from the EMA model for snapshot grids."""
-    diff_config = diffusion_defaults()
-    diff_config["timestep_respacing"] = str(num_sampling_steps)
-    snap_diffusion = create_diffusion(**diff_config)
-
     all_samples = []
     for z_chunk, c_chunk in zip(grid_z.split(batch_gpu), grid_classes.split(batch_gpu)):
         bs = z_chunk.shape[0]
@@ -99,18 +96,18 @@ def generate_snapshot_images(
         model_kwargs = {
             "y": torch.cat([c_chunk, classes_null], 0),
             "cfg_scale": cfg_scale,
-            "diffusion_steps": diff_config["diffusion_steps"],
+            "diffusion_steps": 1000,
             "scale_pow": scale_pow,
         }
         with torch.cuda.amp.autocast(dtype=torch.float16):
-            sample = snap_diffusion.p_sample_loop(
+            sample = dpm_solver_sample(
                 ema_model.forward_with_cfg,
+                diffusion,
                 z_cfg.shape,
-                z_cfg,
-                clip_denoised=False,
-                progress=False,
+                device,
+                num_steps=num_sampling_steps,
                 model_kwargs=model_kwargs,
-                device=device,
+                noise=z_cfg,
             )
             sample, _ = sample.chunk(2, dim=0)
             decoded = vae.decode(sample.float() / 0.18215).sample
@@ -190,19 +187,15 @@ def compute_activations(images_uint8_nchw, extractor, batch_size, device, desc="
 @torch.inference_mode()
 def generate_eval_samples(
     ema_model, vae, diffusion, num_samples, batch_gpu, latent_size, device,
-    cfg_scale=4.4, num_sampling_steps=250, scale_pow=4.0,
+    cfg_scale=4.4, num_sampling_steps=25, scale_pow=4.0,
 ):
     """Generate N random images for metric evaluation (NCHW uint8 numpy).
 
-    Uses DDPM sampler with 250 steps to match the paper's evaluation protocol.
+    Uses DPM-Solver++(2M) with 25 steps for fast evaluation during training.
     """
-    diff_config = diffusion_defaults()
-    diff_config["timestep_respacing"] = str(num_sampling_steps)
-    eval_diffusion = create_diffusion(**diff_config)
-
     all_images = []
     generated = 0
-    pbar = tqdm(total=num_samples, desc=f"Generating eval samples (ddpm{num_sampling_steps})", unit="img")
+    pbar = tqdm(total=num_samples, desc=f"Generating eval samples (dpm++{num_sampling_steps})", unit="img")
     while generated < num_samples:
         bs = min(batch_gpu, num_samples - generated)
         z = torch.randn(bs, 4, latent_size, latent_size, device=device)
@@ -213,14 +206,18 @@ def generate_eval_samples(
         model_kwargs = {
             "y": torch.cat([classes, classes_null], 0),
             "cfg_scale": cfg_scale,
-            "diffusion_steps": diff_config["diffusion_steps"],
+            "diffusion_steps": 1000,
             "scale_pow": scale_pow,
         }
         with torch.cuda.amp.autocast(dtype=torch.float16):
-            sample = eval_diffusion.p_sample_loop(
-                ema_model.forward_with_cfg, z_cfg.shape, z_cfg,
-                clip_denoised=False, progress=False,
-                model_kwargs=model_kwargs, device=device,
+            sample = dpm_solver_sample(
+                ema_model.forward_with_cfg,
+                diffusion,
+                z_cfg.shape,
+                device,
+                num_steps=num_sampling_steps,
+                model_kwargs=model_kwargs,
+                noise=z_cfg,
             )
             sample, _ = sample.chunk(2, dim=0)
             decoded = vae.decode(sample.float() / 0.18215).sample
