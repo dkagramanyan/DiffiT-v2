@@ -299,34 +299,72 @@ def compute_inception_score(logits, split_size=5000):
     return float(np.mean(scores))
 
 
-def compute_precision_recall(ref_acts, sample_acts, k=3):
-    """Precision and Recall via k-NN manifold estimation (GPU-accelerated)."""
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+def compute_precision_recall(ref_acts, sample_acts, k=3, rank=0, world_size=1):
+    """Precision and Recall via k-NN manifold estimation (multi-GPU accelerated).
+
+    All ranks must call this. Rank 0 broadcasts the data, every rank computes
+    its shard, and results are reduced back to rank 0.
+    """
     BATCH = 512
 
-    def knn_radii(feats_np, k):
-        feats = torch.from_numpy(feats_np).to(device)
+    # Broadcast data from rank 0 to all ranks
+    if world_size > 1:
+        if rank == 0:
+            ref_t = torch.from_numpy(ref_acts).cuda()
+            sample_t = torch.from_numpy(sample_acts).cuda()
+            shapes = torch.tensor([ref_t.shape[0], ref_t.shape[1],
+                                   sample_t.shape[0], sample_t.shape[1]], device="cuda")
+        else:
+            shapes = torch.zeros(4, dtype=torch.long, device="cuda")
+        dist.broadcast(shapes, src=0)
+        nr, d, ns, _ = shapes.tolist()
+        if rank != 0:
+            ref_t = torch.zeros(nr, d, device="cuda")
+            sample_t = torch.zeros(ns, d, device="cuda")
+        dist.broadcast(ref_t, src=0)
+        dist.broadcast(sample_t, src=0)
+    else:
+        ref_t = torch.from_numpy(ref_acts).cuda()
+        sample_t = torch.from_numpy(sample_acts).cuda()
+
+    device = ref_t.device
+
+    def knn_radii(feats, k, rank, world_size):
+        """Each rank computes radii for its shard of rows."""
         n = feats.shape[0]
         radii = torch.zeros(n, device=device)
-        for i in range(0, n, BATCH):
-            # cdist computes pairwise L2 without materializing (B, N, D)
-            dists_sq = torch.cdist(feats[i : i + BATCH], feats).square()
-            radii[i : i + BATCH] = torch.kthvalue(dists_sq, k + 1, dim=1).values
+        # Split row indices across ranks
+        indices = list(range(0, n, BATCH))
+        my_indices = indices[rank::world_size]
+        for i in my_indices:
+            end = min(i + BATCH, n)
+            dists_sq = torch.cdist(feats[i:end], feats).square()
+            radii[i:end] = torch.kthvalue(dists_sq, k + 1, dim=1).values
+        # Sum-reduce radii (non-overlapping shards, so sum is correct)
+        if world_size > 1:
+            dist.all_reduce(radii, op=dist.ReduceOp.SUM)
         return radii
 
-    def manifold_coverage(ref_f_np, ref_r, eval_f_np):
-        ref_f = torch.from_numpy(ref_f_np).to(device)
-        eval_f = torch.from_numpy(eval_f_np).to(device)
-        count = 0
-        for i in range(0, eval_f.shape[0], BATCH):
-            dists_sq = torch.cdist(eval_f[i : i + BATCH], ref_f).square()
-            count += int((dists_sq <= ref_r.unsqueeze(0)).any(dim=1).sum())
-        return count / eval_f.shape[0]
+    def manifold_coverage(ref_f, ref_r, eval_f, rank, world_size):
+        """Each rank checks coverage for its shard of eval rows."""
+        n = eval_f.shape[0]
+        local_count = 0
+        indices = list(range(0, n, BATCH))
+        my_indices = indices[rank::world_size]
+        for i in my_indices:
+            end = min(i + BATCH, n)
+            dists_sq = torch.cdist(eval_f[i:end], ref_f).square()
+            local_count += int((dists_sq <= ref_r.unsqueeze(0)).any(dim=1).sum())
+        # Reduce counts
+        count_t = torch.tensor([local_count], device=device, dtype=torch.long)
+        if world_size > 1:
+            dist.all_reduce(count_t, op=dist.ReduceOp.SUM)
+        return count_t.item() / n
 
-    ref_r = knn_radii(ref_acts, k)
-    sample_r = knn_radii(sample_acts, k)
-    precision = manifold_coverage(ref_acts, ref_r, sample_acts)
-    recall = manifold_coverage(sample_acts, sample_r, ref_acts)
+    ref_r = knn_radii(ref_t, k, rank, world_size)
+    sample_r = knn_radii(sample_t, k, rank, world_size)
+    precision = manifold_coverage(ref_t, ref_r, sample_t, rank, world_size)
+    recall = manifold_coverage(sample_t, sample_r, ref_t, rank, world_size)
     return precision, recall
 
 
@@ -335,7 +373,11 @@ def evaluate_metrics(
     num_fid_samples, batch_gpu, latent_size, device,
     rank=0, world_size=1,
 ):
-    """Generate samples across all ranks, compute metrics on rank 0."""
+    """Generate samples across all ranks, compute metrics on rank 0.
+
+    All ranks participate in sample generation and precision/recall kNN.
+    Only rank 0 computes FID, IS, sFID (cheap, single-GPU is fine).
+    """
     if rank == 0:
         logger.log(f"Evaluating metrics ({num_fid_samples} samples across {world_size} GPU(s))...")
     fake_images = generate_eval_samples(
@@ -343,23 +385,32 @@ def evaluate_metrics(
         rank=rank, world_size=world_size,
     )
 
-    # Only rank 0 has the gathered images and computes metrics
-    if rank != 0:
-        return None
+    # Rank 0 computes Inception features and scalar metrics
+    if rank == 0:
+        fake_acts = compute_activations(fake_images, inception_extractor, batch_size=64, device=device)
+        metrics = {}
+        metrics["IS"] = compute_inception_score(fake_acts["logits"])
+        metrics["FID"] = compute_fid(ref_acts["pool"], fake_acts["pool"])
+        metrics["sFID"] = compute_fid(ref_acts["spatial"], fake_acts["spatial"])
+        ref_pool = ref_acts["pool"]
+        fake_pool = fake_acts["pool"]
+    else:
+        metrics = {}
+        ref_pool = None
+        fake_pool = None
 
-    fake_acts = compute_activations(fake_images, inception_extractor, batch_size=64, device=device)
+    # Precision/Recall: all ranks participate (GPU-heavy kNN)
+    prec, rec = compute_precision_recall(
+        ref_pool, fake_pool, k=3, rank=rank, world_size=world_size,
+    )
 
-    metrics = {}
-    metrics["IS"] = compute_inception_score(fake_acts["logits"])
-    metrics["FID"] = compute_fid(ref_acts["pool"], fake_acts["pool"])
-    metrics["sFID"] = compute_fid(ref_acts["spatial"], fake_acts["spatial"])
-    prec, rec = compute_precision_recall(ref_acts["pool"], fake_acts["pool"])
-    metrics["Precision"] = prec
-    metrics["Recall"] = rec
-
-    for k, v in metrics.items():
-        logger.log(f"  {k}: {v:.4f}")
-    return metrics
+    if rank == 0:
+        metrics["Precision"] = prec
+        metrics["Recall"] = rec
+        for k, v in metrics.items():
+            logger.log(f"  {k}: {v:.4f}")
+        return metrics
+    return None
 
 
 # ---------------------------------------------------------------------------
