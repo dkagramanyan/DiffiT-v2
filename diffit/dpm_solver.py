@@ -146,13 +146,12 @@ def dpm_solver_sample(
         # Predict x0 from eps
         x0_pred = predict_x0(model_output, x, alpha_cur, sigma_cur)
 
-        h = lam_next - lam_cur  # step size in lambda space (negative since lam decreases)
+        h = lam_next - lam_cur  # step size in lambda space (positive: lam increases as noise decreases)
 
         if i == 0 or x0_prev is None:
             # 1st-order update (DPM-Solver++1):
-            # x_{s} = (sigma_s / sigma_t) * x_t + alpha_s * (1 - exp(-(h))) * x0
-            # where h = lam_next - lam_cur (negative)
-            x = (sigma_next / sigma_cur) * x + alpha_next * (1.0 - torch.exp(h)) * x0_pred
+            # x_next = (sigma_next / sigma_cur) * x + alpha_next * (1 - exp(-h)) * x0
+            x = (sigma_next / sigma_cur) * x + alpha_next * (1.0 - torch.exp(-h)) * x0_pred
         else:
             # 2nd-order multistep update (DPM-Solver++2M):
             h_prev = lam_cur - lam_prev
@@ -161,7 +160,7 @@ def dpm_solver_sample(
             # Corrected x0 prediction using linear extrapolation
             D1 = (1.0 + 0.5 / r) * x0_pred - (0.5 / r) * x0_prev
 
-            x = (sigma_next / sigma_cur) * x + alpha_next * (1.0 - torch.exp(h)) * D1
+            x = (sigma_next / sigma_cur) * x + alpha_next * (1.0 - torch.exp(-h)) * D1
 
         # Save for next step
         x0_prev = x0_pred
