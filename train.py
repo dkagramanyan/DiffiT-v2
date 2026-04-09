@@ -506,19 +506,18 @@ def training_loop(
     # GradScaler for fp16 (not needed for bf16)
     scaler = torch.amp.GradScaler(device="cuda", enabled=use_grad_scaler)
 
-    # DDP wrapper with modern optimizations
+    # torch.compile first, then wrap with DDP (PyTorch-recommended order).
+    # Compiling the inner model preserves DDP's allreduce backward hooks.
+    compiled_model = torch.compile(model)
+
     if num_gpus > 1:
         ddp_model = DDP(
-            model,
+            compiled_model,
             device_ids=[rank],
             gradient_as_bucket_view=True,
-            static_graph=True,
         )
     else:
-        ddp_model = model
-
-    # torch.compile for kernel fusion (PyTorch 2.x)
-    compiled_model = torch.compile(ddp_model)
+        ddp_model = compiled_model
 
     # VAE encoder (for latent diffusion)
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
@@ -721,7 +720,7 @@ def training_loop(
 
         # Forward under autocast
         with torch.amp.autocast("cuda", dtype=amp_dtype_torch, enabled=amp_enabled):
-            losses = diffusion.training_losses(compiled_model, latent, t, model_kwargs=model_kwargs)
+            losses = diffusion.training_losses(ddp_model, latent, t, model_kwargs=model_kwargs)
             loss = (losses["loss"] * weights).mean()
 
         # Backward with GradScaler (no-op when using bf16)
