@@ -89,7 +89,6 @@ def generate_samples(
     if use_fp16:
         model.convert_to_fp16()
     model.eval()
-    torch.set_grad_enabled(False)
 
     # VAE decoder
     vae = AutoencoderKL.from_pretrained(
@@ -104,60 +103,63 @@ def generate_samples(
     print(f"Generating {num_samples} samples with batch_size={batch_size} "
           f"on {world_size} GPU(s)...")
 
-    while len(all_images) * batch_size < num_samples:
-        model_kwargs = {}
-        z = torch.randn(batch_size, 4, latent_size, latent_size, device=dev())
-        classes = torch.randint(
-            low=0, high=NUM_CLASSES, size=(batch_size,), device=dev()
-        )
+    # inference_mode is the strictest no-grad context: no autograd view
+    # tracking, no version counters → fastest for pure sampling.
+    with torch.inference_mode():
+        while len(all_images) * batch_size < num_samples:
+            model_kwargs = {}
+            z = torch.randn(batch_size, 4, latent_size, latent_size, device=dev())
+            classes = torch.randint(
+                low=0, high=NUM_CLASSES, size=(batch_size,), device=dev()
+            )
 
-        if cfg_cond:
-            z = torch.cat([z, z], 0)
-            classes_null = torch.full((batch_size,), NUM_CLASSES, device=dev())
-            model_kwargs["y"] = torch.cat([classes, classes_null], 0)
-            model_kwargs["cfg_scale"] = cfg_scale
-            model_kwargs["diffusion_steps"] = diff_config["diffusion_steps"]
-            model_kwargs["scale_pow"] = scale_pow
-        else:
-            model_kwargs["y"] = classes
-
-        sample_fn = diffusion.ddim_sample_loop if use_ddim else diffusion.p_sample_loop
-        sample = sample_fn(
-            model.forward_with_cfg,
-            z.shape,
-            z,
-            clip_denoised=False,
-            progress=(get_rank() == 0),
-            model_kwargs=model_kwargs,
-            device=dev(),
-        )
-
-        if cfg_cond:
-            sample, _ = sample.chunk(2, dim=0)
-
-        # Decode latent → image
-        sample = vae.decode(sample / 0.18215).sample
-        sample = ((sample + 1) * 127.5).clamp(0, 255).to(torch.uint8)
-        sample = sample.permute(0, 2, 3, 1).contiguous()
-
-        # Gather across GPUs
-        if world_size > 1:
-            gathered = [torch.zeros_like(sample) for _ in range(world_size)]
-            dist.all_gather(gathered, sample)
-            all_images.extend([s.cpu().numpy() for s in gathered])
-        else:
-            all_images.append(sample.cpu().numpy())
-
-        if class_cond:
-            if world_size > 1:
-                gathered_labels = [torch.zeros_like(classes) for _ in range(world_size)]
-                dist.all_gather(gathered_labels, classes)
-                all_labels.extend([l.cpu().numpy() for l in gathered_labels])
+            if cfg_cond:
+                z = torch.cat([z, z], 0)
+                classes_null = torch.full((batch_size,), NUM_CLASSES, device=dev())
+                model_kwargs["y"] = torch.cat([classes, classes_null], 0)
+                model_kwargs["cfg_scale"] = cfg_scale
+                model_kwargs["diffusion_steps"] = diff_config["diffusion_steps"]
+                model_kwargs["scale_pow"] = scale_pow
             else:
-                all_labels.append(classes.cpu().numpy())
+                model_kwargs["y"] = classes
 
-        total_so_far = len(all_images) * batch_size
-        print(f"Created {total_so_far} / {num_samples} samples")
+            sample_fn = diffusion.ddim_sample_loop if use_ddim else diffusion.p_sample_loop
+            sample = sample_fn(
+                model.forward_with_cfg,
+                z.shape,
+                z,
+                clip_denoised=False,
+                progress=(get_rank() == 0),
+                model_kwargs=model_kwargs,
+                device=dev(),
+            )
+
+            if cfg_cond:
+                sample, _ = sample.chunk(2, dim=0)
+
+            # Decode latent → image
+            sample = vae.decode(sample / 0.18215).sample
+            sample = ((sample + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+            sample = sample.permute(0, 2, 3, 1).contiguous()
+
+            # Gather across GPUs
+            if world_size > 1:
+                gathered = [torch.zeros_like(sample) for _ in range(world_size)]
+                dist.all_gather(gathered, sample)
+                all_images.extend([s.cpu().numpy() for s in gathered])
+            else:
+                all_images.append(sample.cpu().numpy())
+
+            if class_cond:
+                if world_size > 1:
+                    gathered_labels = [torch.zeros_like(classes) for _ in range(world_size)]
+                    dist.all_gather(gathered_labels, classes)
+                    all_labels.extend([l.cpu().numpy() for l in gathered_labels])
+                else:
+                    all_labels.append(classes.cpu().numpy())
+
+            total_so_far = len(all_images) * batch_size
+            print(f"Created {total_so_far} / {num_samples} samples")
 
     # Save results
     arr = np.concatenate(all_images, axis=0)[:num_samples]

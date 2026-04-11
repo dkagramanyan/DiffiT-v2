@@ -89,10 +89,15 @@ def load_data(
         drop_last=True,
         persistent_workers=num_workers > 0,
     )
+    # Advance the DistributedSampler epoch each pass so every rank gets
+    # a fresh shuffle. (Previously we always passed epoch=0, so every
+    # epoch repeated the same rank-local shard order verbatim.)
+    epoch = 0
     while True:
         if sampler is not None and hasattr(sampler, "set_epoch"):
-            sampler.set_epoch(getattr(loader, "_epoch", 0))
+            sampler.set_epoch(epoch)
         yield from loader
+        epoch += 1
 
 
 def _list_image_files_recursively(data_dir):

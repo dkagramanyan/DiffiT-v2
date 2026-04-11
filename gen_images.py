@@ -85,7 +85,6 @@ def generate_images(
     msg = model.load_state_dict(load_state_dict(model_path, map_location="cpu"))
     print(f"Model loaded: {msg}")
     model.to(device).eval()
-    torch.set_grad_enabled(False)
 
     # Create diffusion
     diff_config = diffusion_defaults()
@@ -99,53 +98,55 @@ def generate_images(
 
     os.makedirs(outdir, exist_ok=True)
 
-    # Generate images
-    for seed_idx, seed in enumerate(seeds):
-        torch.manual_seed(seed)
-        print(f"Generating image for seed {seed} ({seed_idx + 1}/{len(seeds)}) ...")
+    # Generate images under inference_mode: strictest no-grad context,
+    # avoids autograd version-counter overhead during sampling.
+    with torch.inference_mode():
+        for seed_idx, seed in enumerate(seeds):
+            torch.manual_seed(seed)
+            print(f"Generating image for seed {seed} ({seed_idx + 1}/{len(seeds)}) ...")
 
-        z = torch.randn(batch_sz, 4, latent_size, latent_size, device=device)
+            z = torch.randn(batch_sz, 4, latent_size, latent_size, device=device)
 
-        # Class label
-        if class_idx is not None:
-            classes = torch.full((batch_sz,), class_idx, device=device, dtype=torch.long)
-        else:
-            classes = torch.randint(0, NUM_CLASSES, (batch_sz,), device=device)
+            # Class label
+            if class_idx is not None:
+                classes = torch.full((batch_sz,), class_idx, device=device, dtype=torch.long)
+            else:
+                classes = torch.randint(0, NUM_CLASSES, (batch_sz,), device=device)
 
-        # Classifier-free guidance setup
-        z_cfg = torch.cat([z, z], 0)
-        classes_null = torch.full((batch_sz,), NUM_CLASSES, device=device, dtype=torch.long)
-        model_kwargs = {
-            "y": torch.cat([classes, classes_null], 0),
-            "cfg_scale": cfg_scale,
-            "diffusion_steps": diff_config["diffusion_steps"],
-            "scale_pow": scale_pow,
-        }
+            # Classifier-free guidance setup
+            z_cfg = torch.cat([z, z], 0)
+            classes_null = torch.full((batch_sz,), NUM_CLASSES, device=device, dtype=torch.long)
+            model_kwargs = {
+                "y": torch.cat([classes, classes_null], 0),
+                "cfg_scale": cfg_scale,
+                "diffusion_steps": diff_config["diffusion_steps"],
+                "scale_pow": scale_pow,
+            }
 
-        sample_fn = diffusion.ddim_sample_loop if use_ddim else diffusion.p_sample_loop
-        sample = sample_fn(
-            model.forward_with_cfg,
-            z_cfg.shape,
-            z_cfg,
-            clip_denoised=False,
-            progress=True,
-            model_kwargs=model_kwargs,
-            device=device,
-        )
+            sample_fn = diffusion.ddim_sample_loop if use_ddim else diffusion.p_sample_loop
+            sample = sample_fn(
+                model.forward_with_cfg,
+                z_cfg.shape,
+                z_cfg,
+                clip_denoised=False,
+                progress=True,
+                model_kwargs=model_kwargs,
+                device=device,
+            )
 
-        sample, _ = sample.chunk(2, dim=0)
+            sample, _ = sample.chunk(2, dim=0)
 
-        # Decode latent → image
-        sample = vae.decode(sample / 0.18215).sample
-        sample = ((sample + 1) * 127.5).clamp(0, 255).to(torch.uint8)
-        sample = sample.permute(0, 2, 3, 1).cpu().numpy()
+            # Decode latent → image
+            sample = vae.decode(sample / 0.18215).sample
+            sample = ((sample + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+            sample = sample.permute(0, 2, 3, 1).cpu().numpy()
 
-        # Save each image in batch
-        for i, img in enumerate(sample):
-            fname = f"seed{seed:04d}"
-            if batch_sz > 1:
-                fname += f"_b{i:02d}"
-            PIL.Image.fromarray(img, "RGB").save(os.path.join(outdir, f"{fname}.png"))
+            # Save each image in batch
+            for i, img in enumerate(sample):
+                fname = f"seed{seed:04d}"
+                if batch_sz > 1:
+                    fname += f"_b{i:02d}"
+                PIL.Image.fromarray(img, "RGB").save(os.path.join(outdir, f"{fname}.png"))
 
     print("Done.")
 

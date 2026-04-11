@@ -238,7 +238,7 @@ class DiffiTAttention(nn.Module):
             qkv_temb = self.qkv_temb(temb).unsqueeze(1).to(x.dtype)
             qkv = qkv_temb + self.qkv(x)
         else:
-            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+            qkv = self.qkv(x)
 
         qkv = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)                          # each: (B, heads, N, head_dim)
@@ -320,8 +320,9 @@ class FinalLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 # Latent-size threshold that separates the two CFG strategies.
-# image_size 256 → latent_size 32  (power-cosine CFG)
-# image_size 512 → latent_size 64  (linear CFG)
+# image_size 256  → latent_size 32   (power-cosine CFG schedule)
+# image_size 512  → latent_size 64   (constant CFG scale)
+# image_size 1024 → latent_size 128  (constant CFG scale)
 _LATENT_SIZE_THRESHOLD = 32
 
 
@@ -340,7 +341,7 @@ class DiffiT(nn.Module):
         patch_size: int = 2,
         in_channels: int = 4,
         hidden_size: int = 1152,
-        depth: int = 30,
+        depth: int = 28,
         num_heads: int = 16,
         mlp_ratio: float = 4.0,
         mask_ratio=None,
@@ -481,14 +482,19 @@ class DiffiT(nn.Module):
         predicted noise.
 
         CFG strategy varies by resolution:
-            - **image_size 256** (``input_size <= 32``): power-cosine schedule
-              that ramps the effective scale over the diffusion process.
-            - **image_size 512** (``input_size > 32``): constant linear CFG
-              scaling.
+            - **image_size 256** (``input_size <= 32``): power-cosine
+              schedule that ramps the effective scale over the diffusion
+              process.
+            - **image_size 512 / 1024** (``input_size > 32``): constant
+              CFG scale across all denoising steps.
         """
+        # Latent diffusion uses `in_channels` eps channels (e.g. 4 for
+        # Stable-Diffusion VAE), not the RGB-era hardcoded 3.
+        split = self.in_channels
+
         if cfg_scale is None:
             model_out = self.forward(x, t, y)
-            eps, rest = model_out[:, :3], model_out[:, 3:]
+            eps, rest = model_out[:, :split], model_out[:, split:]
             return torch.cat([eps, rest], dim=1)
 
         # Duplicate the conditional half for paired evaluation
@@ -496,7 +502,7 @@ class DiffiT(nn.Module):
         combined = torch.cat([half, half], dim=0)
         model_out = self.forward(combined, t, y)
 
-        eps, rest = model_out[:, :3], model_out[:, 3:]
+        eps, rest = model_out[:, :split], model_out[:, split:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
 
         if self.input_size <= _LATENT_SIZE_THRESHOLD:
@@ -506,7 +512,7 @@ class DiffiT(nn.Module):
             real_cfg_scale = (cfg_scale - 1) * scale_step + 1
             real_cfg_scale = real_cfg_scale[: len(x) // 2].view(-1, 1, 1, 1)
         else:
-            # ----- image_size 512: constant linear CFG -----------------------
+            # ----- image_size 512 / 1024: constant CFG scale -----------------
             real_cfg_scale = cfg_scale
 
         half_eps = uncond_eps + real_cfg_scale * (cond_eps - uncond_eps)
@@ -519,5 +525,5 @@ class DiffiT(nn.Module):
 # ---------------------------------------------------------------------------
 
 def Diffit(**kwargs):
-    """DiffiT-XL/2 configuration (depth 30, dim 1152, patch 2, 16 heads)."""
-    return DiffiT(depth=30, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+    """DiffiT-XL/2 configuration (depth 28, dim 1152, patch 2, 16 heads)."""
+    return DiffiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)

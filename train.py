@@ -85,7 +85,8 @@ def setup_snapshot_image_grid(image_size, gw=None, gh=None):
 @torch.inference_mode()
 def generate_snapshot_images(
     ema_model, vae, diffusion, grid_z, grid_classes, batch_gpu, device,
-    cfg_scale=4.4, num_sampling_steps=25, scale_pow=4.0,
+    *,
+    cfg_scale, num_sampling_steps=25, scale_pow=4.0,
 ):
     """Generate a batch of images from the EMA model for snapshot grids."""
     all_samples = []
@@ -187,7 +188,8 @@ def compute_activations(images_uint8_nchw, extractor, batch_size, device, desc="
 @torch.inference_mode()
 def generate_eval_samples(
     ema_model, vae, diffusion, num_samples, batch_gpu, latent_size, device,
-    cfg_scale=4.4, num_sampling_steps=25, scale_pow=4.0,
+    *,
+    cfg_scale, num_sampling_steps=25, scale_pow=4.0,
     rank=0, world_size=1,
 ):
     """Generate N random images for metric evaluation (NCHW uint8 numpy).
@@ -299,6 +301,7 @@ def compute_inception_score(logits, split_size=5000):
     return float(np.mean(scores))
 
 
+@torch.inference_mode()
 def compute_precision_recall(ref_acts, sample_acts, k=3, rank=0, world_size=1):
     """Precision and Recall via k-NN manifold estimation (multi-GPU accelerated).
 
@@ -368,9 +371,12 @@ def compute_precision_recall(ref_acts, sample_acts, k=3, rank=0, world_size=1):
     return precision, recall
 
 
+@torch.inference_mode()
 def evaluate_metrics(
     ema_model, vae, diffusion, ref_acts, inception_extractor,
     num_fid_samples, batch_gpu, latent_size, device,
+    *,
+    cfg_scale,
     rank=0, world_size=1,
 ):
     """Generate samples across all ranks, compute metrics on rank 0.
@@ -379,9 +385,13 @@ def evaluate_metrics(
     Only rank 0 computes FID, IS, sFID (cheap, single-GPU is fine).
     """
     if rank == 0:
-        logger.log(f"Evaluating metrics ({num_fid_samples} samples across {world_size} GPU(s))...")
+        logger.log(
+            f"Evaluating metrics ({num_fid_samples} samples across "
+            f"{world_size} GPU(s), cfg_scale={cfg_scale})..."
+        )
     fake_images = generate_eval_samples(
         ema_model, vae, diffusion, num_fid_samples, batch_gpu, latent_size, device,
+        cfg_scale=cfg_scale,
         rank=rank, world_size=world_size,
     )
 
@@ -420,17 +430,21 @@ def subprocess_fn(rank, c, temp_dir):
     """Entry point for each DDP worker."""
     logger.configure(log_dir=c["run_dir"])
 
+    # Pin this process to its GPU *before* initializing the NCCL process
+    # group. NCCL inspects the current CUDA device at init time to build
+    # its communicator; flipping devices afterwards causes silent
+    # contention and (sometimes) hangs on the first collective.
+    torch.cuda.set_device(rank)
+    torch.backends.cuda.matmul.allow_tf32 = c.get("allow_tf32", True)
+    torch.backends.cudnn.allow_tf32 = c.get("allow_tf32", True)
+    torch.backends.cudnn.benchmark = True
+
     if c["num_gpus"] > 1:
         init_file = os.path.abspath(os.path.join(temp_dir, ".torch_distributed_init"))
         init_method = f"file://{init_file}"
         dist.init_process_group(
             backend="nccl", init_method=init_method, rank=rank, world_size=c["num_gpus"]
         )
-
-    torch.cuda.set_device(rank)
-    torch.backends.cuda.matmul.allow_tf32 = c.get("allow_tf32", True)
-    torch.backends.cudnn.allow_tf32 = c.get("allow_tf32", True)
-    torch.backends.cudnn.benchmark = True
 
     training_loop(rank=rank, **c)
 
@@ -461,6 +475,7 @@ def training_loop(
     resume,
     model_name,
     schedule_sampler_name,
+    cfg_scale,
     amp_dtype="fp16",
     workers=4,
     cache_in_ram=False,
@@ -506,18 +521,20 @@ def training_loop(
     # GradScaler for fp16 (not needed for bf16)
     scaler = torch.amp.GradScaler(device="cuda", enabled=use_grad_scaler)
 
-    # torch.compile first, then wrap with DDP (PyTorch-recommended order).
-    # Compiling the inner model preserves DDP's allreduce backward hooks.
-    compiled_model = torch.compile(model)
-
+    # Wrap with DDP first, then torch.compile. This is the order recommended
+    # by the torch.compile + DDP tutorial: compile traces through the DDP
+    # forward/backward hooks so the allreduce calls are part of the graph
+    # and don't cause repeated recompilations.
     if num_gpus > 1:
         ddp_model = DDP(
-            compiled_model,
+            model,
             device_ids=[rank],
             gradient_as_bucket_view=True,
         )
     else:
-        ddp_model = compiled_model
+        ddp_model = model
+
+    ddp_model = torch.compile(ddp_model)
 
     # VAE encoder (for latent diffusion)
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
@@ -674,6 +691,7 @@ def training_loop(
         fakes_init = generate_snapshot_images(
             ema_model, vae, diffusion, grid_z, grid_classes,
             batch_gpu=batch_gpu, device=device,
+            cfg_scale=cfg_scale,
         )
         save_image_grid(fakes_init, os.path.join(run_dir, "fakes_init.png"), drange=[0, 255], grid_size=grid_size)
 
@@ -822,6 +840,7 @@ def training_loop(
                     fakes = generate_snapshot_images(
                         ema_model, vae, diffusion, grid_z, grid_classes,
                         batch_gpu=batch_gpu, device=device,
+                        cfg_scale=cfg_scale,
                     )
                     save_image_grid(
                         fakes, os.path.join(run_dir, f"fakes{cur_nimg // 1000:06d}.png"),
@@ -834,6 +853,7 @@ def training_loop(
                     stats_metrics = evaluate_metrics(
                         ema_model, vae, diffusion, ref_acts, inception_extractor,
                         num_fid_samples, batch_gpu, latent_size, device,
+                        cfg_scale=cfg_scale,
                         rank=rank, world_size=num_gpus,
                     )
                     # Only rank 0 logs and saves metrics
@@ -894,6 +914,7 @@ def training_loop(
         fakes = generate_snapshot_images(
             ema_model, vae, diffusion, grid_z, grid_classes,
             batch_gpu=batch_gpu, device=device,
+            cfg_scale=cfg_scale,
         )
         save_image_grid(
             fakes, os.path.join(run_dir, f"fakes{cur_nimg // 1000:06d}.png"),
@@ -984,6 +1005,9 @@ BASE_CONFIGS = {
         use_fp16=True,
         schedule_sampler_name="uniform",
         num_fid_samples=10000,
+        # Paper-reported guidance for 256x256 (power-cosine schedule inside
+        # forward_with_cfg ramps this 1 → cfg_scale).
+        cfg_scale=4.4,
     ),
     "diffit-512": dict(
         image_size=512,
@@ -996,6 +1020,9 @@ BASE_CONFIGS = {
         use_fp16=True,
         schedule_sampler_name="uniform",
         num_fid_samples=10000,
+        # Paper-reported guidance for 512x512 (applied as a constant scale
+        # across all denoising steps in forward_with_cfg).
+        cfg_scale=1.49,
     ),
     "diffit-1024": dict(
         image_size=1024,
@@ -1008,6 +1035,9 @@ BASE_CONFIGS = {
         use_fp16=True,
         schedule_sampler_name="uniform",
         num_fid_samples=512,
+        # No paper-reported number for 1024; start with the 512 value
+        # (constant CFG branch) and tune empirically.
+        cfg_scale=1.49,
     ),
 }
 
@@ -1038,6 +1068,7 @@ BASE_CONFIGS = {
 @click.option("--resume",       help="Resume from checkpoint path", metavar="PATH",            type=str, default=None)
 @click.option("--schedule-sampler", "schedule_sampler_name", help="Timestep sampler [default: from cfg]", type=str, default=None)
 @click.option("--num-fid-samples", help="Samples for FID eval during training (0=disable)", metavar="INT", type=click.IntRange(min=0), default=None)
+@click.option("--cfg-scale",    help="Classifier-free guidance scale used during training-time eval [default: from cfg]", metavar="FLOAT", type=float, default=None)
 
 # Misc settings.
 @click.option("--desc",         help="String to include in result dir name", metavar="STR",    type=str, default=None)
@@ -1075,6 +1106,8 @@ def main(**kwargs):
         cfg["schedule_sampler_name"] = opts["schedule_sampler_name"]
     if opts["num_fid_samples"] is not None:
         cfg["num_fid_samples"] = opts["num_fid_samples"]
+    if opts["cfg_scale"] is not None:
+        cfg["cfg_scale"] = opts["cfg_scale"]
 
     # Build full config dict.
     c = dict(
@@ -1098,6 +1131,7 @@ def main(**kwargs):
         workers=opts["workers"],
         cache_in_ram=opts["cache_in_ram"],
         num_fid_samples=cfg["num_fid_samples"],
+        cfg_scale=cfg["cfg_scale"],
         log_interval=10,
         save_interval=10000,
     )
