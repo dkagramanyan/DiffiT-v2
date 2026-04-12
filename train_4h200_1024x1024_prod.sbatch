@@ -99,8 +99,12 @@ echo "Start time : $(date)"
 echo "────────────────────────────────────"
 
 # ── Train ──────────────────────────────────────────────────────────────────────
-# cfg=diffit-1024 pulls image_size=1024, lr=1e-4, cfg_scale=1.49 (constant)
-# from BASE_CONFIGS in train.py.
+# cfg=diffit-1024 pulls from BASE_CONFIGS:
+#   image_size=1024, lr=1e-4, cfg_scale=1.49, gradient_checkpointing=True,
+#   grad_accum_steps=2, lr_warmup_kimg=1000.
+#
+# With checkpointing + 2-step accumulation the effective batch per step is:
+#   H100: 16 × 4 × 2 = 128    H200: 32 × 4 × 2 = 256
 python "$PROJECT_DIR/train.py" \
     --outdir="$OUTDIR" \
     --cfg=diffit-1024 \

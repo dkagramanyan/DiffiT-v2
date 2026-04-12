@@ -26,6 +26,7 @@ import re
 import tempfile
 import time
 import warnings
+from contextlib import nullcontext
 
 import click
 import numpy as np
@@ -476,6 +477,9 @@ def training_loop(
     model_name,
     schedule_sampler_name,
     cfg_scale,
+    grad_accum_steps=1,
+    gradient_checkpointing=False,
+    lr_warmup_kimg=0,
     amp_dtype="fp16",
     workers=4,
     cache_in_ram=False,
@@ -505,7 +509,15 @@ def training_loop(
     model = diffit_module.__dict__[model_name](input_size=latent_size)
     model.to(device)
 
-    # EMA model
+    if gradient_checkpointing:
+        model.gradient_checkpointing = True
+        if is_main:
+            logger.log("Gradient checkpointing enabled — "
+                       "block activations will be recomputed during backward.")
+
+    # EMA model (deep-copied *after* setting checkpointing flag so the
+    # flag is present, but eval never triggers it because of the
+    # `and self.training` guard in forward).
     ema_model = copy.deepcopy(model)
     ema_model.requires_grad_(False)
     ema_model.eval()
@@ -515,26 +527,27 @@ def training_loop(
     diffusion = create_diffusion(**diff_config)
     schedule_sampler = create_named_schedule_sampler(schedule_sampler_name, diffusion)
 
-    # Optimizer (directly on model parameters — torch.amp handles precision)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
+    # Optimizer — fused=True keeps param updates in a single CUDA kernel
+    # and is ~15-20 % faster than the default loop on Ampere / Hopper.
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0, fused=True)
 
     # GradScaler for fp16 (not needed for bf16)
     scaler = torch.amp.GradScaler(device="cuda", enabled=use_grad_scaler)
 
-    # Wrap with DDP first, then torch.compile. This is the order recommended
-    # by the torch.compile + DDP tutorial: compile traces through the DDP
-    # forward/backward hooks so the allreduce calls are part of the graph
-    # and don't cause repeated recompilations.
+    # Wrap with DDP first, then torch.compile (recommended order: compile
+    # traces through DDP's forward/backward hooks so allreduce is part of
+    # the compiled graph).  We keep a reference to the raw DDP wrapper for
+    # the no_sync() context needed during gradient accumulation.
     if num_gpus > 1:
-        ddp_model = DDP(
+        ddp_raw = DDP(
             model,
             device_ids=[rank],
             gradient_as_bucket_view=True,
         )
     else:
-        ddp_model = model
+        ddp_raw = model
 
-    ddp_model = torch.compile(ddp_model)
+    ddp_model = torch.compile(ddp_raw, mode="max-autotune")
 
     # VAE encoder (for latent diffusion)
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
@@ -701,11 +714,21 @@ def training_loop(
         dist.barrier()
 
     # Training
-    logger.log(f"Training for {total_kimg} kimg...")
+    effective_batch = batch_gpu * num_gpus * grad_accum_steps
+    if is_main:
+        logger.log(
+            f"Training for {total_kimg} kimg  "
+            f"(batch_gpu={batch_gpu} × {num_gpus} GPUs × {grad_accum_steps} accum "
+            f"= {effective_batch} effective batch)"
+        )
+        if lr_warmup_kimg > 0:
+            logger.log(f"LR warmup: 0 → {lr} over {lr_warmup_kimg} kimg")
+
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
     maintenance_time = start_time - time.time()  # negative initially
     cur_tick = 0
+    opt_steps = 0
 
     def _format_time(seconds):
         """Format seconds into human-readable string like SAN-v2."""
@@ -721,41 +744,60 @@ def training_loop(
             return f"{h}h {m:02d}m {sec:02d}s"
 
     while cur_nimg < total_kimg * 1000:
-        batch, cond = next(data_iter)
-        batch = batch.to(device, non_blocking=True)
-
-        # Encode to latent space (under autocast for VAE convolutions)
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype_torch, enabled=amp_enabled):
-            latent = vae.encode(batch).latent_dist.sample() * 0.18215
-
-        # Sample timesteps
-        t, weights = schedule_sampler.sample(latent.shape[0], device)
-
-        # Model kwargs
-        model_kwargs = {}
-        if "y" in cond:
-            model_kwargs["y"] = cond["y"].to(device, non_blocking=True)
-
-        # Forward under autocast
-        with torch.amp.autocast("cuda", dtype=amp_dtype_torch, enabled=amp_enabled):
-            losses = diffusion.training_losses(ddp_model, latent, t, model_kwargs=model_kwargs)
-            loss = (losses["loss"] * weights).mean()
-
-        # Backward with GradScaler (no-op when using bf16)
         opt.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
+
+        # --- Gradient accumulation over micro-batches -----------------------
+        for micro_step in range(grad_accum_steps):
+            batch, cond = next(data_iter)
+            batch = batch.to(device, non_blocking=True)
+
+            # Encode to latent space
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype_torch, enabled=amp_enabled):
+                latent = vae.encode(batch).latent_dist.sample() * 0.18215
+
+            # Sample timesteps
+            t, weights = schedule_sampler.sample(latent.shape[0], device)
+
+            # Model kwargs
+            model_kwargs = {}
+            if "y" in cond:
+                model_kwargs["y"] = cond["y"].to(device, non_blocking=True)
+
+            # Skip DDP allreduce on all micro-steps except the last to
+            # avoid redundant gradient synchronisation.
+            is_last_micro = (micro_step == grad_accum_steps - 1)
+            sync_ctx = nullcontext() if is_last_micro or num_gpus <= 1 else ddp_raw.no_sync()
+
+            with sync_ctx:
+                with torch.amp.autocast("cuda", dtype=amp_dtype_torch, enabled=amp_enabled):
+                    losses = diffusion.training_losses(ddp_model, latent, t, model_kwargs=model_kwargs)
+                    loss = (losses["loss"] * weights).mean() / grad_accum_steps
+
+                scaler.scale(loss).backward()
+
+            cur_nimg += batch_gpu * num_gpus
+
+            # Accumulate loss for tick-level reporting (undo the 1/accum
+            # scaling so the logged value reflects per-sample magnitude).
+            logger.logkv_mean("Loss/train", loss.item() * grad_accum_steps)
+            if "vb" in losses:
+                logger.logkv_mean("Loss/vb", losses["vb"].mean().item())
+
+        # --- Optimizer step (once per effective batch) ----------------------
         scaler.step(opt)
         scaler.update()
+        opt_steps += 1
+
+        # LR warmup (linear ramp from 0 → lr)
+        if lr_warmup_kimg > 0:
+            warmup_nimg = lr_warmup_kimg * 1000
+            warmup_frac = min(1.0, cur_nimg / warmup_nimg)
+            for pg in opt.param_groups:
+                pg["lr"] = lr * warmup_frac
 
         # Update EMA
         update_ema(ema_model.parameters(), model.parameters(), rate=ema_rate)
 
-        cur_nimg += batch_gpu * num_gpus
-
-        # Accumulate loss for tick-level reporting
-        logger.logkv_mean("Loss/train", loss.item())
-        if "vb" in losses:
-            logger.logkv_mean("Loss/vb", losses["vb"].mean().item())
         if "mse" in losses:
             logger.logkv_mean("Loss/mse", losses["mse"].mean().item())
 
@@ -1005,9 +1047,10 @@ BASE_CONFIGS = {
         use_fp16=True,
         schedule_sampler_name="uniform",
         num_fid_samples=10000,
-        # Paper-reported guidance for 256x256 (power-cosine schedule inside
-        # forward_with_cfg ramps this 1 → cfg_scale).
         cfg_scale=4.4,
+        grad_accum_steps=1,
+        gradient_checkpointing=False,
+        lr_warmup_kimg=0,
     ),
     "diffit-512": dict(
         image_size=512,
@@ -1020,9 +1063,10 @@ BASE_CONFIGS = {
         use_fp16=True,
         schedule_sampler_name="uniform",
         num_fid_samples=10000,
-        # Paper-reported guidance for 512x512 (applied as a constant scale
-        # across all denoising steps in forward_with_cfg).
         cfg_scale=1.49,
+        grad_accum_steps=1,
+        gradient_checkpointing=False,
+        lr_warmup_kimg=0,
     ),
     "diffit-1024": dict(
         image_size=1024,
@@ -1035,9 +1079,12 @@ BASE_CONFIGS = {
         use_fp16=True,
         schedule_sampler_name="uniform",
         num_fid_samples=512,
-        # No paper-reported number for 1024; start with the 512 value
-        # (constant CFG branch) and tune empirically.
         cfg_scale=1.49,
+        # 1024² is memory-bound: enable checkpointing by default and
+        # use 2-step accumulation to double the effective batch.
+        grad_accum_steps=2,
+        gradient_checkpointing=True,
+        lr_warmup_kimg=1000,
     ),
 }
 
@@ -1069,6 +1116,11 @@ BASE_CONFIGS = {
 @click.option("--schedule-sampler", "schedule_sampler_name", help="Timestep sampler [default: from cfg]", type=str, default=None)
 @click.option("--num-fid-samples", help="Samples for FID eval during training (0=disable)", metavar="INT", type=click.IntRange(min=0), default=None)
 @click.option("--cfg-scale",    help="Classifier-free guidance scale used during training-time eval [default: from cfg]", metavar="FLOAT", type=float, default=None)
+
+# Performance tuning.
+@click.option("--grad-accum",  help="Gradient accumulation steps (effective batch = batch-gpu × gpus × accum)", metavar="INT", type=click.IntRange(min=1), default=None)
+@click.option("--grad-ckpt/--no-grad-ckpt", "gradient_checkpointing", help="Enable gradient checkpointing (trades compute for memory)", default=None)
+@click.option("--lr-warmup",   help="Linear LR warmup duration in kimg (0 = disabled) [default: from cfg]", metavar="KIMG", type=click.IntRange(min=0), default=None)
 
 # Misc settings.
 @click.option("--desc",         help="String to include in result dir name", metavar="STR",    type=str, default=None)
@@ -1108,6 +1160,12 @@ def main(**kwargs):
         cfg["num_fid_samples"] = opts["num_fid_samples"]
     if opts["cfg_scale"] is not None:
         cfg["cfg_scale"] = opts["cfg_scale"]
+    if opts["grad_accum"] is not None:
+        cfg["grad_accum_steps"] = opts["grad_accum"]
+    if opts["gradient_checkpointing"] is not None:
+        cfg["gradient_checkpointing"] = opts["gradient_checkpointing"]
+    if opts["lr_warmup"] is not None:
+        cfg["lr_warmup_kimg"] = opts["lr_warmup"]
 
     # Build full config dict.
     c = dict(
@@ -1132,6 +1190,9 @@ def main(**kwargs):
         cache_in_ram=opts["cache_in_ram"],
         num_fid_samples=cfg["num_fid_samples"],
         cfg_scale=cfg["cfg_scale"],
+        grad_accum_steps=cfg["grad_accum_steps"],
+        gradient_checkpointing=cfg["gradient_checkpointing"],
+        lr_warmup_kimg=cfg["lr_warmup_kimg"],
         log_interval=10,
         save_interval=10000,
     )

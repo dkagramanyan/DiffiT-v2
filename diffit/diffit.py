@@ -14,11 +14,13 @@ Code by Ali Hatamizadeh.
 """
 
 import math
+from functools import partial
 from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from timm.models.layers import trunc_normal_
 from timm.models.vision_transformer import Mlp, PatchEmbed
 
@@ -222,7 +224,11 @@ class DiffiTAttention(nn.Module):
         relative_coords[:, :, 0] += ws[0] - 1
         relative_coords[:, :, 1] += ws[1] - 1
         relative_coords[:, :, 0] *= 2 * ws[1] - 1
-        self.register_buffer("relative_position_index", relative_coords.sum(-1))
+        # int32 is sufficient (max value ≈ (2*ws-1)² ≤ 16k) and halves the
+        # buffer from 3.6 GB → 1.8 GB at 1024² resolution.
+        self.register_buffer(
+            "relative_position_index", relative_coords.sum(-1).to(torch.int32)
+        )
 
         # Linear projections -------------------------------------------------
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -378,6 +384,7 @@ class DiffiT(nn.Module):
             for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.gradient_checkpointing = False
 
         self._initialize_weights()
 
@@ -460,7 +467,10 @@ class DiffiT(nn.Module):
         c = self.t_embedder(t) + self.y_embedder(y, self.training)
 
         for block in self.blocks:
-            x = block(x, c)
+            if self.gradient_checkpointing and self.training:
+                x = grad_checkpoint(block, x, c, use_reentrant=False)
+            else:
+                x = block(x, c)
 
         x = self.final_layer(x)
         return self.unpatchify(x)
