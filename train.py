@@ -547,7 +547,12 @@ def training_loop(
     else:
         ddp_raw = model
 
-    ddp_model = torch.compile(ddp_raw, mode="max-autotune")
+    # max-autotune enables CUDA-graph capture, which conflicts with
+    # gradient checkpointing (the replayed graph overwrites tensors the
+    # backward recomputation still needs).  Use the no-cudagraphs
+    # variant when checkpointing is active.
+    compile_mode = "max-autotune-no-cudagraphs" if gradient_checkpointing else "max-autotune"
+    ddp_model = torch.compile(ddp_raw, mode=compile_mode)
 
     # VAE encoder (for latent diffusion)
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
