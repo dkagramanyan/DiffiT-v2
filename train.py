@@ -917,44 +917,20 @@ def training_loop(
                                 stats_tfevents.add_scalar(f"Metrics/{name}", value, global_step=global_step, walltime=walltime)
                             stats_tfevents.flush()
 
-                # Save checkpoint (rank 0 only)
+                # Save checkpoint (rank 0 only) — inference-only: EMA weights as a raw state_dict
                 if is_main:
                     save_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}.pt")
                     logger.log(f"Saving checkpoint to {save_path}...")
-                    ckpt_data = {
-                        "model": model.state_dict(),
-                        "ema": ema_model.state_dict(),
-                        "opt": opt.state_dict(),
-                        "cur_nimg": cur_nimg,
-                        "config": {
-                            "image_size": image_size,
-                            "model_name": model_name,
-                        },
-                    }
-                    if use_grad_scaler:
-                        ckpt_data["scaler"] = scaler.state_dict()
-                    torch.save(ckpt_data, save_path)
+                    torch.save(ema_model.state_dict(), save_path)
                     logger.log(f"Checkpoint saved (kimg={cur_nimg / 1e3:.1f})")
 
                     maintenance_time = time.time() - snap_start
 
-    # Final save
+    # Final save — inference-only: EMA weights as a raw state_dict
     if is_main:
         save_path = os.path.join(run_dir, "network-final.pt")
         logger.log(f"Saving final model to {save_path}...")
-        ckpt_data = {
-            "model": model.state_dict(),
-            "ema": ema_model.state_dict(),
-            "opt": opt.state_dict(),
-            "cur_nimg": cur_nimg,
-            "config": {
-                "image_size": image_size,
-                "model_name": model_name,
-            },
-        }
-        if use_grad_scaler:
-            ckpt_data["scaler"] = scaler.state_dict()
-        torch.save(ckpt_data, save_path)
+        torch.save(ema_model.state_dict(), save_path)
 
         # Final image snapshot
         logger.log("Saving final image snapshot...")

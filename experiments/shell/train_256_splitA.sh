@@ -17,7 +17,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
 
 : "${NPROC:=1}"
-: "${BATCH_GPU:=32}"
+: "${BATCH_GPU:=16}"
 : "${KIMG:=1000}"
 : "${SNAP:=5}"
 : "${DATASET:=${PROJECT_DIR}/datasets/imagenet_9to4_1024x1024_256x256.zip}"
