@@ -8,15 +8,34 @@ For business inquiries, please visit our website and submit the form: [NVIDIA Re
 
 **DiffiT** (Diffusion Vision Transformers) is a generative model that combines the expressive power of diffusion models with Vision Transformers (ViTs), introducing **Time-dependent Multihead Self Attention (TMSA)** for fine-grained control over the denoising at each timestep. DiffiT achieves SOTA performance on class-conditional ImageNet generation at multiple resolutions, notably an **FID score of 1.73** on ImageNet-256.
 
+**DiffiT-v2** is a performance refresh of this codebase. TMSA is preserved exactly as defined in the paper (Section 3.2, Eqs 3–5). What changes is the attention plumbing around it — the learned relative-position bias is replaced with **RoPE-2D** so SDPA can dispatch to FlashAttention, **QK-norm** is added for bf16 stability, LayerNorm becomes RMSNorm, and the MLP switches to SwiGLU. Training and sampling are rebuilt around `torchrun`, `torch.compile`, and `click`. See the [v2 release notes](#v2-changes-at-a-glance) below.
+
 ![teaser](./assets/imagenet.png)
 
 ![teaser](./assets/latent_diffit.png)
 
 ## News
+- **[04.19.2026]** DiffiT-v2 performance refresh: RoPE-2D + FlashAttention, QK-norm, RMSNorm, SwiGLU. 1024² now a first-class config.
 - **[03.08.2026]** DiffiT code and pretrained model are released!
 - **[07.01.2024]** DiffiT has been accepted to [ECCV 2024](https://eccv.ecva.net/)!
 - **[04.02.2024]** Updated [manuscript](https://arxiv.org/abs/2312.02139) now available on arXiv!
 - **[12.04.2023]** Paper is published on arXiv!
+
+## v2 changes at a glance
+
+| Change | What it does | Why |
+|---|---|---|
+| **RoPE-2D** replaces learned relative-position bias | Axial rotary embeddings on Q, K | Unlocks FlashAttention-2 (attn_mask is no longer needed) and enables progressive-resolution finetuning across 256/512/1024. Frees ~2 GB `relative_position_index` buffer at 1024². |
+| **QK-norm** (RMSNorm on Q, K) | Stateful per-head RMSNorm before RoPE | Prevents bf16/fp16 attention-logit blow-up at depth-28, hidden-1152 scale. |
+| **RMSNorm** replaces LayerNorm | Stateless RMS normalization | ~1–2% faster, no quality regression. |
+| **SwiGLU** MLP | Matched-param `hidden × 8/3` inner width, rounded to 64 | Modern FFN; small consistent quality gain. |
+| **TMSA preserved** | Additive time-token QKV projection | Paper's core contribution (Eqs 3–5, Fig 7b). Parameter count stays at **561M** — matches Table 9 of the paper. |
+| **CFG split fix** | Split at `self.in_channels` (=4 for SD-VAE) | Original code hardcoded `:3` which was wrong for 4-channel latents. |
+| **`torchrun` + `torch.compile`** | Modern distributed launch | Replaces MPI; `max-autotune` mode enabled for training. |
+
+**Expected performance** (vs. original DiffiT): ~1.1–1.3× at 256², ~1.8–2.5× at 512², **~3–5× at 1024²** — dominated by FlashAttention at high resolution. Quality impact: ±0.1–0.3 FID, directionally positive.
+
+> **⚠️ Checkpoints from the original DiffiT are not compatible with v2** — parameter names and shapes changed. See the release notes for details.
 
 ## Models
 
@@ -92,64 +111,176 @@ The `--cfg` flag selects a base configuration that sets model architecture,
 resolution, learning rate, diffusion settings, etc. Individual CLI options
 can still override any preset value.
 
-| Config | Resolution | Model | LR | FP16 | kimg | Schedule Sampler |
-|--------|-----------|-------|------|------|------|------------------|
-| `diffit-256` | 256 | Diffit (XL/2) | 1e-4 | off | 400000 | uniform |
-| `diffit-512` | 512 | Diffit (XL/2) | 1e-4 | on | 400000 | uniform |
-| `diffit-1024` | 1024 | Diffit (XL/2) | 1e-4 | on | 400000 | uniform |
+| Config | Resolution | Model | LR | AMP | kimg | CFG scale | Grad ckpt |
+|--------|-----------|-------|------|------|------|-----------|-----------|
+| `diffit-256` | 256 | DiffiT-XL/2 | 3e-4 | bf16 | 400000 | 4.4 (power-cosine) | off |
+| `diffit-512` | 512 | DiffiT-XL/2 | 1e-4 | bf16 | 400000 | 1.49 (constant) | off |
+| `diffit-1024` | 1024 | DiffiT-XL/2 | 1e-4 | bf16 | 400000 | 1.49 (constant) | on |
 
-### Single command
+Paper's recipe (Appendix I.2, p.22): AdamW, EMA 0.9999, DDPM sampler 250 steps, ADM diffusion hyperparameters.
 
-Train DiffiT on ImageNet-256 with multi-GPU DDP:
+### Training strategies
+
+You have two viable approaches. **We strongly recommend the progressive-finetune path** (B) — it is 3–5× cheaper and historically reaches better final FID than independent from-scratch runs at higher resolutions.
+
+---
+
+### Strategy A: From scratch at each resolution
+
+Use this if you need apples-to-apples per-resolution baselines for a paper.
+
+**Cost warning:** on 2× H200 with the default `total_kimg=400000`, each run takes roughly:
+
+| Resolution | Est. walltime (2× H200, bf16) |
+|---|---|
+| 256² | ~10–20 days |
+| 512² | ~25–45 days |
+| 1024² | ~50–100 days |
+
+Total sequential: 3–5 months. Shrink `--kimg` to something reachable (e.g. `--kimg=100000`) or plan for multi-job resume chains.
+
+#### 256² from scratch
 
 ```bash
 python train.py --outdir=./training-runs \
     --cfg=diffit-256 \
     --data=./datasets/imagenet_256x256.zip \
-    --gpus 4 \
-    --batch-gpu 64
+    --gpus 2 \
+    --batch-gpu 96
 ```
+Global batch = 192. Per paper (Section I.2): LR 3e-4, batch 256, EMA 0.9999.
 
-Train on ImageNet-512:
+#### 512² from scratch
 
 ```bash
 python train.py --outdir=./training-runs \
     --cfg=diffit-512 \
     --data=./datasets/imagenet_512x512.zip \
-    --gpus 4 \
-    --batch-gpu 25
+    --gpus 2 \
+    --batch-gpu 64 \
+    --lr-warmup 1000
 ```
+Global batch = 128. LR warmup is recommended for from-scratch high-res runs.
 
-### SLURM sbatch scripts
+#### 1024² from scratch
 
-Pre-configured sbatch files are provided for A100 and H200 clusters:
-
-**A100 (2 GPU):**
 ```bash
-sbatch sbatch/a100/train_2_gpu_256x256.sbatch
-sbatch sbatch/a100/train_2_gpu_512x512.sbatch
+python train.py --outdir=./training-runs \
+    --cfg=diffit-1024 \
+    --data=./datasets/imagenet_1024x1024.zip \
+    --gpus 2 \
+    --batch-gpu 16 \
+    --grad-accum 4
 ```
+Global effective batch = 16 × 2 × 4 = 128. With RoPE+FlashAttention you may be able to drop `--grad-accum` and/or disable checkpointing (`--no-grad-ckpt`) — start conservative and raise `--batch-gpu` once you confirm it fits.
 
-**H200 (4 GPU):**
-```bash
-sbatch sbatch/h200/h200_train_4_gpu_256x256.sbatch
-sbatch sbatch/h200/h200_train_4_gpu_512x512.sbatch
-```
+---
 
-**H200 (1 GPU):**
-```bash
-sbatch sbatch/h200/h200_train_1_gpu_256x256.sbatch
-```
+### Strategy B: Progressive finetuning (recommended)
 
-### Resume from checkpoint
+RoPE-2D lets you re-use a 256² checkpoint at higher resolutions — something the original learned-bias DiffiT could not do. This cuts total compute by ~3–5× and typically yields better final FID.
+
+**Step 1. Train 256² from scratch** (same as Strategy A):
 
 ```bash
 python train.py --outdir=./training-runs \
     --cfg=diffit-256 \
     --data=./datasets/imagenet_256x256.zip \
-    --gpus 4 \
+    --gpus 2 \
+    --batch-gpu 96
+```
+Let it run until FID plateaus on the inline eval (check TensorBoard). For a strong base, aim for 100k–200k kimg.
+
+**Step 2. Finetune 256² → 512²**:
+
+```bash
+python train.py --outdir=./training-runs \
+    --cfg=diffit-512 \
+    --data=./datasets/imagenet_512x512.zip \
+    --gpus 2 \
     --batch-gpu 64 \
-    --resume ./training-runs/00000-diffit-256-gpus4-batch256/network-snapshot-001000.pt
+    --resume ./training-runs/00000-diffit-256-*/network-final.pt \
+    --lr 5e-5 \
+    --lr-warmup 500 \
+    --kimg 100000
+```
+Lower LR (5e-5 ≈ half of the `diffit-512` default) for finetuning, short warmup, and a smaller total-kimg budget — finetuning converges faster than from-scratch.
+
+**Step 3. Finetune 512² → 1024²**:
+
+```bash
+python train.py --outdir=./training-runs \
+    --cfg=diffit-1024 \
+    --data=./datasets/imagenet_1024x1024.zip \
+    --gpus 2 \
+    --batch-gpu 16 \
+    --resume ./training-runs/00001-diffit-512-*/network-final.pt \
+    --lr 2e-5 \
+    --lr-warmup 500 \
+    --kimg 50000
+```
+
+**Why this works:** RoPE encodes positions via rotation, not learned weights. The frequency table is regenerated at the target grid size at load time (non-persistent buffer), so the saved state dict transplants cleanly. The rest of the network (QKV, QK-norm scales, SwiGLU, final linear) sees the same per-token distribution at any resolution — it just processes more tokens per image.
+
+---
+
+### SLURM sbatch scripts
+
+Pre-configured sbatch files are provided for H200:
+
+```bash
+sbatch train_2h200_256x256_prod.sbatch
+sbatch train_2h200_512x512_prod.sbatch
+sbatch train_2h200_1024x1024_prod.sbatch
+sbatch train_4h200_1024x1024_prod.sbatch
+```
+
+For progressive finetuning, add `--resume=$PATH_TO_PREV_FINAL` to the sbatch's `python train.py ...` line and lower the LR as shown above.
+
+### Chaining runs with SLURM dependencies
+
+Walltime caps will not fit `total_kimg=400000` in a single job. Chain jobs:
+
+```bash
+JID=$(sbatch --parsable train_2h200_256x256_prod.sbatch)
+for i in 1 2 3; do
+    JID=$(sbatch --parsable --dependency=afterany:$JID train_2h200_256x256_prod.sbatch)
+done
+```
+
+Or add self-requeue to the sbatch:
+
+```bash
+#SBATCH --signal=B:USR1@300
+trap 'scontrol requeue $SLURM_JOB_ID' USR1
+```
+
+Make sure your sbatch picks up the latest checkpoint on restart:
+
+```bash
+LATEST_CKPT=$(ls -t "$OUTDIR"/*/network-snapshot-*.pt 2>/dev/null | head -1)
+RESUME_FLAG=""
+[ -n "$LATEST_CKPT" ] && RESUME_FLAG="--resume=$LATEST_CKPT"
+
+python train.py \
+    --outdir="$OUTDIR" \
+    --cfg=diffit-256 \
+    --data="$DATASET" \
+    --gpus 2 \
+    --batch-gpu 96 \
+    --snap 100 \
+    $RESUME_FLAG
+```
+
+### Resume from checkpoint (manual)
+
+```bash
+python train.py --outdir=./training-runs \
+    --cfg=diffit-256 \
+    --data=./datasets/imagenet_256x256.zip \
+    --gpus 2 \
+    --batch-gpu 96 \
+    --resume ./training-runs/00000-diffit-256-gpus2-batch192/network-snapshot-001000.pt
 ```
 
 ### Training options

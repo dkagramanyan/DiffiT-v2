@@ -213,15 +213,24 @@ def _swiglu_hidden(hidden: int, mlp_ratio: float, multiple_of: int = 64) -> int:
 
 
 # ---------------------------------------------------------------------------
-# DiffiT attention (RoPE-2D + QK-norm, FlashAttention-compatible)
+# DiffiT attention (TMSA + RoPE-2D + QK-norm, FlashAttention-compatible)
 # ---------------------------------------------------------------------------
 
 class DiffiTAttention(nn.Module):
-    """Multi-head self-attention with axial 2D RoPE and QK RMSNorm."""
+    """
+    Time-dependent Multihead Self-Attention (TMSA) with axial 2D RoPE and
+    QK-norm. Implements DiffiT's additive time-conditioning on the QKV
+    projections (Eqs. 3-5 of the DiffiT paper):
+
+        qs = xs · Wqs + xt · Wqt
+        ks = xs · Wks + xt · Wkt
+        vs = xs · Wvs + xt · Wvt
+    """
 
     def __init__(
         self,
         dim: int,
+        temb_dim: int,
         num_heads: int,
         qkv_bias: bool = True,
         attn_drop: float = 0.0,
@@ -234,7 +243,9 @@ class DiffiTAttention(nn.Module):
             "head_dim must be divisible by 4 for axial 2D RoPE"
         )
 
+        # Spatial and temporal QKV projections (TMSA)
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv_temb = nn.Linear(temb_dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
 
         self.q_norm = RMSNorm(self.head_dim, elementwise_affine=True)
@@ -246,17 +257,18 @@ class DiffiTAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        temb: torch.Tensor,
         cos_y: torch.Tensor,
         sin_y: torch.Tensor,
         cos_x: torch.Tensor,
         sin_x: torch.Tensor,
     ) -> torch.Tensor:
         B, N, C = x.shape
-        qkv = (
-            self.qkv(x)
-            .reshape(B, N, 3, self.num_heads, self.head_dim)
-            .permute(2, 0, 3, 1, 4)
-        )
+
+        # TMSA: add projected time token to spatial QKV before splitting heads.
+        qkv_temb = self.qkv_temb(temb).unsqueeze(1).to(x.dtype)
+        qkv = self.qkv(x) + qkv_temb
+        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)  # each: (B, heads, N, head_dim)
 
         q = self.q_norm(q)
@@ -275,15 +287,16 @@ class DiffiTAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Transformer block (AdaLN-Zero conditioning)
+# DiffiT transformer block (TMSA + SwiGLU)
 # ---------------------------------------------------------------------------
 
-def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
-
 class DiffiTBlock(nn.Module):
-    """DiffiT transformer block with AdaLN-Zero conditioning and SwiGLU MLP."""
+    """
+    DiffiT transformer block (Eqs. 7-8 of the paper):
+
+        x̂ = TMSA(LN(x), xt) + x
+        x  = MLP(LN(x̂)) + x̂
+    """
 
     def __init__(
         self,
@@ -293,42 +306,35 @@ class DiffiTBlock(nn.Module):
     ):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, elementwise_affine=False)
-        self.attn = DiffiTAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=True)
+        self.attn = DiffiTAttention(
+            dim=hidden_size,
+            temb_dim=hidden_size,
+            num_heads=num_heads,
+            qkv_bias=True,
+        )
         self.norm2 = RMSNorm(hidden_size, elementwise_affine=False)
         self.mlp = SwiGLU(hidden_size, _swiglu_hidden(hidden_size, mlp_ratio))
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True),
-        )
 
     def forward(
         self,
         x: torch.Tensor,
-        c: torch.Tensor,
+        temb: torch.Tensor,
         cos_y: torch.Tensor,
         sin_y: torch.Tensor,
         cos_x: torch.Tensor,
         sin_x: torch.Tensor,
     ) -> torch.Tensor:
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(c).chunk(6, dim=-1)
-        )
-        x = x + gate_msa.unsqueeze(1) * self.attn(
-            modulate(self.norm1(x), shift_msa, scale_msa),
-            cos_y, sin_y, cos_x, sin_x,
-        )
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(
-            modulate(self.norm2(x), shift_mlp, scale_mlp)
-        )
+        x = x + self.attn(self.norm1(x), temb, cos_y, sin_y, cos_x, sin_x)
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
 # ---------------------------------------------------------------------------
-# Final projection layer (AdaLN-Zero)
+# Final projection layer
 # ---------------------------------------------------------------------------
 
 class FinalLayer(nn.Module):
-    """Final projection with AdaLN-Zero modulation → patch-level predictions."""
+    """Final projection: RMSNorm → SiLU → Linear → patch-level predictions."""
 
     def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
         super().__init__()
@@ -336,14 +342,10 @@ class FinalLayer(nn.Module):
         self.linear = nn.Linear(
             hidden_size, patch_size * patch_size * out_channels, bias=True
         )
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True),
-        )
+        self.silu = nn.SiLU()
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
-        return self.linear(modulate(self.norm_final(x), shift, scale))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(self.silu(self.norm_final(x)))
 
 
 # ---------------------------------------------------------------------------
@@ -362,8 +364,8 @@ class DiffiT(nn.Module):
     DiffiT: Diffusion Vision Transformers for Image Generation.
 
     A class-conditional latent diffusion model built from DiffiTBlocks with
-    axial 2D rotary position embeddings, QK-normalized attention, AdaLN-Zero
-    timestep/class conditioning, and SwiGLU feed-forward layers.
+    Time-dependent Multihead Self-Attention (TMSA) conditioning, axial 2D
+    rotary position embeddings, QK-normalized attention, and SwiGLU FFNs.
     """
 
     def __init__(
@@ -438,12 +440,7 @@ class DiffiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-        # Zero-init AdaLN modulations so each block/final-layer starts as identity.
-        for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        # Zero-init final projection so the model starts near identity.
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
@@ -470,24 +467,26 @@ class DiffiT(nn.Module):
         enable_mask: bool = False,
     ) -> torch.Tensor:
         x = self.x_embedder(x)
-        c = self.t_embedder(t) + self.y_embedder(y, self.training)
+        # TMSA time token: combined timestep + class embedding, shared across
+        # all blocks (DiffiT paper, Section 3.2).
+        temb = self.t_embedder(t) + self.y_embedder(y, self.training)
 
         for block in self.blocks:
             if self.gradient_checkpointing and self.training:
                 x = grad_checkpoint(
-                    block, x, c,
+                    block, x, temb,
                     self.rope_cos_y, self.rope_sin_y,
                     self.rope_cos_x, self.rope_sin_x,
                     use_reentrant=False,
                 )
             else:
                 x = block(
-                    x, c,
+                    x, temb,
                     self.rope_cos_y, self.rope_sin_y,
                     self.rope_cos_x, self.rope_sin_x,
                 )
 
-        x = self.final_layer(x, c)
+        x = self.final_layer(x)
         return self.unpatchify(x)
 
     def forward_with_cfg(
