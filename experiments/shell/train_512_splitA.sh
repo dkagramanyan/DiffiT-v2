@@ -10,7 +10,7 @@ PROJECT_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
 : "${BATCH_GPU:=16}"
 : "${KIMG:=1000}"
 : "${SNAP:=5}"
-: "${DATASET:=${PROJECT_DIR}/datasets/imagenet_512x512.zip}"
+: "${DATASET:=${PROJECT_DIR}/datasets/imagenet_9to4_1024x1024_512x512.zip}"
 : "${OUTDIR:=${PROJECT_DIR}/experiments/runs/512}"
 : "${CONDA_ENV:=diffit}"
 

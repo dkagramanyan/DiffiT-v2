@@ -31,7 +31,7 @@ source /opt/software/python/miniconda/latest/etc/profile.d/conda.sh
 conda activate diffit_rocky
 
 PROJECT_DIR=/home/dgkagramanyan/DiffiT-v2
-DATASET=$PROJECT_DIR/datasets/imagenet_9to4_1024x1024.zip
+DATASET=$PROJECT_DIR/datasets/imagenet_9to4_1024x1024_1024x1024.zip
 OUTDIR=$PROJECT_DIR/experiments/runs/1024
 
 mkdir -p "$OUTDIR" "$PROJECT_DIR/experiments/logs"
