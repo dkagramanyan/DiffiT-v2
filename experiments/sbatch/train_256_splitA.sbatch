@@ -22,10 +22,8 @@ export CXX=/usr/bin/g++
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_DEBUG=INFO
-export TORCH_CUDA_ARCH_LIST="9.0"
 
-source /opt/software/python/miniconda/latest/etc/profile.d/conda.sh
-conda activate diffit_rocky
+conda activate diffit
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 PROJECT_DIR=/home/dgkagramanyan/DiffiT-v2
@@ -50,9 +48,9 @@ torchrun --standalone --nproc_per_node=2 \
     --data="$DATASET" \
     --image-size=256 \
     --split=A \
-    --batch-gpu=96 \
+    --batch-gpu=8 \
     --kimg=30000 \
-    --snap=10
+    --snap=100
 
 EXIT_CODE=$?
 echo "────────────────────────────────────"

@@ -405,31 +405,16 @@ def main(**opts):
                     stats_jsonl.flush()
 
                     ckpt_path = os.path.join(run_dir, f"network-snapshot-{int(kimg):08d}.pt")
-                    torch.save({
-                        "model": model.state_dict(),
-                        "ema":   ema_model.state_dict(),
-                        "opt":   opt.state_dict(),
-                        "cur_nimg": cur_nimg,
-                        "kimg": kimg,
-                        "split": opts["split"],
-                        "image_size": image_size,
-                    }, ckpt_path)
+                    torch.save(ema_model.state_dict(), ckpt_path)
                     log(f"Saved {ckpt_path}  test_loss={test_loss:.4f}")
 
             loss_accum, n_accum = 0.0, 0
             tick_nimg = cur_nimg
             tick_start = time.time()
 
-    # Final checkpoint
+    # Final checkpoint — inference-only: EMA weights as a raw state_dict
     if is_main():
-        kimg = cur_nimg / 1000
-        torch.save({
-            "model": model.state_dict(),
-            "ema":   ema_model.state_dict(),
-            "opt":   opt.state_dict(),
-            "cur_nimg": cur_nimg, "kimg": kimg,
-            "split": opts["split"], "image_size": image_size,
-        }, os.path.join(run_dir, "network-final.pt"))
+        torch.save(ema_model.state_dict(), os.path.join(run_dir, "network-final.pt"))
         stats_jsonl.close()
         stats_tb.close()
     log("Training complete.")
