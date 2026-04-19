@@ -13,6 +13,10 @@ PROJECT_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
 : "${DATASET:=${PROJECT_DIR}/datasets/imagenet_9to4_1024x1024_512x512.zip}"
 : "${OUTDIR:=${PROJECT_DIR}/experiments/runs/512}"
 : "${CONDA_ENV:=diffit}"
+: "${FOREGROUND:=0}"
+: "${LOG_DIR:=${PROJECT_DIR}/experiments/logs}"
+SCRIPT_NAME=$(basename "${BASH_SOURCE[0]}" .sh)
+: "${LOG_FILE:=${LOG_DIR}/${SCRIPT_NAME}_$(date +%Y%m%d_%H%M%S).log}"
 
 echo "──────────────────────────────────────────"
 echo "  PROJECT_DIR : $PROJECT_DIR"
@@ -24,9 +28,10 @@ echo "  KIMG        : $KIMG"
 echo "  SNAP        : $SNAP"
 echo "  DATASET     : $DATASET"
 echo "  OUTDIR      : $OUTDIR"
+echo "  LOG_FILE    : $LOG_FILE"
 echo "──────────────────────────────────────────"
 
-mkdir -p "$OUTDIR"
+mkdir -p "$OUTDIR" "$LOG_DIR"
 
 if [[ -n "${CONDA_ENV}" ]]; then
     # shellcheck disable=SC1091
@@ -36,12 +41,25 @@ fi
 
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 
-torchrun --standalone --nproc_per_node="$NPROC" \
-    "${PROJECT_DIR}/experiments/train_sample_split.py" \
-    --outdir="$OUTDIR" \
-    --data="$DATASET" \
-    --image-size=512 \
-    --split=B \
-    --batch-gpu="$BATCH_GPU" \
-    --kimg="$KIMG" \
+CMD=(
+    torchrun --standalone --nproc_per_node="$NPROC"
+    "${PROJECT_DIR}/experiments/train_sample_split.py"
+    --outdir="$OUTDIR"
+    --data="$DATASET"
+    --image-size=512
+    --split=B
+    --batch-gpu="$BATCH_GPU"
+    --kimg="$KIMG"
     --snap="$SNAP"
+)
+
+if [[ "$FOREGROUND" == "1" ]]; then
+    "${CMD[@]}" 2>&1 | tee "$LOG_FILE"
+else
+    nohup "${CMD[@]}" > "$LOG_FILE" 2>&1 &
+    PID=$!
+    disown
+    echo "Started in background. PID: $PID"
+    echo "Monitor: tail -f $LOG_FILE"
+    echo "Kill:    kill $PID   # or: pkill -P $PID"
+fi

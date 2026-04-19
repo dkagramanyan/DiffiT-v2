@@ -6,6 +6,10 @@
 #   RUN_A       path to split-A run directory
 #   RUN_B       path to split-B run directory
 #
+# Optional env vars:
+#   FOREGROUND=1  keep attached (tee to terminal + log). Default: detach via nohup.
+#   LOG_FILE=...  override log path
+#
 # Usage:
 #   RESOLUTION=256 RUN_A=./experiments/runs/256/00000-... RUN_B=./experiments/runs/256/00001-... \
 #       bash experiments/shell/analyze.sh
@@ -29,6 +33,10 @@ fi
 
 : "${OUTDIR:=${PROJECT_DIR}/experiments/analysis/${RESOLUTION}}"
 : "${CONDA_ENV:=diffit}"
+: "${FOREGROUND:=0}"
+: "${LOG_DIR:=${PROJECT_DIR}/experiments/logs}"
+SCRIPT_NAME=$(basename "${BASH_SOURCE[0]}" .sh)
+: "${LOG_FILE:=${LOG_DIR}/${SCRIPT_NAME}_${RESOLUTION}_$(date +%Y%m%d_%H%M%S).log}"
 
 # Resolution-dependent sampling budget.
 case "$RESOLUTION" in
@@ -46,9 +54,10 @@ echo "  OUTDIR      : $OUTDIR"
 echo "  NUM_SAMPLES : $NUM_SAMPLES"
 echo "  BATCH_SIZE  : $BATCH_SIZE"
 echo "  NUM_STEPS   : $NUM_STEPS"
+echo "  LOG_FILE    : $LOG_FILE"
 echo "──────────────────────────────────────────"
 
-mkdir -p "$OUTDIR"
+mkdir -p "$OUTDIR" "$LOG_DIR"
 
 if [[ -n "${CONDA_ENV}" ]]; then
     # shellcheck disable=SC1091
@@ -58,11 +67,24 @@ fi
 
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 
-python "${PROJECT_DIR}/experiments/analyze_sample_split.py" \
-    --run-a="$RUN_A" \
-    --run-b="$RUN_B" \
-    --outdir="$OUTDIR" \
-    --num-samples="$NUM_SAMPLES" \
-    --num-steps="$NUM_STEPS" \
-    --batch-size="$BATCH_SIZE" \
+CMD=(
+    python "${PROJECT_DIR}/experiments/analyze_sample_split.py"
+    --run-a="$RUN_A"
+    --run-b="$RUN_B"
+    --outdir="$OUTDIR"
+    --num-samples="$NUM_SAMPLES"
+    --num-steps="$NUM_STEPS"
+    --batch-size="$BATCH_SIZE"
     --title="Biased generalization in DiffiT (${RESOLUTION}²)"
+)
+
+if [[ "$FOREGROUND" == "1" ]]; then
+    "${CMD[@]}" 2>&1 | tee "$LOG_FILE"
+else
+    nohup "${CMD[@]}" > "$LOG_FILE" 2>&1 &
+    PID=$!
+    disown
+    echo "Started in background. PID: $PID"
+    echo "Monitor: tail -f $LOG_FILE"
+    echo "Kill:    kill $PID   # or: pkill -P $PID"
+fi
