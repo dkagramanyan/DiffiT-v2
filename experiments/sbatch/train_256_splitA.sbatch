@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=2
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --time=2-0:0
 #SBATCH --output=/home/dgkagramanyan/DiffiT-v2/experiments/logs/slurm_%j.out
 #SBATCH --error=/home/dgkagramanyan/DiffiT-v2/experiments/logs/slurm_%j.out
@@ -22,8 +22,10 @@ export CXX=/usr/bin/g++
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_DEBUG=INFO
+export TORCH_CUDA_ARCH_LIST="9.0"
 
-conda activate diffit
+source /opt/software/python/miniconda/latest/etc/profile.d/conda.sh
+conda activate diffit_rocky
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 PROJECT_DIR=/home/dgkagramanyan/DiffiT-v2
@@ -48,7 +50,7 @@ torchrun --standalone --nproc_per_node=2 \
     --data="$DATASET" \
     --image-size=256 \
     --split=A \
-    --batch-gpu=8 \
+    --batch-gpu=96 \
     --kimg=30000 \
     --snap=100
 
