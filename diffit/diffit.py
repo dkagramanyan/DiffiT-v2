@@ -10,84 +10,106 @@
 
 """
 DiffiT: Diffusion Vision Transformers for Image Generation.
-Code by Ali Hatamizadeh. 
+Code by Ali Hatamizadeh.
 """
 
 import math
-from functools import partial
 from typing import Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
-from timm.models.layers import trunc_normal_
-from timm.models.vision_transformer import Mlp, PatchEmbed
+from timm.models.vision_transformer import PatchEmbed
 
 
 # ---------------------------------------------------------------------------
-# Positional embedding utilities
+# Norms
 # ---------------------------------------------------------------------------
 
-def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
+class RMSNorm(nn.Module):
+    """Root-mean-square layer normalization over the last dim."""
+
+    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = False):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim)) if elementwise_affine else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        in_dtype = x.dtype
+        x32 = x.float()
+        rms = x32.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        x = (x32 * rms).to(in_dtype)
+        if self.weight is not None:
+            x = x * self.weight
+        return x
+
+
+# ---------------------------------------------------------------------------
+# 2D axial Rotary Position Embedding
+# ---------------------------------------------------------------------------
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def build_axial_rope_cache(grid_size: int, head_dim: int, base: float = 10000.0):
     """
-    Compute 1-D sinusoidal positional embeddings.
+    Precompute cos/sin tables for axial 2D RoPE on a ``grid_size × grid_size`` grid.
 
-    Args:
-        embed_dim: Output dimension for each position (must be even).
-        pos:       Positions to encode, arbitrary shape – will be flattened.
-
-    Returns:
-        Embedding array of shape ``(M, embed_dim)``.
+    The first half of ``head_dim`` encodes the row (y) position, the second half
+    encodes the column (x). Each returned tensor has shape
+    ``(1, 1, grid_size**2, head_dim/2)``.
     """
-    assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
-    omega /= embed_dim / 2.0
-    omega = 1.0 / 10000**omega                          # (D/2,)
+    assert head_dim % 4 == 0, "head_dim must be divisible by 4 for axial 2D RoPE"
+    quarter = head_dim // 4
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, quarter, dtype=torch.float32) / quarter)
+    )
 
-    pos = pos.reshape(-1)                                # (M,)
-    out = np.einsum("m,d->md", pos, omega)               # (M, D/2)
+    pos = torch.arange(grid_size, dtype=torch.float32)
+    freqs_1d = torch.einsum("p,f->pf", pos, inv_freq)  # (G, quarter)
 
-    return np.concatenate([np.sin(out), np.cos(out)], axis=1)  # (M, D)
+    freqs_y = (
+        freqs_1d[:, None, :].expand(grid_size, grid_size, quarter).reshape(-1, quarter)
+    )
+    freqs_x = (
+        freqs_1d[None, :, :].expand(grid_size, grid_size, quarter).reshape(-1, quarter)
+    )
+
+    def _to_cs(freqs: torch.Tensor):
+        emb = torch.cat([freqs, freqs], dim=-1)  # (N, head_dim/2) — rotate_half layout
+        return emb.cos()[None, None], emb.sin()[None, None]
+
+    cos_y, sin_y = _to_cs(freqs_y)
+    cos_x, sin_x = _to_cs(freqs_x)
+    return cos_y, sin_y, cos_x, sin_x
 
 
-def get_2d_sincos_pos_embed_from_grid(embed_dim: int, grid: np.ndarray) -> np.ndarray:
-    assert embed_dim % 2 == 0
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
-    return np.concatenate([emb_h, emb_w], axis=1)                       # (H*W, D)
+def apply_axial_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_y: torch.Tensor,
+    sin_y: torch.Tensor,
+    cos_x: torch.Tensor,
+    sin_x: torch.Tensor,
+):
+    """Apply axial 2D RoPE to ``q`` and ``k`` of shape ``(B, heads, N, head_dim)``."""
+    qy, qx = q.chunk(2, dim=-1)
+    ky, kx = k.chunk(2, dim=-1)
 
+    cos_y = cos_y.to(q.dtype)
+    sin_y = sin_y.to(q.dtype)
+    cos_x = cos_x.to(q.dtype)
+    sin_x = sin_x.to(q.dtype)
 
-def get_2d_sincos_pos_embed(
-    embed_dim: int,
-    grid_size: int,
-    cls_token: bool = False,
-    extra_tokens: int = 0,
-) -> np.ndarray:
-    """
-    Generate 2-D sinusoidal positional embeddings on a square grid.
+    qy = qy * cos_y + _rotate_half(qy) * sin_y
+    ky = ky * cos_y + _rotate_half(ky) * sin_y
+    qx = qx * cos_x + _rotate_half(qx) * sin_x
+    kx = kx * cos_x + _rotate_half(kx) * sin_x
 
-    Args:
-        embed_dim:    Embedding dimension.
-        grid_size:    Height (= width) of the grid.
-        cls_token:    If *True*, prepend ``extra_tokens`` zero rows.
-        extra_tokens: Number of extra token slots to prepend.
-
-    Returns:
-        Array of shape ``[grid_size*grid_size, embed_dim]`` (or with
-        ``extra_tokens`` additional leading rows when requested).
-    """
-    grid_h = np.arange(grid_size, dtype=np.float32)
-    grid_w = np.arange(grid_size, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)           # w first
-    grid = np.stack(grid, axis=0).reshape(2, 1, grid_size, grid_size)
-
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token and extra_tokens > 0:
-        pos_embed = np.concatenate(
-            [np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0
-        )
-    return pos_embed
+    return torch.cat([qy, qx], dim=-1), torch.cat([ky, kx], dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -110,17 +132,6 @@ class TimestepEmbedder(nn.Module):
     def timestep_embedding(
         t: torch.Tensor, dim: int, max_period: int = 10000
     ) -> torch.Tensor:
-        """
-        Sinusoidal timestep embeddings following Vaswani et al.
-
-        Args:
-            t:          1-D tensor of ``N`` indices (may be fractional).
-            dim:        Embedding dimension.
-            max_period: Controls the minimum frequency.
-
-        Returns:
-            Tensor of shape ``(N, dim)``.
-        """
         half = dim // 2
         freqs = torch.exp(
             -math.log(max_period)
@@ -136,15 +147,11 @@ class TimestepEmbedder(nn.Module):
         return embedding
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        return self.mlp(t_freq)
+        return self.mlp(self.timestep_embedding(t, self.frequency_embedding_size))
 
 
 class LabelEmbedder(nn.Module):
-    """
-    Embeds class labels into vector representations.
-    Supports label dropout for classifier-free guidance.
-    """
+    """Embeds class labels; supports label-dropout for classifier-free guidance."""
 
     def __init__(self, num_classes: int, hidden_size: int, dropout_prob: float):
         super().__init__()
@@ -158,7 +165,6 @@ class LabelEmbedder(nn.Module):
         labels: torch.Tensor,
         force_drop_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Replace a random subset of labels with the null class for CFG."""
         if force_drop_ids is None:
             drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
         else:
@@ -178,87 +184,88 @@ class LabelEmbedder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# DiffiT attention with relative position bias
+# SwiGLU MLP
+# ---------------------------------------------------------------------------
+
+class SwiGLU(nn.Module):
+    """SwiGLU feed-forward: ``down( silu(gate(x)) * up(x) )``."""
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int,
+        out_features: Optional[int] = None,
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        self.gate = nn.Linear(in_features, hidden_features, bias=True)
+        self.up = nn.Linear(in_features, hidden_features, bias=True)
+        self.down = nn.Linear(hidden_features, out_features, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
+def _swiglu_hidden(hidden: int, mlp_ratio: float, multiple_of: int = 64) -> int:
+    """Matched-param inner width: ``hidden * mlp_ratio * 2/3`` rounded up."""
+    raw = int(hidden * mlp_ratio * 2 / 3)
+    return ((raw + multiple_of - 1) // multiple_of) * multiple_of
+
+
+# ---------------------------------------------------------------------------
+# DiffiT attention (RoPE-2D + QK-norm, FlashAttention-compatible)
 # ---------------------------------------------------------------------------
 
 class DiffiTAttention(nn.Module):
-    """
-    Window-based multi-head self-attention with time-embedding modulation
-    and learnable relative position bias (Swin-style).
-    """
+    """Multi-head self-attention with axial 2D RoPE and QK RMSNorm."""
 
     def __init__(
         self,
         dim: int,
-        temb_dim: Optional[int],
         num_heads: int,
-        window_size: int = 16,
         qkv_bias: bool = True,
-        qk_scale: Optional[float] = None,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
     ):
         super().__init__()
         self.num_heads = num_heads
-
-        # Time-embedding projection ------------------------------------------
-        if temb_dim is not None:
-            self.qkv_temb = nn.Linear(temb_dim, dim * 3)
-
-        # Window / relative position bias ------------------------------------
-        self.window_size = (window_size, window_size)
-        ws = self.window_size
-
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * ws[0] - 1) * (2 * ws[1] - 1), num_heads)
-        )
-        trunc_normal_(self.relative_position_bias_table, std=0.02)
-
-        coords_h = torch.arange(ws[0])
-        coords_w = torch.arange(ws[1])
-        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"))
-        coords_flat = torch.flatten(coords, 1)
-
-        relative_coords = coords_flat[:, :, None] - coords_flat[:, None, :]
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
-        relative_coords[:, :, 0] += ws[0] - 1
-        relative_coords[:, :, 1] += ws[1] - 1
-        relative_coords[:, :, 0] *= 2 * ws[1] - 1
-        # int32 is sufficient (max value ≈ (2*ws-1)² ≤ 16k) and halves the
-        # buffer from 3.6 GB → 1.8 GB at 1024² resolution.
-        self.register_buffer(
-            "relative_position_index", relative_coords.sum(-1).to(torch.int32)
+        self.head_dim = dim // num_heads
+        assert self.head_dim % 4 == 0, (
+            "head_dim must be divisible by 4 for axial 2D RoPE"
         )
 
-        # Linear projections -------------------------------------------------
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
+
+        self.q_norm = RMSNorm(self.head_dim, elementwise_affine=True)
+        self.k_norm = RMSNorm(self.head_dim, elementwise_affine=True)
 
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor, temb: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos_y: torch.Tensor,
+        sin_y: torch.Tensor,
+        cos_x: torch.Tensor,
+        sin_x: torch.Tensor,
+    ) -> torch.Tensor:
         B, N, C = x.shape
+        qkv = (
+            self.qkv(x)
+            .reshape(B, N, 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
+        q, k, v = qkv.unbind(0)  # each: (B, heads, N, head_dim)
 
-        if temb is not None:
-            qkv_temb = self.qkv_temb(temb).unsqueeze(1).to(x.dtype)
-            qkv = qkv_temb + self.qkv(x)
-        else:
-            qkv = self.qkv(x)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q, k = apply_axial_rope(q, k, cos_y, sin_y, cos_x, sin_x)
 
-        qkv = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)                          # each: (B, heads, N, head_dim)
-
-        # Relative position bias as attention mask: (1, num_heads, N, N)
-        ws = self.window_size
-        rpb = self.relative_position_bias_table[
-            self.relative_position_index.view(-1)
-        ].view(ws[0] * ws[1], ws[0] * ws[1], -1)
-        attn_bias = rpb.permute(2, 0, 1).contiguous().unsqueeze(0)  # (1, heads, N, N)
-
-        x = torch.nn.functional.scaled_dot_product_attention(
+        # No attn_mask → SDPA can dispatch to FlashAttention.
+        x = F.scaled_dot_product_attention(
             q, k, v,
-            attn_mask=attn_bias,
             dropout_p=self.attn_drop.p if self.training else 0.0,
         )
 
@@ -268,57 +275,75 @@ class DiffiTAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Transformer block
+# Transformer block (AdaLN-Zero conditioning)
 # ---------------------------------------------------------------------------
 
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
 class DiffiTBlock(nn.Module):
-    """Single DiffiT transformer block: Norm → Attention → Norm → MLP."""
+    """DiffiT transformer block with AdaLN-Zero conditioning and SwiGLU MLP."""
 
     def __init__(
         self,
         hidden_size: int,
         num_heads: int,
         mlp_ratio: float = 4.0,
-        **block_kwargs,
     ):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = DiffiTAttention(
-            dim=hidden_size,
-            temb_dim=hidden_size,
-            num_heads=num_heads,
-            qkv_bias=True,
-            **block_kwargs,
-        )
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.mlp = Mlp(
-            in_features=hidden_size,
-            hidden_features=int(hidden_size * mlp_ratio),
-            act_layer=lambda: nn.GELU(approximate="tanh"),
-            drop=0,
+        self.norm1 = RMSNorm(hidden_size, elementwise_affine=False)
+        self.attn = DiffiTAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=True)
+        self.norm2 = RMSNorm(hidden_size, elementwise_affine=False)
+        self.mlp = SwiGLU(hidden_size, _swiglu_hidden(hidden_size, mlp_ratio))
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True),
         )
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), c)
-        x = x + self.mlp(self.norm2(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        cos_y: torch.Tensor,
+        sin_y: torch.Tensor,
+        cos_x: torch.Tensor,
+        sin_x: torch.Tensor,
+    ) -> torch.Tensor:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=-1)
+        )
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa),
+            cos_y, sin_y, cos_x, sin_x,
+        )
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(
+            modulate(self.norm2(x), shift_mlp, scale_mlp)
+        )
         return x
 
 
 # ---------------------------------------------------------------------------
-# Final projection layer
+# Final projection layer (AdaLN-Zero)
 # ---------------------------------------------------------------------------
 
 class FinalLayer(nn.Module):
-    """Final projection: LayerNorm → SiLU → Linear  →  patch-level predictions."""
+    """Final projection with AdaLN-Zero modulation → patch-level predictions."""
 
     def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
         super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
-        self.silu = nn.SiLU()
+        self.norm_final = RMSNorm(hidden_size, elementwise_affine=False)
+        self.linear = nn.Linear(
+            hidden_size, patch_size * patch_size * out_channels, bias=True
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True),
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(self.silu(self.norm_final(x)))
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+        return self.linear(modulate(self.norm_final(x), shift, scale))
 
 
 # ---------------------------------------------------------------------------
@@ -336,9 +361,9 @@ class DiffiT(nn.Module):
     """
     DiffiT: Diffusion Vision Transformers for Image Generation.
 
-    A class-conditional latent diffusion model built from DiffiTBlocks
-    with window-based relative-position self-attention and sinusoidal
-    time/position embeddings.
+    A class-conditional latent diffusion model built from DiffiTBlocks with
+    axial 2D rotary position embeddings, QK-normalized attention, AdaLN-Zero
+    timestep/class conditioning, and SwiGLU feed-forward layers.
     """
 
     def __init__(
@@ -364,23 +389,25 @@ class DiffiT(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
 
-        # window_size must match the spatial grid so the relative
-        # position bias table covers every token pair.
-        window_size = input_size // patch_size  # 256→16, 512→32
-
         # Embedders -----------------------------------------------------------
-        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        self.x_embedder = PatchEmbed(
+            input_size, patch_size, in_channels, hidden_size, bias=True
+        )
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
 
-        num_patches = self.x_embedder.num_patches
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, num_patches, hidden_size), requires_grad=False
-        )
+        # RoPE-2D cache (shared across all blocks, non-persistent buffer) ----
+        grid_size = input_size // patch_size
+        head_dim = hidden_size // num_heads
+        cos_y, sin_y, cos_x, sin_x = build_axial_rope_cache(grid_size, head_dim)
+        self.register_buffer("rope_cos_y", cos_y, persistent=False)
+        self.register_buffer("rope_sin_y", sin_y, persistent=False)
+        self.register_buffer("rope_cos_x", cos_x, persistent=False)
+        self.register_buffer("rope_sin_x", sin_x, persistent=False)
 
         # Transformer backbone ------------------------------------------------
         self.blocks = nn.ModuleList([
-            DiffiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, window_size=window_size)
+            DiffiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio)
             for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
@@ -399,12 +426,6 @@ class DiffiT(nn.Module):
 
         self.apply(_basic_init)
 
-        # Fixed sinusoidal position embedding
-        pos_embed = get_2d_sincos_pos_embed(
-            self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5)
-        )
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
         # Patch embedding projection
         w = self.x_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
@@ -417,22 +438,19 @@ class DiffiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-        # Zero-init final projection so the model starts near identity
+        # Zero-init AdaLN modulations so each block/final-layer starts as identity.
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
     # ----- helpers -----------------------------------------------------------
 
     def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Rearrange patch tokens back into a spatial feature map.
-
-        Args:
-            x: ``(N, T, patch_size**2 * C)``
-
-        Returns:
-            ``(N, C, H, W)``
-        """
+        """Rearrange patch tokens ``(N, T, p*p*C)`` back into ``(N, C, H, W)``."""
         c = self.out_channels
         p = self.x_embedder.patch_size[0]
         h = w = int(x.shape[1] ** 0.5)
@@ -451,28 +469,25 @@ class DiffiT(nn.Module):
         y: torch.Tensor,
         enable_mask: bool = False,
     ) -> torch.Tensor:
-        """
-        Forward pass of DiffiT.
-
-        Args:
-            x: ``(N, C, H, W)`` spatial inputs (images or latent codes).
-            t: ``(N,)`` diffusion timesteps.
-            y: ``(N,)`` class labels.
-            enable_mask: Reserved for future use.
-
-        Returns:
-            ``(N, out_C, H, W)`` noise (and optionally variance) prediction.
-        """
-        x = self.x_embedder(x) + self.pos_embed
+        x = self.x_embedder(x)
         c = self.t_embedder(t) + self.y_embedder(y, self.training)
 
         for block in self.blocks:
             if self.gradient_checkpointing and self.training:
-                x = grad_checkpoint(block, x, c, use_reentrant=False)
+                x = grad_checkpoint(
+                    block, x, c,
+                    self.rope_cos_y, self.rope_sin_y,
+                    self.rope_cos_x, self.rope_sin_x,
+                    use_reentrant=False,
+                )
             else:
-                x = block(x, c)
+                x = block(
+                    x, c,
+                    self.rope_cos_y, self.rope_sin_y,
+                    self.rope_cos_x, self.rope_sin_x,
+                )
 
-        x = self.final_layer(x)
+        x = self.final_layer(x, c)
         return self.unpatchify(x)
 
     def forward_with_cfg(
@@ -487,19 +502,12 @@ class DiffiT(nn.Module):
         """
         Forward pass with (optional) classifier-free guidance.
 
-        When ``cfg_scale`` is given the batch is assumed to be
-        ``[cond_half, uncond_half]`` and guidance is applied to the
-        predicted noise.
-
         CFG strategy varies by resolution:
-            - **image_size 256** (``input_size <= 32``): power-cosine
-              schedule that ramps the effective scale over the diffusion
-              process.
-            - **image_size 512 / 1024** (``input_size > 32``): constant
-              CFG scale across all denoising steps.
+            - **image_size 256** (``input_size <= 32``): power-cosine schedule
+              that ramps the effective scale over the diffusion process.
+            - **image_size 512 / 1024** (``input_size > 32``): constant CFG
+              scale across all denoising steps.
         """
-        # Latent diffusion uses `in_channels` eps channels (e.g. 4 for
-        # Stable-Diffusion VAE), not the RGB-era hardcoded 3.
         split = self.in_channels
 
         if cfg_scale is None:
@@ -507,7 +515,6 @@ class DiffiT(nn.Module):
             eps, rest = model_out[:, :split], model_out[:, split:]
             return torch.cat([eps, rest], dim=1)
 
-        # Duplicate the conditional half for paired evaluation
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
         model_out = self.forward(combined, t, y)
@@ -516,13 +523,11 @@ class DiffiT(nn.Module):
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
 
         if self.input_size <= _LATENT_SIZE_THRESHOLD:
-            # ----- image_size 256: power-cosine CFG schedule -----------------
             phase = ((1 - t / diffusion_steps) ** scale_pow) * math.pi
             scale_step = 0.5 * (1 - torch.cos(phase))
             real_cfg_scale = (cfg_scale - 1) * scale_step + 1
             real_cfg_scale = real_cfg_scale[: len(x) // 2].view(-1, 1, 1, 1)
         else:
-            # ----- image_size 512 / 1024: constant CFG scale -----------------
             real_cfg_scale = cfg_scale
 
         half_eps = uncond_eps + real_cfg_scale * (cond_eps - uncond_eps)
