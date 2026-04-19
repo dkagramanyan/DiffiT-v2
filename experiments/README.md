@@ -18,15 +18,25 @@ experiments/
 ├── README.md                   # this file
 ├── train_sample_split.py       # trains ONE model on split A or B + logs Loss/test
 ├── analyze_sample_split.py     # walks checkpoint pairs → cosine distance → plot
-└── sbatch/
-    ├── train_256_splitA.sbatch
-    ├── train_256_splitB.sbatch
-    ├── train_512_splitA.sbatch
-    ├── train_512_splitB.sbatch
-    ├── train_1024_splitA.sbatch
-    ├── train_1024_splitB.sbatch
-    └── analyze.sbatch          # analysis job (1 GPU)
+├── sbatch/                     # cluster launchers (SLURM)
+│   ├── train_256_splitA.sbatch
+│   ├── train_256_splitB.sbatch
+│   ├── train_512_splitA.sbatch
+│   ├── train_512_splitB.sbatch
+│   ├── train_1024_splitA.sbatch
+│   ├── train_1024_splitB.sbatch
+│   └── analyze.sbatch          # analysis job (1 GPU)
+└── shell/                      # local launchers (no SLURM; env-var-overridable)
+    ├── train_256_splitA.sh
+    ├── train_256_splitB.sh
+    ├── train_512_splitA.sh
+    ├── train_512_splitB.sh
+    ├── train_1024_splitA.sh
+    ├── train_1024_splitB.sh
+    └── analyze.sh
 ```
+
+The `sbatch/` and `shell/` directories are pairwise equivalents. Same training script, same defaults — `sbatch/` wraps it in SLURM directives for H200 clusters; `shell/` runs locally with smaller defaults and env-var overrides.
 
 ## Dataset split
 
@@ -72,24 +82,62 @@ sbatch experiments/sbatch/train_1024_splitB.sbatch
 
 Global batch 32 (with `--grad-accum=2`), grad-checkpointing on, `--kimg=10000`. Walltime ~4 days per run.
 
-### Manual launch (no sbatch)
+### Local smoke test (no SLURM) — `shell/`
 
-Single GPU, 256²:
+The `shell/` scripts mirror the sbatches but with local-friendly defaults and zero SLURM directives. Use these to verify the pipeline end-to-end on your workstation before committing cluster time.
+
+**Local defaults** (much smaller than cluster defaults):
+
+| | NPROC | BATCH_GPU | KIMG | SNAP |
+|---|---|---|---|---|
+| 256² | 1 | 32 | 1000 | 5 |
+| 512² | 1 | 16 | 1000 | 5 |
+| 1024² | 1 | 2 (+ grad-accum 2, grad-ckpt) | 500 | 5 |
+
+Smoke-test run (~10–30 min per model on one GPU):
 
 ```bash
+bash experiments/shell/train_256_splitA.sh
+bash experiments/shell/train_256_splitB.sh
+bash experiments/shell/analyze.sh 256 \
+    ./experiments/runs/256/00000-diffit-256-splitA-batch32 \
+    ./experiments/runs/256/00001-diffit-256-splitB-batch32
+```
+
+All scripts accept env-var overrides — **no flag editing needed:**
+
+```bash
+# Larger local run on a 48 GB GPU
+BATCH_GPU=64 KIMG=10000 bash experiments/shell/train_256_splitA.sh
+
+# Two local GPUs
+NPROC=2 bash experiments/shell/train_256_splitA.sh
+
+# Point at a different dataset
+DATASET=./datasets/my_subset.zip bash experiments/shell/train_256_splitA.sh
+
+# Skip conda activation (already active)
+CONDA_ENV= bash experiments/shell/train_256_splitA.sh
+
+# Disable grad-checkpointing at 1024² if memory allows
+GRAD_CKPT=0 bash experiments/shell/train_1024_splitA.sh
+```
+
+Scripts auto-detect `PROJECT_DIR` from their own location — they work from any cwd.
+
+### Manual launch (no wrapper)
+
+If you'd rather call the Python entry point directly:
+
+```bash
+# Single GPU
 python experiments/train_sample_split.py \
     --outdir=./experiments/runs/256 \
     --data=./datasets/imagenet_256x256.zip \
-    --image-size=256 \
-    --split=A \
-    --batch-gpu=96 \
-    --kimg=30000 \
-    --snap=10
-```
+    --image-size=256 --split=A \
+    --batch-gpu=96 --kimg=30000 --snap=10
 
-Multi-GPU via `torchrun`:
-
-```bash
+# Multi-GPU via torchrun
 torchrun --standalone --nproc_per_node=2 experiments/train_sample_split.py \
     --outdir=./experiments/runs/256 \
     --data=./datasets/imagenet_256x256.zip \
@@ -112,13 +160,20 @@ python experiments/analyze_sample_split.py \
     --title="Biased generalization in DiffiT (256²)"
 ```
 
-Or via the sbatch:
+Via the cluster sbatch:
 
 ```bash
 sbatch --export=ALL,RESOLUTION=256,\
 RUN_A=/path/to/splitA,\
 RUN_B=/path/to/splitB \
     experiments/sbatch/analyze.sbatch
+```
+
+Or locally via the shell wrapper (positional args):
+
+```bash
+bash experiments/shell/analyze.sh 256 \
+    /path/to/splitA /path/to/splitB
 ```
 
 **What the analysis script does:**
