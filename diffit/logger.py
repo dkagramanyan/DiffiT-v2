@@ -140,6 +140,41 @@ class CSVOutputFormat(KVWriter):
         self.file.close()
 
 
+class TBTextOutputFormat(SeqWriter):
+    """Mirror `logger.log(...)` text to TensorBoard add_text + stats.jsonl."""
+
+    def __init__(self, summary_writer, stats_jsonl=None):
+        self.writer = summary_writer
+        self.jsonl = stats_jsonl
+        self._step = 0
+
+    def writeseq(self, seq):
+        msg = " ".join(str(x) for x in seq)
+        try:
+            self.writer.add_text("log", msg, global_step=self._step)
+        except Exception:
+            pass
+        if self.jsonl is not None:
+            try:
+                self.jsonl.write(json.dumps({
+                    "kind": "text", "msg": msg, "time": time.time(), "step": self._step,
+                }) + "\n")
+                self.jsonl.flush()
+            except Exception:
+                pass
+        self._step += 1
+
+    def close(self):
+        pass
+
+
+def register_tb_writer(summary_writer, stats_jsonl=None):
+    """Attach a TB/jsonl text mirror to the current Logger so logger.log() fans out."""
+    if Logger.CURRENT is None:
+        _configure_default_logger()
+    Logger.CURRENT.output_formats.append(TBTextOutputFormat(summary_writer, stats_jsonl))
+
+
 def make_output_format(format, ev_dir, log_suffix=""):
     os.makedirs(ev_dir, exist_ok=True)
     if format == "stdout":

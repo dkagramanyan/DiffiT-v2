@@ -53,11 +53,16 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import diffit.diffit as diffit_module
-from diffit import create_diffusion, diffusion_defaults
+from diffit import create_diffusion, diffusion_defaults, NUM_CLASSES
 from diffit.image_datasets import (
     ImageDataset,
     ZipImageDataset,
     _list_image_files_recursively,
+)
+from diffit.metrics import (
+    InceptionFeatureExtractor,
+    compute_activations,
+    evaluate_metrics,
 )
 from diffit.nn import update_ema
 from diffit.timestep_sampler import create_named_schedule_sampler
@@ -123,9 +128,47 @@ def is_main():
     return (not dist.is_initialized()) or dist.get_rank() == 0
 
 
+# Module-level log fan-out state, set in main() once writers exist.
+_tb_writer = None
+_jsonl_handle = None
+_text_step = 0
+
+
 def log(msg: str):
-    if is_main():
-        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    """Print to stdout + mirror to TB (add_text) and stats.jsonl when configured."""
+    global _text_step
+    if not is_main():
+        return
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    if _tb_writer is not None:
+        try:
+            _tb_writer.add_text("log", msg, global_step=_text_step)
+        except Exception:
+            pass
+    if _jsonl_handle is not None:
+        try:
+            _jsonl_handle.write(json.dumps({
+                "kind": "text", "msg": msg, "time": time.time(), "step": _text_step,
+            }) + "\n")
+            _jsonl_handle.flush()
+        except Exception:
+            pass
+    _text_step += 1
+
+
+def _write_scalars(kvs: dict, step):
+    """Write a group of scalars to TB and stats.jsonl as a single record."""
+    if not is_main():
+        return
+    if _tb_writer is not None:
+        for k, v in kvs.items():
+            if isinstance(v, (int, float)):
+                _tb_writer.add_scalar(k, v, step)
+    if _jsonl_handle is not None:
+        _jsonl_handle.write(json.dumps({
+            "kind": "scalars", "step": float(step), "time": time.time(), **kvs,
+        }) + "\n")
+        _jsonl_handle.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +234,10 @@ def compute_test_loss(
 @click.option("--cache-in-ram/--no-cache-in-ram", default=True, show_default=True)
 @click.option("--val-batches", default=16, show_default=True, type=int,
               help="Number of val batches for test-loss estimation")
+@click.option("--num-fid-samples", default=0, show_default=True, type=int,
+              help="Samples for FID/IS/sFID/Precision/Recall eval at each snap (0=disable)")
+@click.option("--cfg-scale",  default=4.4, show_default=True, type=float,
+              help="CFG scale used when generating FID samples")
 @click.option("--seed",       default=42, show_default=True, type=int, help="Init / training RNG seed")
 @click.option("--resume",     default=None, type=str, help="Checkpoint to resume from")
 def main(**opts):
@@ -313,6 +360,11 @@ def main(**opts):
         stats_tb = tb.SummaryWriter(run_dir)
         stats_jsonl = open(os.path.join(run_dir, "stats.jsonl"), "at")
 
+        # Wire module-level fan-out so every log() call mirrors to TB + stats.jsonl.
+        global _tb_writer, _jsonl_handle
+        _tb_writer = stats_tb
+        _jsonl_handle = stats_jsonl
+
         # Dump config for reproducibility
         with open(os.path.join(run_dir, "config.json"), "w") as f:
             json.dump({**opts, "val_frac": VAL_FRAC,
@@ -320,6 +372,33 @@ def main(**opts):
                       "split_seed": SPLIT_SEED, "world_size": world_size,
                       "lr": lr, "train_size": len(train_idx),
                       "val_size": len(val_idx)}, f, indent=2)
+
+    # ----- FID setup (only when --num-fid-samples > 0) -----------------
+    inception_extractor = None
+    ref_acts = None
+    num_fid_samples = opts["num_fid_samples"]
+    if num_fid_samples > 0 and is_main():
+        log("Loading InceptionV3 for metric evaluation...")
+        from torchvision.models import inception_v3, Inception_V3_Weights
+        inception_model = inception_v3(weights=Inception_V3_Weights.DEFAULT).eval().to(device)
+        inception_extractor = InceptionFeatureExtractor(inception_model)
+
+        log(f"Pre-computing reference Inception features ({num_fid_samples} val images)...")
+        ref_images = []
+        n_collected = 0
+        ref_iter = iter(val_loader)
+        while n_collected < num_fid_samples:
+            try:
+                batch, _ = next(ref_iter)
+            except StopIteration:
+                ref_iter = iter(val_loader)
+                batch, _ = next(ref_iter)
+            ref_images.append((batch + 1).mul(127.5).clamp(0, 255).byte().numpy())
+            n_collected += batch.shape[0]
+        ref_images = np.concatenate(ref_images, axis=0)[:num_fid_samples]
+        ref_acts = compute_activations(
+            ref_images, inception_extractor, batch_size=64, device=device,
+        )
 
     # ----- train loop ---------------------------------------------------
     model.train()
@@ -329,6 +408,9 @@ def main(**opts):
     cur_tick = 0
     train_iter = iter(train_loader)
     train_epoch = 0
+    run_start = time.time()
+    maintenance_time = 0.0
+    total_kimg = opts["kimg"]
     log("Starting training loop")
 
     while cur_nimg < opts["kimg"] * 1000:
@@ -377,40 +459,87 @@ def main(**opts):
             tick_time = time.time() - tick_start
             cur_tick += 1
             train_loss = loss_accum / max(n_accum, 1)
+            kimg = cur_nimg / 1000
+
+            # Memory stats (parity with train.py)
+            cpumem = 0.0
+            gpumem = 0.0
+            reserved = 0.0
+            try:
+                import psutil
+                cpumem = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 3)
+            except ImportError:
+                pass
+            if torch.cuda.is_available():
+                gpumem = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+
+            sec_per_kimg = tick_time / max((cur_nimg - tick_nimg) / 1000, 1e-6)
+            kimg_left = max(total_kimg - kimg, 0.0)
+            eta_sec = sec_per_kimg * kimg_left if sec_per_kimg > 0 else 0.0
+            total_elapsed = time.time() - run_start
 
             if is_main():
-                kimg = cur_nimg / 1000
-                stats_tb.add_scalar("Loss/train", train_loss, kimg)
-                stats_tb.add_scalar("Progress/sec_per_kimg",
-                                    tick_time / max((cur_nimg - tick_nimg) / 1000, 1e-6),
-                                    kimg)
+                _write_scalars({
+                    "Loss/train": train_loss,
+                    "Progress/sec_per_kimg": sec_per_kimg,
+                    "Progress/sec_per_tick": tick_time,
+                    "Progress/eta_sec": eta_sec,
+                    "Progress/elapsed_sec": total_elapsed,
+                    "Progress/maintenance_sec": maintenance_time,
+                    "Memory/cpu_gb": cpumem,
+                    "Memory/gpu_gb": gpumem,
+                    "Memory/gpu_reserved_gb": reserved,
+                    "tick": cur_tick,
+                    "kimg": kimg,
+                }, step=kimg)
                 log(f"tick {cur_tick:6d}  kimg {kimg:>9.1f}  "
                     f"train_loss {train_loss:.4f}  "
-                    f"tick_time {tick_time:.1f}s")
+                    f"tick_time {tick_time:.1f}s  "
+                    f"sec/kimg {sec_per_kimg:.2f}  "
+                    f"cpumem {cpumem:.2f}  gpumem {gpumem:.2f}  reserved {reserved:.2f}")
 
-            # Snapshot + test loss
+            # Snapshot + test loss + (optional) FID
             if cur_tick % opts["snap"] == 0 or cur_nimg >= opts["kimg"] * 1000:
+                snap_start = time.time()
                 log("Computing test loss...")
                 test_loss = compute_test_loss(
                     ema_model, vae, diffusion, val_loader, device, amp_dtype,
                     num_batches=opts["val_batches"],
                 )
                 if is_main():
-                    kimg = cur_nimg / 1000
-                    stats_tb.add_scalar("Loss/test", test_loss, kimg)
-                    stats_jsonl.write(json.dumps({
-                        "kimg": kimg, "tick": cur_tick,
-                        "train_loss": train_loss, "test_loss": test_loss,
-                    }) + "\n")
-                    stats_jsonl.flush()
+                    _write_scalars({"Loss/test": test_loss, "kimg": kimg, "tick": cur_tick},
+                                   step=kimg)
 
+                # FID/IS/sFID/Precision/Recall (all ranks participate in sample gen + kNN)
+                if num_fid_samples > 0:
+                    latent_size = image_size // 8
+                    stats_metrics = evaluate_metrics(
+                        ema_model, vae, diffusion, ref_acts, inception_extractor,
+                        num_fid_samples, opts["batch_gpu"], latent_size, device,
+                        cfg_scale=opts["cfg_scale"],
+                        rank=rank, world_size=world_size,
+                        log_fn=log,
+                    )
+                    if is_main() and stats_metrics is not None:
+                        _write_scalars(
+                            {f"Metrics/{k}": v for k, v in stats_metrics.items()},
+                            step=kimg,
+                        )
+
+                if is_main():
                     ckpt_path = os.path.join(run_dir, f"network-snapshot-{int(kimg):08d}.pt")
                     torch.save(ema_model.state_dict(), ckpt_path)
                     log(f"Saved {ckpt_path}  test_loss={test_loss:.4f}")
+                maintenance_time = time.time() - snap_start
+            else:
+                maintenance_time = 0.0
 
             loss_accum, n_accum = 0.0, 0
             tick_nimg = cur_nimg
             tick_start = time.time()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(device)
 
     # Final checkpoint — inference-only: EMA weights as a raw state_dict
     if is_main():
