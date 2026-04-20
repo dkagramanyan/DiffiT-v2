@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=2
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --time=4-0:0
 #SBATCH --output=/home/dgkagramanyan/DiffiT-v2/experiments/logs/slurm_%j.out
 #SBATCH --error=/home/dgkagramanyan/DiffiT-v2/experiments/logs/slurm_%j.out
@@ -45,7 +45,7 @@ torchrun --standalone --nproc_per_node=2 \
     --split=B \
     --batch-gpu=64 \
     --kimg=20000 \
-    --snap=10
+    --snap=100
 
 EXIT_CODE=$?
 echo "────────────────────────────────────"

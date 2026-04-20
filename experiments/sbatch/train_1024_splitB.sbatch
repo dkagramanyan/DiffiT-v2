@@ -51,7 +51,7 @@ torchrun --standalone --nproc_per_node=2 \
     --grad-accum=2 \
     --grad-ckpt \
     --kimg=10000 \
-    --snap=10
+    --snap=100
 
 EXIT_CODE=$?
 echo "────────────────────────────────────"
