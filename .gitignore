@@ -6,3 +6,4 @@ training-runs/*
 
 logs/*
 experiments/runs/*
+experiments/logs/*

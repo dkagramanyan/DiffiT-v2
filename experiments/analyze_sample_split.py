@@ -47,7 +47,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import diffit.diffit as diffit_module
-from diffit import create_diffusion, diffusion_defaults, NUM_CLASSES
+from diffit import create_diffusion, diffusion_defaults
 
 
 # ---------------------------------------------------------------------------
@@ -79,17 +79,43 @@ def match_checkpoints(run_a: str, run_b: str) -> List[Tuple[int, str, str]]:
 # ---------------------------------------------------------------------------
 
 def load_model(ckpt_path: str, device: torch.device, model_name: str = "Diffit"):
-    """Load EMA weights into a fresh DiffiT model."""
+    """Load EMA weights into a fresh DiffiT model.
+
+    Supports both the raw state_dict format saved by train_sample_split.py
+    (torch.save(ema_model.state_dict(), ...)) and the wrapped dict format
+    ({"ema": ..., "model": ..., "image_size": ...}).
+
+    Infers num_classes from the class-embedding table shape so the model
+    is built with the same size as the checkpoint — otherwise
+    load_state_dict raises a shape-mismatch error, and y indices sampled
+    for the fresh model would be out-of-bounds for the embedding table.
+    """
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    image_size = ckpt.get("image_size", 256)
+
+    if isinstance(ckpt, dict) and "ema" in ckpt:
+        state = ckpt["ema"]
+        image_size = ckpt.get("image_size", 256)
+    elif isinstance(ckpt, dict) and "model" in ckpt:
+        state = ckpt["model"]
+        image_size = ckpt.get("image_size", 256)
+    else:
+        state = ckpt  # raw state_dict; image_size not stored
+        image_size = 256
+
+    # LabelEmbedder stores nn.Embedding(num_classes + 1, hidden): +1 slot
+    # reserved for the CFG null token.
+    y_weight = state["y_embedder.embedding_table.weight"]
+    num_classes = y_weight.shape[0] - 1
+
     latent_size = image_size // 8
-    model = diffit_module.__dict__[model_name](input_size=latent_size)
-    state = ckpt.get("ema", ckpt.get("model"))
+    model = diffit_module.__dict__[model_name](
+        input_size=latent_size, num_classes=num_classes,
+    )
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
         print(f"  load_state_dict: missing={len(missing)} unexpected={len(unexpected)}")
     model.to(device).eval()
-    return model, image_size
+    return model, image_size, num_classes
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +162,7 @@ def sample_with_fixed_noise(
 def cosine_distance(
     model_a, model_b, vae, diffusion, device,
     num_samples: int, latent_size: int, batch_size: int,
-    num_steps: int, base_seed: int = 0,
+    num_steps: int, num_classes: int, base_seed: int = 0,
 ):
     """Mean cosine distance between matched-noise decoded samples from A and B."""
     dists = []
@@ -149,7 +175,7 @@ def cosine_distance(
         torch.manual_seed(base_seed + batch_idx)
         torch.cuda.manual_seed(base_seed + batch_idx)
         z_T = torch.randn(bs, 4, latent_size, latent_size, device=device)
-        y = torch.randint(0, NUM_CLASSES, (bs,), device=device)
+        y = torch.randint(0, num_classes, (bs,), device=device)
 
         img_a_lat = sample_with_fixed_noise(
             model_a, diffusion, z_T, y, device,
@@ -321,8 +347,12 @@ def main():
     for kimg, path_a, path_b in pairs:
         t0 = time.time()
         print(f"\n== kimg={kimg} ==")
-        model_a, image_size = load_model(path_a, device, args.model)
-        model_b, _          = load_model(path_b, device, args.model)
+        model_a, image_size, num_classes_a = load_model(path_a, device, args.model)
+        model_b, _,          num_classes_b = load_model(path_b, device, args.model)
+        if num_classes_a != num_classes_b:
+            raise ValueError(
+                f"num_classes mismatch between runs: A={num_classes_a}, B={num_classes_b}"
+            )
         latent_size = image_size // 8
 
         mean, sem = cosine_distance(
@@ -331,6 +361,7 @@ def main():
             latent_size=latent_size,
             batch_size=args.batch_size,
             num_steps=args.num_steps,
+            num_classes=num_classes_a,
             base_seed=args.base_seed,
         )
         tl_a = test_a.get(kimg, float("nan"))
