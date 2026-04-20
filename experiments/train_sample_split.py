@@ -538,8 +538,6 @@ def main(**opts):
             loss_accum, n_accum = 0.0, 0
             tick_nimg = cur_nimg
             tick_start = time.time()
-            if torch.cuda.is_available():
-                torch.cuda.reset_peak_memory_stats(device)
 
     # Final checkpoint — inference-only: EMA weights as a raw state_dict
     if is_main():
