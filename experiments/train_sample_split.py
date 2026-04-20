@@ -234,7 +234,7 @@ def compute_test_loss(
 @click.option("--cache-in-ram/--no-cache-in-ram", default=True, show_default=True)
 @click.option("--val-batches", default=16, show_default=True, type=int,
               help="Number of val batches for test-loss estimation")
-@click.option("--num-fid-samples", default=0, show_default=True, type=int,
+@click.option("--num-fid-samples", default=10000, show_default=True, type=int,
               help="Samples for FID/IS/sFID/Precision/Recall eval at each snap (0=disable)")
 @click.option("--cfg-scale",  default=4.4, show_default=True, type=float,
               help="CFG scale used when generating FID samples")
@@ -404,19 +404,22 @@ def main(**opts):
         inception_model = inception_v3(weights=Inception_V3_Weights.DEFAULT).eval().to(device)
         inception_extractor = InceptionFeatureExtractor(inception_model)
 
-        log(f"Pre-computing reference Inception features ({num_fid_samples} val images)...")
+        # Ref set is bounded by unique val images — duplicating would bias the
+        # reference covariance. Fakes stay at num_fid_samples (all unique).
+        num_ref = min(num_fid_samples, len(val_ds))
+        log(f"Pre-computing reference Inception features "
+            f"({num_ref} unique val images; fakes will be {num_fid_samples})...")
         ref_images = []
         n_collected = 0
         ref_iter = iter(val_loader)
-        while n_collected < num_fid_samples:
+        while n_collected < num_ref:
             try:
                 batch, _ = next(ref_iter)
             except StopIteration:
-                ref_iter = iter(val_loader)
-                batch, _ = next(ref_iter)
+                break  # val_loader exhausted
             ref_images.append((batch + 1).mul(127.5).clamp(0, 255).byte().numpy())
             n_collected += batch.shape[0]
-        ref_images = np.concatenate(ref_images, axis=0)[:num_fid_samples]
+        ref_images = np.concatenate(ref_images, axis=0)[:num_ref]
         ref_acts = compute_activations(
             ref_images, inception_extractor, batch_size=64, device=device,
         )

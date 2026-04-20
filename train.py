@@ -182,7 +182,7 @@ def training_loop(
     amp_dtype="fp16",
     workers=4,
     cache_in_ram=False,
-    num_fid_samples=1024,
+    num_fid_samples=10000,
     **_extra,
 ):
     """Main training loop for DiffiT."""
@@ -766,7 +766,7 @@ BASE_CONFIGS = {
         ema_rate=0.9999,
         use_fp16=True,
         schedule_sampler_name="uniform",
-        num_fid_samples=512,
+        num_fid_samples=10000,
         cfg_scale=1.49,
         # 1024² is memory-bound: enable checkpointing by default and
         # use 2-step accumulation to double the effective batch.
