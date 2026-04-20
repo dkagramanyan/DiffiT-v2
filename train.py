@@ -38,7 +38,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 import diffit.diffit as diffit_module
-from diffit import create_diffusion, diffusion_defaults, NUM_CLASSES
+from diffit import create_diffusion, diffusion_defaults
 from diffit.dist_util import setup_dist, dev, get_rank, get_world_size, synchronize
 from diffit.image_datasets import load_data
 from diffit.nn import update_ema
@@ -90,14 +90,14 @@ def setup_snapshot_image_grid(image_size, gw=None, gh=None):
 def generate_snapshot_images(
     ema_model, vae, diffusion, grid_z, grid_classes, batch_gpu, device,
     *,
-    cfg_scale, num_sampling_steps=25, scale_pow=4.0,
+    cfg_scale, null_class_idx, num_sampling_steps=25, scale_pow=4.0,
 ):
     """Generate a batch of images from the EMA model for snapshot grids."""
     all_samples = []
     for z_chunk, c_chunk in zip(grid_z.split(batch_gpu), grid_classes.split(batch_gpu)):
         bs = z_chunk.shape[0]
         z_cfg = torch.cat([z_chunk, z_chunk], 0)
-        classes_null = torch.full((bs,), NUM_CLASSES, device=device, dtype=torch.long)
+        classes_null = torch.full((bs,), null_class_idx, device=device, dtype=torch.long)
         model_kwargs = {
             "y": torch.cat([c_chunk, classes_null], 0),
             "cfg_scale": cfg_scale,
@@ -220,6 +220,14 @@ def training_loop(
     del probe_iter
     if is_main:
         logger.log(f"Discovered {num_dataset_classes} classes in dataset.")
+
+    # Model embedding is sized to num_dataset_classes + 1 (last slot = CFG null
+    # token). Raw dataset labels can be any int (e.g. ImageNet subset IDs), so
+    # map them to contiguous [0, num_dataset_classes) before feeding the model.
+    max_raw = max(sorted_class_list) if sorted_class_list else 0
+    label_map_tensor = torch.full((max_raw + 1,), -1, dtype=torch.long, device=device)
+    for contiguous_idx, raw in enumerate(sorted_class_list):
+        label_map_tensor[raw] = contiguous_idx
 
     # Build model (sized to the dataset's actual class count).
     latent_size = image_size // 8
@@ -401,11 +409,11 @@ def training_loop(
         n_grid, 4, latent_size, latent_size, device=device,
         generator=torch.Generator(device=device).manual_seed(seed * max(num_gpus, 1)),
     )
-    # Each row gets a single class, cycling through discovered classes
+    # Each row gets a single class, cycling through discovered classes.
+    # Use contiguous indices (0..K-1) since these are fed to the model.
     grid_classes_list = []
     for r in range(gh):
-        c = grid_row_classes[r]
-        grid_classes_list.extend([c] * gw)
+        grid_classes_list.extend([r % num_dataset_classes] * gw)
     grid_classes = torch.tensor(grid_classes_list, device=device, dtype=torch.long)
 
     # Save initial fakes
@@ -414,6 +422,7 @@ def training_loop(
             ema_model, vae, diffusion, grid_z, grid_classes,
             batch_gpu=batch_gpu, device=device,
             cfg_scale=cfg_scale,
+            null_class_idx=num_dataset_classes,
         )
         save_image_grid(fakes_init, os.path.join(run_dir, "fakes_init.png"), drange=[0, 255], grid_size=grid_size)
 
@@ -470,7 +479,8 @@ def training_loop(
             # Model kwargs
             model_kwargs = {}
             if "y" in cond:
-                model_kwargs["y"] = cond["y"].to(device, non_blocking=True)
+                raw_y = cond["y"].to(device, non_blocking=True)
+                model_kwargs["y"] = label_map_tensor[raw_y]
 
             # Skip DDP allreduce on all micro-steps except the last to
             # avoid redundant gradient synchronisation.
@@ -592,6 +602,7 @@ def training_loop(
                         ema_model, vae, diffusion, grid_z, grid_classes,
                         batch_gpu=batch_gpu, device=device,
                         cfg_scale=cfg_scale,
+                        null_class_idx=num_dataset_classes,
                     )
                     save_image_grid(
                         fakes, os.path.join(run_dir, f"fakes{cur_nimg // 1000:06d}.png"),
@@ -607,7 +618,7 @@ def training_loop(
                         cfg_scale=cfg_scale,
                         rank=rank, world_size=num_gpus,
                         log_fn=logger.log,
-                        class_list=sorted_class_list,
+                        class_list=list(range(num_dataset_classes)),
                         null_class_idx=num_dataset_classes,
                     )
                     # Only rank 0 logs and saves metrics
@@ -645,6 +656,7 @@ def training_loop(
             ema_model, vae, diffusion, grid_z, grid_classes,
             batch_gpu=batch_gpu, device=device,
             cfg_scale=cfg_scale,
+            null_class_idx=num_dataset_classes,
         )
         save_image_grid(
             fakes, os.path.join(run_dir, f"fakes{cur_nimg // 1000:06d}.png"),
