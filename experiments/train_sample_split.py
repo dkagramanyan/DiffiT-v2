@@ -278,6 +278,24 @@ def main(**opts):
     log(f"Dataset size: {len(base)} "
         f"(val={len(val_idx)}, trainA={len(a_idx)}, trainB={len(b_idx)})")
 
+    # Class IDs actually present in the dataset (for FID sampling + model sizing).
+    # ImageDataset stores them in `.classes`; ZipImageDataset in `._labels`.
+    if getattr(base, "classes", None) is not None:
+        _labels_src = list(base.classes)
+    elif getattr(base, "_labels", None):
+        _labels_src = list(base._labels.values())
+    else:
+        _labels_src = []
+    dataset_class_list = sorted(set(_labels_src))
+    expected = list(range(len(dataset_class_list)))
+    if dataset_class_list != expected:
+        raise ValueError(
+            f"Dataset labels must be dense 0..N-1, got {dataset_class_list[:10]}"
+            f"{'...' if len(dataset_class_list) > 10 else ''}. "
+            "Remap before training."
+        )
+    log(f"Dataset classes: {len(dataset_class_list)} unique (ids=0..{len(dataset_class_list) - 1})")
+
     train_idx = a_idx if opts["split"] == "A" else b_idx
     train_ds = Subset(base, train_idx.tolist())
     val_ds   = Subset(base, val_idx.tolist())
@@ -307,7 +325,10 @@ def main(**opts):
 
     # ----- model --------------------------------------------------------
     latent_size = image_size // 8
-    model = diffit_module.__dict__[opts["model_name"]](input_size=latent_size).to(device)
+    num_dataset_classes = max(len(dataset_class_list), 1)
+    model = diffit_module.__dict__[opts["model_name"]](
+        input_size=latent_size, num_classes=num_dataset_classes,
+    ).to(device)
     if opts["grad_ckpt"]:
         model.gradient_checkpointing = True
 
@@ -520,6 +541,8 @@ def main(**opts):
                         cfg_scale=opts["cfg_scale"],
                         rank=rank, world_size=world_size,
                         log_fn=log,
+                        class_list=dataset_class_list or None,
+                        null_class_idx=num_dataset_classes,
                     )
                     if is_main() and stats_metrics is not None:
                         _write_scalars(

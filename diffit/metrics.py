@@ -78,8 +78,20 @@ def generate_eval_samples(
     *,
     cfg_scale, num_sampling_steps=25, scale_pow=4.0,
     rank=0, world_size=1,
+    class_list=None, null_class_idx=None,
 ):
-    """Generate N random images for metric evaluation (NCHW uint8 numpy)."""
+    """Generate N random images for metric evaluation (NCHW uint8 numpy).
+
+    class_list: list of int class IDs to sample from. Defaults to range(NUM_CLASSES).
+    null_class_idx: CFG null-token embedding index. Defaults to NUM_CLASSES
+        (matches a model built with num_classes=NUM_CLASSES).
+    """
+    if class_list is None:
+        class_list = list(range(NUM_CLASSES))
+    if null_class_idx is None:
+        null_class_idx = NUM_CLASSES
+    class_tensor = torch.tensor(class_list, device=device, dtype=torch.long)
+
     samples_per_rank = (num_samples + world_size - 1) // world_size
     local_target = min(samples_per_rank, num_samples - rank * samples_per_rank)
     local_target = max(local_target, 0)
@@ -91,10 +103,10 @@ def generate_eval_samples(
     while generated < local_target:
         bs = min(batch_gpu, local_target - generated)
         z = torch.randn(bs, 4, latent_size, latent_size, device=device)
-        classes = torch.randint(0, NUM_CLASSES, (bs,), device=device)
+        classes = class_tensor[torch.randint(0, len(class_tensor), (bs,), device=device)]
 
         z_cfg = torch.cat([z, z], 0)
-        classes_null = torch.full((bs,), NUM_CLASSES, device=device, dtype=torch.long)
+        classes_null = torch.full((bs,), null_class_idx, device=device, dtype=torch.long)
         model_kwargs = {
             "y": torch.cat([classes, classes_null], 0),
             "cfg_scale": cfg_scale,
@@ -246,24 +258,27 @@ def evaluate_metrics(
     cfg_scale,
     rank=0, world_size=1,
     log_fn=None,
+    class_list=None, null_class_idx=None,
 ):
     """Generate samples across all ranks, compute metrics on rank 0.
 
-    log_fn: optional callable(str) -> None. Defaults to a no-op.
+    class_list / null_class_idx: forwarded to generate_eval_samples. See there.
     Returns dict of metrics on rank 0, None on other ranks.
     """
     if log_fn is None:
         log_fn = lambda *a, **k: None
 
     if rank == 0:
+        n_cls = len(class_list) if class_list is not None else NUM_CLASSES
         log_fn(
             f"Evaluating metrics ({num_fid_samples} samples across "
-            f"{world_size} GPU(s), cfg_scale={cfg_scale})..."
+            f"{world_size} GPU(s), cfg_scale={cfg_scale}, classes={n_cls})..."
         )
     fake_images = generate_eval_samples(
         ema_model, vae, diffusion, num_fid_samples, batch_gpu, latent_size, device,
         cfg_scale=cfg_scale,
         rank=rank, world_size=world_size,
+        class_list=class_list, null_class_idx=null_class_idx,
     )
 
     if rank == 0:

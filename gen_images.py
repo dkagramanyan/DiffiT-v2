@@ -57,6 +57,7 @@ def parse_range(s: Union[str, List]) -> List[int]:
 @click.option("--vae-decoder", type=click.Choice(["ema", "mse"]), default="ema", show_default=True, help="VAE decoder variant")
 @click.option("--decode-layer", type=int, default=None, help="Decode layer override")
 @click.option("--batch-sz", type=int, default=1, show_default=True, help="Batch size per sample")
+@click.option("--num-classes", type=int, default=1000, show_default=True, help="Must match num_classes used at train time")
 def generate_images(
     model_path,
     seeds,
@@ -71,6 +72,7 @@ def generate_images(
     vae_decoder,
     decode_layer,
     batch_sz,
+    num_classes,
 ):
     """Generate individual PNG images using a pretrained DiffiT model."""
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -80,7 +82,7 @@ def generate_images(
     print(f'Loading model from "{model_path}"...')
     latent_size = image_size // 8
     model = diffit_module.__dict__[model_name](
-        input_size=latent_size, decode_layer=decode_layer
+        input_size=latent_size, decode_layer=decode_layer, num_classes=num_classes,
     )
     msg = model.load_state_dict(load_state_dict(model_path, map_location="cpu"))
     print(f"Model loaded: {msg}")

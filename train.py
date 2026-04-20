@@ -203,9 +203,29 @@ def training_loop(
     if is_main:
         logger.log(f"AMP: enabled={amp_enabled}, dtype={amp_dtype_torch}, grad_scaler={use_grad_scaler}")
 
-    # Build model
+    # Discover dataset class count before building model so embedding table
+    # matches the dataset (avoids wasted untrained-class params).
+    probe_iter = load_data(
+        data_dir=data, batch_size=64, image_size=image_size,
+        class_cond=True, random_flip=False, num_workers=2,
+        distributed=False,
+    )
+    discovered_classes = set()
+    for _ in range(50):  # probe up to 3200 samples
+        _, cond_probe = next(probe_iter)
+        if "y" in cond_probe:
+            discovered_classes.update(cond_probe["y"].numpy().tolist())
+    num_dataset_classes = max(len(discovered_classes), 1)
+    sorted_class_list = sorted(discovered_classes)
+    del probe_iter
+    if is_main:
+        logger.log(f"Discovered {num_dataset_classes} classes in dataset.")
+
+    # Build model (sized to the dataset's actual class count).
     latent_size = image_size // 8
-    model = diffit_module.__dict__[model_name](input_size=latent_size)
+    model = diffit_module.__dict__[model_name](
+        input_size=latent_size, num_classes=num_dataset_classes,
+    )
     model.to(device)
 
     if gradient_checkpointing:
@@ -328,22 +348,6 @@ def training_loop(
         ref_acts = compute_activations(ref_images, inception_extractor, batch_size=64, device=device)
         del ref_images
         logger.log("Reference features computed.")
-
-    # Discover number of classes in dataset
-    probe_iter = load_data(
-        data_dir=data, batch_size=64, image_size=image_size,
-        class_cond=True, random_flip=False, num_workers=2,
-        distributed=False,
-    )
-    discovered_classes = set()
-    for _ in range(50):  # probe up to 3200 samples
-        _, cond_probe = next(probe_iter)
-        if "y" in cond_probe:
-            discovered_classes.update(cond_probe["y"].numpy().tolist())
-    num_dataset_classes = max(len(discovered_classes), 1)
-    sorted_class_list = sorted(discovered_classes)
-    del probe_iter
-    logger.log(f"Discovered {num_dataset_classes} classes in dataset.")
 
     # Build class-sorted grid: each row cycles through classes
     # Row 0 → class 0, row 1 → class 1, ..., row K → class K % num_classes
@@ -603,6 +607,8 @@ def training_loop(
                         cfg_scale=cfg_scale,
                         rank=rank, world_size=num_gpus,
                         log_fn=logger.log,
+                        class_list=sorted_class_list,
+                        null_class_idx=num_dataset_classes,
                     )
                     # Only rank 0 logs and saves metrics
                     if is_main and stats_metrics is not None:

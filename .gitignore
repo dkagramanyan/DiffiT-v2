@@ -5,3 +5,4 @@ training-runs/*
 *.log
 
 logs/*
+experiments/runs/*

@@ -22,7 +22,7 @@ import torch.distributed as dist
 from diffusers.models import AutoencoderKL
 
 import diffit.diffit as diffit_module
-from diffit import create_diffusion, diffusion_defaults, NUM_CLASSES
+from diffit import create_diffusion, diffusion_defaults
 from diffit.dist_util import setup_dist, dev, load_state_dict, get_rank, get_world_size
 
 
@@ -43,6 +43,7 @@ from diffit.dist_util import setup_dist, dev, load_state_dict, get_rank, get_wor
 @click.option("--vae-decoder", type=click.Choice(["ema", "mse"]), default="ema", show_default=True, help="VAE decoder variant")
 @click.option("--decode-layer", type=int, default=None, help="Decode layer override")
 @click.option("--seed", type=int, default=None, help="Global random seed")
+@click.option("--num-classes", type=int, default=1000, show_default=True, help="Must match num_classes used at train time")
 def generate_samples(
     model_path,
     outdir,
@@ -60,6 +61,7 @@ def generate_samples(
     vae_decoder,
     decode_layer,
     seed,
+    num_classes,
 ):
     """Generate samples for FID evaluation."""
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -75,7 +77,7 @@ def generate_samples(
     # Create model
     latent_size = image_size // 8
     model = diffit_module.__dict__[model_name](
-        input_size=latent_size, decode_layer=decode_layer
+        input_size=latent_size, decode_layer=decode_layer, num_classes=num_classes,
     )
     msg = model.load_state_dict(load_state_dict(model_path, map_location="cpu"))
     print(f"Model loaded: {msg}")
@@ -110,12 +112,12 @@ def generate_samples(
             model_kwargs = {}
             z = torch.randn(batch_size, 4, latent_size, latent_size, device=dev())
             classes = torch.randint(
-                low=0, high=NUM_CLASSES, size=(batch_size,), device=dev()
+                low=0, high=num_classes, size=(batch_size,), device=dev()
             )
 
             if cfg_cond:
                 z = torch.cat([z, z], 0)
-                classes_null = torch.full((batch_size,), NUM_CLASSES, device=dev())
+                classes_null = torch.full((batch_size,), num_classes, device=dev())
                 model_kwargs["y"] = torch.cat([classes, classes_null], 0)
                 model_kwargs["cfg_scale"] = cfg_scale
                 model_kwargs["diffusion_steps"] = diff_config["diffusion_steps"]
