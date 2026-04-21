@@ -11,6 +11,7 @@
 #SBATCH --error=/home/dgkagramanyan/DiffiT-v2/experiments/logs/slurm_%j.out
 #SBATCH --constraint="type_f|type_h"
 #SBATCH --gres-flags=enforce-binding
+#SBATCH --gpu-bind=closest
 
 # ── Environment ────────────────────────────────────────────────────────────
 module purge
