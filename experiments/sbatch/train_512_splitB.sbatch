@@ -11,7 +11,6 @@
 #SBATCH --error=/home/dgkagramanyan/DiffiT-v2/experiments/logs/slurm_%j.out
 #SBATCH --constraint="type_h"
 #SBATCH --gres-flags=enforce-binding
-#SBATCH --gpu-bind=closest
 
 module purge
 module load Python/Anaconda
@@ -44,6 +43,7 @@ torchrun --standalone --nproc_per_node=2 \
     --data="$DATASET" \
     --image-size=512 \
     --split=B \
+    --seed=132 \
     --batch-gpu=64 \
     --kimg=20000 \
     --snap=100

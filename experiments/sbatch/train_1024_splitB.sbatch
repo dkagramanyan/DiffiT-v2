@@ -48,6 +48,7 @@ torchrun --standalone --nproc_per_node=2 \
     --data="$DATASET" \
     --image-size=1024 \
     --split=B \
+    --seed=132 \
     --batch-gpu=8 \
     --grad-accum=2 \
     --grad-ckpt \
