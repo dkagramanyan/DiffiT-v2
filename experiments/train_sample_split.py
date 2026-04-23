@@ -354,12 +354,22 @@ def main(**opts):
     else:
         ddp_model = model
 
+    # max-autotune captures CUDA graphs, which clash with gradient checkpointing
+    # (the replayed graph overwrites tensors the recompute still needs).
+    compile_mode = "max-autotune-no-cudagraphs" if opts["grad_ckpt"] else "max-autotune"
+    ddp_model = torch.compile(ddp_model, mode=compile_mode)
+
     # ----- VAE ----------------------------------------------------------
     log("Loading VAE...")
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
     vae.eval()
     for p in vae.parameters():
         p.requires_grad_(False)
+    # torch.compile's CUDA-graph pools hold ~90 GiB during eval; slice/tile
+    # the decoder so a batch_gpu-sized VAE decode still fits.
+    vae.enable_slicing()
+    if image_size >= 1024:
+        vae.enable_tiling()
 
     # ----- resume -------------------------------------------------------
     cur_nimg = 0
