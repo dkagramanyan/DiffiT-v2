@@ -69,7 +69,7 @@ python "$PROJECT_DIR/train.py" \
     --cfg=diffit-512 \
     --data="$DATASET" \
     --gpus=2 \
-    --batch-gpu=64 \
+    --batch-gpu=48 \
     --snap=100
 
 EXIT_CODE=$?
