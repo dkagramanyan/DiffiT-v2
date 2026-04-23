@@ -285,6 +285,11 @@ def training_loop(
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
     vae.eval()
     vae.requires_grad_(False)
+    # torch.compile's CUDA-graph pools hold ~90 GiB during eval; slice/tile
+    # the decoder so a batch_gpu-sized VAE decode still fits.
+    vae.enable_slicing()
+    if image_size >= 1024:
+        vae.enable_tiling()
 
     # Resume
     cur_nimg = 0
