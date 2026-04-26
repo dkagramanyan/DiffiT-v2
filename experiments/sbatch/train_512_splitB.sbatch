@@ -43,6 +43,7 @@ torchrun --standalone --nproc_per_node=2 \
     --data="$DATASET" \
     --image-size=512 \
     --split=B \
+    --seed=132 \
     --batch-gpu=64 \
     --kimg=20000 \
     --snap=100
