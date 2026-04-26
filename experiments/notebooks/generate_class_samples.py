@@ -37,7 +37,13 @@ import torch
 from diffusers.models import AutoencoderKL
 from tqdm.auto import tqdm
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# Walk up from this file until we find the directory containing the
+# `diffit` package — works whether the script lives in experiments/ or
+# experiments/notebooks/.
+REPO_ROOT = next(
+    p for p in Path(__file__).resolve().parents
+    if (p / 'diffit' / '__init__.py').exists()
+)
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
