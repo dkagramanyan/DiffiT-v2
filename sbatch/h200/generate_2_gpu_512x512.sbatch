@@ -34,15 +34,16 @@ which g++
 g++ --version
 
 conda list | grep -E "torch|cuda|cudnn|ninja"
+
 export TORCH_CUDA_ARCH_LIST="9.0"
 
 python gen_images.py \
-  --model-path ./training-runs/00017-diffit-256-gpus2-batch192/network-snapshot-021772.pt \
+  --model-path ./training-runs/00018-diffit-512-gpus4-batch256/network-snapshot-007372.pt \
   --samples-per-class 10000 \
-  --batch-size 32 \
-  --outdir ./generated/00017-diffit-256-gpus2-batch192 \
-  --image-size 256 \
-  --cfg-scale 4.4 \
+  --batch-size 16 \
+  --outdir ./generated/00018-diffit-512-gpus4-batch256 \
+  --image-size 512 \
+  --cfg-scale 1.49 \
   --num-sampling-steps 250 \
   --use-ddim \
   --gpus 0,1
