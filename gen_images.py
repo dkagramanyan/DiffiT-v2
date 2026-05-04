@@ -38,7 +38,7 @@ from diffusers.models import AutoencoderKL
 from tqdm.auto import tqdm
 
 import diffit.diffit as diffit_module
-from diffit import create_diffusion, diffusion_defaults, NUM_CLASSES
+from diffit import create_diffusion, diffusion_defaults
 from diffit.dist_util import load_state_dict
 
 
@@ -120,7 +120,7 @@ def _run_sampling(model, vae, diffusion, dev, latent_size, num_classes,
 @click.option("--vae-decoder", type=click.Choice(["ema", "mse"]), default="ema", show_default=True, help="VAE decoder variant")
 @click.option("--decode-layer", type=int, default=None, help="Decode layer override")
 @click.option("--batch-sz", type=int, default=1, show_default=True, help="Seed mode: images per seed (sharing the seed)")
-@click.option("--num-classes", type=int, default=1000, show_default=True, help="Must match num_classes used at train time")
+@click.option("--num-classes", type=int, default=None, help="Override num_classes (default: auto-detect from checkpoint)")
 @click.option("--gpus", type=parse_gpus, default=None, help="GPU ids to use, e.g. '0,1' or '0-3' (default: all available)")
 def generate_images(
     model_path,
@@ -165,6 +165,19 @@ def generate_images(
     print(f'Loading model from "{model_path}" onto {len(devices)} device(s)...')
     latent_size = image_size // 8
     state = load_state_dict(model_path, map_location="cpu")
+
+    # Auto-detect num_classes from the checkpoint's class embedding table.
+    # Last row is the CFG null token, so subtract 1.
+    ckpt_num_classes = int(state["y_embedder.embedding_table.weight"].shape[0]) - 1
+    if num_classes is None:
+        num_classes = ckpt_num_classes
+        print(f"Auto-detected num_classes={num_classes} from checkpoint")
+    elif num_classes != ckpt_num_classes:
+        raise click.UsageError(
+            f"--num-classes={num_classes} conflicts with checkpoint "
+            f"(embedding table implies num_classes={ckpt_num_classes})"
+        )
+
     models = []
     vaes = {}
     for dev in devices:
@@ -253,7 +266,7 @@ def generate_images(
                     if class_idx is not None:
                         class_labels = torch.full((batch_sz,), class_idx, device=dev, dtype=torch.long)
                     else:
-                        class_labels = torch.randint(0, NUM_CLASSES, (batch_sz,),
+                        class_labels = torch.randint(0, num_classes, (batch_sz,),
                                                      device=dev, generator=gen, dtype=torch.long)
 
                     imgs = _run_sampling(
