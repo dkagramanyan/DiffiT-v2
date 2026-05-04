@@ -7,3 +7,4 @@ training-runs/*
 logs/*
 experiments/runs/*
 experiments/logs/*
+experiments/__pycache__/*
