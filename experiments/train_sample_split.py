@@ -54,13 +54,14 @@ if str(REPO_ROOT) not in sys.path:
 
 import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults, NUM_CLASSES
+from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
 from diffit.image_datasets import (
     ImageDataset,
     ZipImageDataset,
     _list_image_files_recursively,
 )
+from diffit.inception import InceptionFeatureExtractor
 from diffit.metrics import (
-    InceptionFeatureExtractor,
     compute_activations,
     evaluate_metrics,
 )
@@ -192,7 +193,7 @@ def compute_test_loss(
             break
         batch = batch.to(device, non_blocking=True)
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=True):
-            latent = vae.encode(batch).latent_dist.sample() * 0.18215
+            latent = vae.encode(batch).latent_dist.sample() * VAE_SCALE_FACTOR
             t = torch.randint(0, diffusion.num_timesteps, (latent.shape[0],), device=device)
             model_kwargs = {}
             if "y" in cond:
@@ -427,7 +428,7 @@ def main(**opts):
                 batch, _ = next(ref_iter)
             except StopIteration:
                 break  # val_loader exhausted
-            ref_images.append((batch + 1).mul(127.5).clamp(0, 255).byte().numpy())
+            ref_images.append((batch + 1).mul(PIXEL_NORM_HALF).clamp(0, UINT8_MAX).byte().numpy())
             n_collected += batch.shape[0]
         ref_images = np.concatenate(ref_images, axis=0)[:num_ref]
         ref_acts = compute_activations(
@@ -463,7 +464,7 @@ def main(**opts):
 
             batch = batch.to(device, non_blocking=True)
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype, enabled=True):
-                latent = vae.encode(batch).latent_dist.sample() * 0.18215
+                latent = vae.encode(batch).latent_dist.sample() * VAE_SCALE_FACTOR
 
             t, weights = sampler.sample(latent.shape[0], device)
             model_kwargs = {}

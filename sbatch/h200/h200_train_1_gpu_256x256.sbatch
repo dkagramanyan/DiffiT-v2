@@ -37,7 +37,7 @@ export TORCH_CUDA_ARCH_LIST="9.0"
 export TORCH_EXTENSIONS_DIR="${HOME}/.cache/torch_extensions"
 export CUDA_CACHE_PATH="${HOME}/.cache/cuda_cache"
 
-python train.py --outdir=./runs/diffit_h200_50 \
+diffit-train --outdir=./runs/diffit_h200_50 \
         --cfg=diffit-256 \
         --data=./datasets/imagenet_256x256.zip \
         --gpus=1 \

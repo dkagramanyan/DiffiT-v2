@@ -16,7 +16,6 @@ Usage:
 import importlib
 import sys
 
-
 # -----------------------------------------------------------------------
 # 1. Dependency check
 # -----------------------------------------------------------------------
@@ -122,7 +121,7 @@ def download_models():
     print("=" * 60)
     print("[3/3] Downloading InceptionV3 (torchvision) ...")
     print("=" * 60)
-    from torchvision.models import inception_v3, Inception_V3_Weights
+    from torchvision.models import Inception_V3_Weights, inception_v3
 
     inception_v3(weights=Inception_V3_Weights.DEFAULT)
     print("  -> cached.\n")

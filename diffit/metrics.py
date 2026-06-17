@@ -11,48 +11,8 @@ from scipy import linalg
 from tqdm import tqdm
 
 from diffit import NUM_CLASSES
+from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
 from diffit.dpm_solver import dpm_solver_sample
-
-
-class InceptionFeatureExtractor(torch.nn.Module):
-    """Extract pool, spatial and logit features from InceptionV3."""
-
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    @torch.no_grad()
-    def forward(self, x):
-        x = torch.nn.functional.interpolate(x, size=(299, 299), mode="bilinear", align_corners=False)
-        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
-        x = (x - mean) / std
-
-        m = self.model
-        x = m.Conv2d_1a_3x3(x)
-        x = m.Conv2d_2a_3x3(x)
-        x = m.Conv2d_2b_3x3(x)
-        x = torch.nn.functional.max_pool2d(x, kernel_size=3, stride=2)
-        x = m.Conv2d_3b_1x1(x)
-        x = m.Conv2d_4a_3x3(x)
-        x = torch.nn.functional.max_pool2d(x, kernel_size=3, stride=2)
-        x = m.Mixed_5b(x)
-        x = m.Mixed_5c(x)
-        x = m.Mixed_5d(x)
-        x = m.Mixed_6a(x)
-        x = m.Mixed_6b(x)
-        spatial = x
-        x = m.Mixed_6c(x)
-        x = m.Mixed_6d(x)
-        x = m.Mixed_6e(x)
-        x = m.Mixed_7a(x)
-        x = m.Mixed_7b(x)
-        x = m.Mixed_7c(x)
-
-        pool = torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).flatten(1)
-        logits = m.fc(pool)
-        spatial = spatial.mean(dim=[-2, -1])
-        return {"pool": pool, "spatial": spatial, "logits": logits}
 
 
 @torch.inference_mode()
@@ -60,7 +20,7 @@ def compute_activations(images_uint8_nchw, extractor, batch_size, device, desc="
     """Compute inception activations from NCHW uint8 numpy array."""
     all_pool, all_spatial, all_logits = [], [], []
     for i in tqdm(range(0, len(images_uint8_nchw), batch_size), desc=desc, unit="batch"):
-        batch = torch.from_numpy(images_uint8_nchw[i : i + batch_size]).float().to(device) / 255.0
+        batch = torch.from_numpy(images_uint8_nchw[i : i + batch_size]).float().to(device) / UINT8_MAX
         feats = extractor(batch)
         all_pool.append(feats["pool"].cpu().numpy())
         all_spatial.append(feats["spatial"].cpu().numpy())
@@ -124,8 +84,8 @@ def generate_eval_samples(
                 noise=z_cfg,
             )
             sample, _ = sample.chunk(2, dim=0)
-            decoded = vae.decode(sample.float() / 0.18215).sample
-        decoded = ((decoded + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+            decoded = vae.decode(sample.float() / VAE_SCALE_FACTOR).sample
+        decoded = ((decoded + 1) * PIXEL_NORM_HALF).clamp(0, UINT8_MAX).to(torch.uint8)
         all_images.append(decoded.cpu().numpy())
         generated += bs
         if pbar is not None:
@@ -191,28 +151,34 @@ def compute_inception_score(logits, split_size=5000):
 
 
 @torch.inference_mode()
-def compute_precision_recall(ref_acts, sample_acts, k=3, rank=0, world_size=1):
-    """Precision and Recall via k-NN manifold estimation (multi-GPU accelerated)."""
+def compute_precision_recall(ref_acts, sample_acts, k=3, rank=0, world_size=1, device=None):
+    """Precision and Recall via k-NN manifold estimation (multi-GPU accelerated).
+
+    ``device`` selects where the k-NN tensors live; defaults to CUDA to preserve
+    the original behaviour, but can be overridden (e.g. CPU) for testing.
+    """
     BATCH = 512
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if world_size > 1:
         if rank == 0:
-            ref_t = torch.from_numpy(ref_acts).cuda()
-            sample_t = torch.from_numpy(sample_acts).cuda()
+            ref_t = torch.from_numpy(ref_acts).to(device)
+            sample_t = torch.from_numpy(sample_acts).to(device)
             shapes = torch.tensor([ref_t.shape[0], ref_t.shape[1],
-                                   sample_t.shape[0], sample_t.shape[1]], device="cuda")
+                                   sample_t.shape[0], sample_t.shape[1]], device=device)
         else:
-            shapes = torch.zeros(4, dtype=torch.long, device="cuda")
+            shapes = torch.zeros(4, dtype=torch.long, device=device)
         dist.broadcast(shapes, src=0)
         nr, d, ns, _ = shapes.tolist()
         if rank != 0:
-            ref_t = torch.zeros(nr, d, device="cuda")
-            sample_t = torch.zeros(ns, d, device="cuda")
+            ref_t = torch.zeros(nr, d, device=device)
+            sample_t = torch.zeros(ns, d, device=device)
         dist.broadcast(ref_t, src=0)
         dist.broadcast(sample_t, src=0)
     else:
-        ref_t = torch.from_numpy(ref_acts).cuda()
-        sample_t = torch.from_numpy(sample_acts).cuda()
+        ref_t = torch.from_numpy(ref_acts).to(device)
+        sample_t = torch.from_numpy(sample_acts).to(device)
 
     device = ref_t.device
 
@@ -295,7 +261,7 @@ def evaluate_metrics(
         fake_pool = None
 
     prec, rec = compute_precision_recall(
-        ref_pool, fake_pool, k=3, rank=rank, world_size=world_size,
+        ref_pool, fake_pool, k=3, rank=rank, world_size=world_size, device=device,
     )
 
     if rank == 0:

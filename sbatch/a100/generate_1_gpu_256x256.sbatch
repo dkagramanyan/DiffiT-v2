@@ -16,7 +16,7 @@ source activate diffit
 
 cd ..
 
-python gen_images.py \
+diffit-gen-images \
   --model-path ./training-runs/CHANGE_ME/network-final.pt \
   --seeds 0-49 \
   --outdir ./generated/256 \

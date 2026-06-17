@@ -36,7 +36,7 @@ g++ --version
 conda list | grep -E "torch|cuda|cudnn|ninja"
 export TORCH_CUDA_ARCH_LIST="9.0"
 
-python gen_images.py \
+diffit-gen-images \
   --model-path ./training-runs/00017-diffit-256-gpus2-batch192/network-snapshot-021772.pt \
   --samples-per-class 10000 \
   --batch-size 32 \

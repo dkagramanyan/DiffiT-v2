@@ -19,9 +19,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from timm.models.vision_transformer import PatchEmbed
-
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 # ---------------------------------------------------------------------------
 # Norms

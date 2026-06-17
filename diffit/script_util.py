@@ -4,9 +4,6 @@ Utility functions for scripts.
 
 import argparse
 
-from . import gaussian_diffusion as gd
-from .respace import SpacedDiffusion, space_timesteps
-
 NUM_CLASSES = 1000
 
 

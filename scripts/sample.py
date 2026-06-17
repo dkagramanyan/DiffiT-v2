@@ -23,7 +23,8 @@ from diffusers.models import AutoencoderKL
 
 import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults
-from diffit.dist_util import setup_dist, dev, load_state_dict, get_rank, get_world_size
+from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
+from diffit.dist_util import dev, get_rank, get_world_size, load_state_dict, setup_dist
 
 
 @click.command()
@@ -38,7 +39,6 @@ from diffit.dist_util import setup_dist, dev, load_state_dict, get_rank, get_wor
 @click.option("--cfg-cond/--no-cfg-cond", default=True, show_default=True, help="Use classifier-free guidance")
 @click.option("--class-cond/--no-class-cond", default=True, show_default=True, help="Use class conditioning")
 @click.option("--use-ddim/--no-use-ddim", default=False, show_default=True, help="Use DDIM sampling")
-@click.option("--use-fp16/--no-use-fp16", default=False, show_default=True, help="Use FP16 inference")
 @click.option("--scale-pow", type=float, default=4.0, show_default=True, help="Power for cosine CFG schedule (256 only)")
 @click.option("--vae-decoder", type=click.Choice(["ema", "mse"]), default="ema", show_default=True, help="VAE decoder variant")
 @click.option("--decode-layer", type=int, default=None, help="Decode layer override")
@@ -56,7 +56,6 @@ def generate_samples(
     cfg_cond,
     class_cond,
     use_ddim,
-    use_fp16,
     scale_pow,
     vae_decoder,
     decode_layer,
@@ -88,8 +87,6 @@ def generate_samples(
     diffusion = create_diffusion(**diff_config)
 
     model.to(dev())
-    if use_fp16:
-        model.convert_to_fp16()
     model.eval()
 
     # VAE decoder
@@ -140,8 +137,8 @@ def generate_samples(
                 sample, _ = sample.chunk(2, dim=0)
 
             # Decode latent → image
-            sample = vae.decode(sample / 0.18215).sample
-            sample = ((sample + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+            sample = vae.decode(sample / VAE_SCALE_FACTOR).sample
+            sample = ((sample + 1) * PIXEL_NORM_HALF).clamp(0, UINT8_MAX).to(torch.uint8)
             sample = sample.permute(0, 2, 3, 1).contiguous()
 
             # Gather across GPUs
