@@ -67,8 +67,15 @@ This repo is an engineering refresh of the upstream [NVlabs/DiffiT](https://gith
 ```bash
 conda create -n diffit python=3.11 -y
 conda activate diffit
-pip install -r requirements.txt
+pip install -e .
 ```
+
+This installs the package (editable) along with its dependencies and the
+console entry-points used throughout this README: `diffit-train`,
+`diffit-sample`, `diffit-gen-images`, `diffit-eval`, `diffit-prepare-data`,
+and `diffit-download-models`. For development extras (tests + linter) use
+`pip install -e ".[dev]"`. A plain `pip install -r requirements.txt` still
+works if you prefer to invoke scripts as `python -m scripts.<name>`.
 
 
 ## Pre-download Models (Offline Nodes)
@@ -76,12 +83,12 @@ pip install -r requirements.txt
 The training script downloads two external models on first run. If your compute nodes have no internet access, run this **on a login node** first:
 
 ```bash
-python download_models.py
+diffit-download-models
 ```
 
 This caches the following models locally:
 - **stabilityai/sd-vae-ft-ema** (335 MB) — VAE for latent diffusion (`~/.cache/huggingface/`)
-- **stabilityai/sd-vae-ft-mse** (335 MB) — VAE variant for `gen_images.py --vae-decoder mse`
+- **stabilityai/sd-vae-ft-mse** (335 MB) — VAE variant for `diffit-gen-images --vae-decoder mse`
 - **InceptionV3** (104 MB) — for IS/FID metrics during training (`~/.cache/torch/hub/`)
 
 > If your compute nodes use a shared filesystem with the login node, the cached files will be available automatically. Otherwise, ensure `~/.cache/huggingface/` and `~/.cache/torch/hub/` are synced.
@@ -89,22 +96,22 @@ This caches the following models locally:
 
 ## Data Preparation
 
-Use `dataset_tool_for_imagenet.py` to convert an ImageNet-style directory into a ZIP archive with resized images and a `dataset.json` containing class labels.
+Use `diffit-prepare-data` to convert an ImageNet-style directory into a ZIP archive with resized images and a `dataset.json` containing class labels.
 
 ```
-python dataset_tool_for_imagenet.py \
+diffit-prepare-data \
     --source /path/to/ILSVRC \
     --dest ./datasets/imagenet_256x256.zip \
     --resolution 256x256 \
     --transform center-crop
 
-python dataset_tool_for_imagenet.py \
+diffit-prepare-data \
     --source /path/to/ILSVRC \
     --dest ./datasets/imagenet_512x512.zip \
     --resolution 512x512 \
     --transform center-crop
 
-python dataset_tool_for_imagenet.py \
+diffit-prepare-data \
     --source /path/to/ILSVRC \
     --dest ./datasets/imagenet_1024x1024.zip \
     --resolution 1024x1024 \
@@ -153,7 +160,7 @@ Total sequential: 3–5 months. Shrink `--kimg` to something reachable (e.g. `--
 #### 256² from scratch
 
 ```bash
-python train.py --outdir=./training-runs \
+diffit-train --outdir=./training-runs \
     --cfg=diffit-256 \
     --data=./datasets/imagenet_256x256.zip \
     --gpus 2 \
@@ -164,7 +171,7 @@ Global batch = 192. Per paper (Section I.2): LR 3e-4, batch 256, EMA 0.9999.
 #### 512² from scratch
 
 ```bash
-python train.py --outdir=./training-runs \
+diffit-train --outdir=./training-runs \
     --cfg=diffit-512 \
     --data=./datasets/imagenet_512x512.zip \
     --gpus 2 \
@@ -176,7 +183,7 @@ Global batch = 128. LR warmup is recommended for from-scratch high-res runs.
 #### 1024² from scratch
 
 ```bash
-python train.py --outdir=./training-runs \
+diffit-train --outdir=./training-runs \
     --cfg=diffit-1024 \
     --data=./datasets/imagenet_1024x1024.zip \
     --gpus 2 \
@@ -194,7 +201,7 @@ RoPE-2D lets you re-use a 256² checkpoint at higher resolutions — something t
 **Step 1. Train 256² from scratch** (same as Strategy A):
 
 ```bash
-python train.py --outdir=./training-runs \
+diffit-train --outdir=./training-runs \
     --cfg=diffit-256 \
     --data=./datasets/imagenet_256x256.zip \
     --gpus 2 \
@@ -205,7 +212,7 @@ Let it run until FID plateaus on the inline eval (check TensorBoard). For a stro
 **Step 2. Finetune 256² → 512²**:
 
 ```bash
-python train.py --outdir=./training-runs \
+diffit-train --outdir=./training-runs \
     --cfg=diffit-512 \
     --data=./datasets/imagenet_512x512.zip \
     --gpus 2 \
@@ -220,7 +227,7 @@ Lower LR (5e-5 ≈ half of the `diffit-512` default) for finetuning, short warmu
 **Step 3. Finetune 512² → 1024²**:
 
 ```bash
-python train.py --outdir=./training-runs \
+diffit-train --outdir=./training-runs \
     --cfg=diffit-1024 \
     --data=./datasets/imagenet_1024x1024.zip \
     --gpus 2 \
@@ -237,6 +244,10 @@ python train.py --outdir=./training-runs \
 
 ### SLURM sbatch scripts
 
+> The sbatch scripts invoke the `diffit-*` console entry points (and
+> `torchrun -m scripts.sample`), so make sure the cluster conda env has the
+> package installed once: `pip install -e .` after `conda activate diffit`.
+
 Pre-configured sbatch files are provided for H200:
 
 ```bash
@@ -246,7 +257,7 @@ sbatch train_2h200_1024x1024_prod.sbatch
 sbatch train_4h200_1024x1024_prod.sbatch
 ```
 
-For progressive finetuning, add `--resume=$PATH_TO_PREV_FINAL` to the sbatch's `python train.py ...` line and lower the LR as shown above.
+For progressive finetuning, add `--resume=$PATH_TO_PREV_FINAL` to the sbatch's `diffit-train ...` line and lower the LR as shown above.
 
 ### Chaining runs with SLURM dependencies
 
@@ -273,7 +284,7 @@ LATEST_CKPT=$(ls -t "$OUTDIR"/*/network-snapshot-*.pt 2>/dev/null | head -1)
 RESUME_FLAG=""
 [ -n "$LATEST_CKPT" ] && RESUME_FLAG="--resume=$LATEST_CKPT"
 
-python train.py \
+diffit-train \
     --outdir="$OUTDIR" \
     --cfg=diffit-256 \
     --data="$DATASET" \
@@ -286,7 +297,7 @@ python train.py \
 ### Resume from checkpoint (manual)
 
 ```bash
-python train.py --outdir=./training-runs \
+diffit-train --outdir=./training-runs \
     --cfg=diffit-256 \
     --data=./datasets/imagenet_256x256.zip \
     --gpus 2 \
@@ -364,7 +375,7 @@ tensorboard --logdir ./training-runs
 Generate individual PNG images for visual inspection:
 
 ```bash
-python gen_images.py \
+diffit-gen-images \
     --model-path ./training-runs/00000-diffit-256-gpus4-batch256/network-final.pt \
     --seeds 0-49 \
     --outdir ./generated/256 \
@@ -395,7 +406,7 @@ Generate 50K samples as `.npz` for FID evaluation:
 
 **ImageNet-256:**
 ```bash
-torchrun --nproc_per_node=4 sample.py \
+torchrun --nproc_per_node=4 -m scripts.sample \
     --model-path ./training-runs/00000-diffit-256-gpus4-batch256/network-final.pt \
     --outdir ./samples/256 \
     --image-size 256 \
@@ -408,7 +419,7 @@ torchrun --nproc_per_node=4 sample.py \
 
 **ImageNet-512:**
 ```bash
-torchrun --nproc_per_node=4 sample.py \
+torchrun --nproc_per_node=4 -m scripts.sample \
     --model-path ./training-runs/00000-diffit-512-gpus4-batch100/network-final.pt \
     --outdir ./samples/512 \
     --image-size 512 \
@@ -441,7 +452,7 @@ Quality metrics are computed **inline during training** every `snap` ticks. The 
 By default, 10000 samples are generated for each evaluation (configurable via `--num-fid-samples`). For a full FID-50K evaluation, use the standalone evaluator:
 
 ```bash
-python evaluator.py \
+diffit-eval \
     --ref-batch ./VIRTUAL_imagenet256_labeled.npz \
     --sample-batch ./samples/256/samples_50000x256x256x3.npz
 ```
@@ -493,14 +504,17 @@ DiffiT-v2/
 │   ├── timestep_sampler.py         # Timestep sampling strategies
 │   ├── diffusion_utils.py          # KL divergence & likelihood
 │   └── pos_emb.py                  # Positional embeddings (CoordConv, Swin)
-├── train.py                         # Training script (DDP, click CLI)
-├── sample.py                        # Bulk sampling for FID (.npz output)
-├── gen_images.py                    # Individual PNG generation (click CLI)
-├── evaluator.py                     # FID/IS evaluation (PyTorch)
-├── dataset_tool_for_imagenet.py     # ImageNet -> ZIP dataset converter
-├── download_models.py               # Pre-download VAE + InceptionV3 for offline nodes
-├── eval_run.sh                      # Evaluation convenience script
+├── scripts/                         # Command-line entry points (installed as diffit-*)
+│   ├── train.py                    # Training (DDP, click CLI)      -> diffit-train
+│   ├── sample.py                   # Bulk FID sampling (.npz)       -> diffit-sample
+│   ├── gen_images.py               # Individual PNG generation      -> diffit-gen-images
+│   ├── evaluator.py                # FID/IS evaluation (PyTorch)    -> diffit-eval
+│   ├── dataset_tool_for_imagenet.py # ImageNet -> ZIP converter     -> diffit-prepare-data
+│   └── download_models.py          # Pre-download VAE + InceptionV3 -> diffit-download-models
 ├── tests/                           # CPU smoke tests (forward, diffusion, RoPE)
+├── eval_run.sh                      # Evaluation convenience script
+├── pyproject.toml                   # Packaging, entry points, ruff/pytest config
+├── .github/workflows/ci.yml         # CI: ruff lint + pytest smoke tests
 ├── sbatch/                          # SLURM job scripts
 │   ├── a100/                       # A100 cluster (2 GPU)
 │   │   ├── train_2_gpu_256x256.sbatch
@@ -517,7 +531,7 @@ DiffiT-v2/
 │       ├── generate_4_gpu_512x512.sbatch
 │       ├── sample_4_gpu_256x256.sbatch
 │       └── sample_4_gpu_512x512.sbatch
-├── requirements.txt                 # Python dependencies
+├── requirements.txt                 # Python dependencies (also declared in pyproject.toml)
 └── README.md
 ```
 

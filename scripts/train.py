@@ -33,26 +33,21 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 from diffusers.models import AutoencoderKL
 from torch.nn.parallel import DistributedDataParallel as DDP
-from tqdm import tqdm
 
 import diffit.diffit as diffit_module
-from diffit import create_diffusion, diffusion_defaults
+from diffit import create_diffusion, diffusion_defaults, logger
 from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
-from diffit.dist_util import setup_dist, dev, get_rank, get_world_size, synchronize
+from diffit.dpm_solver import dpm_solver_sample
 from diffit.image_datasets import load_data
 from diffit.inception import InceptionFeatureExtractor
-from diffit.nn import update_ema
-from diffit import logger
-from diffit.timestep_sampler import create_named_schedule_sampler
-from diffit.dpm_solver import dpm_solver_sample
 from diffit.metrics import (
     compute_activations,
     evaluate_metrics,
 )
-
+from diffit.nn import update_ema
+from diffit.timestep_sampler import create_named_schedule_sampler
 
 # ---------------------------------------------------------------------------
 # Image grid utilities (matching SAN-v2 style)
@@ -342,7 +337,7 @@ def training_loop(
     ref_acts = None
     if is_main and num_fid_samples > 0:
         logger.log("Loading InceptionV3 for metric evaluation...")
-        from torchvision.models import inception_v3, Inception_V3_Weights
+        from torchvision.models import Inception_V3_Weights, inception_v3
         inception_model = inception_v3(weights=Inception_V3_Weights.DEFAULT).eval().to(device)
         inception_extractor = InceptionFeatureExtractor(inception_model)
 
@@ -373,7 +368,6 @@ def training_loop(
         logger.log("Exporting sample images (reals.png, fakes_init.png)...")
         # Collect images per class
         class_images = {c: [] for c in sorted_class_list}
-        images_per_class_needed = gw
         collect_iter = load_data(
             data_dir=data, batch_size=64, image_size=image_size,
             class_cond=True, random_flip=False, num_workers=2,

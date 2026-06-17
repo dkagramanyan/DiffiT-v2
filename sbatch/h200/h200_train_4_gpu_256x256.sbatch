@@ -42,7 +42,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 export TORCH_EXTENSIONS_DIR="${HOME}/.cache/torch_extensions"
 export CUDA_CACHE_PATH="${HOME}/.cache/cuda_cache"
 
-python train.py --outdir=./runs/diffit_h200_51 \
+diffit-train --outdir=./runs/diffit_h200_51 \
         --cfg=diffit-256 \
         --data=./datasets/imagenet_256x256.zip \
         --gpus=4 \

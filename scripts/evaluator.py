@@ -19,7 +19,6 @@ Usage:
 
 import argparse
 import os
-import tempfile
 import warnings
 
 import numpy as np

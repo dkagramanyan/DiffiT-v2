@@ -33,7 +33,7 @@ echo "Start time : $(date)"
 echo "────────────────────────────────────"
 
 # ── Train ──────────────────────────────────────────────────────────────────────
-python "$PROJECT_DIR/train.py" \
+diffit-train \
     --outdir="$OUTDIR" \
     --cfg=diffit-256 \
     --data="$DATASET" \

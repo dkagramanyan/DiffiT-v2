@@ -34,7 +34,7 @@ conda list | grep -E "torch|cuda|cudnn|ninja"
 
 export TORCH_CUDA_ARCH_LIST="9.0"
 
-python gen_images.py \
+diffit-gen-images \
   --model-path ./runs/CHANGE_ME/network-final.pt \
   --seeds 0-49 \
   --outdir ./generated/512 \

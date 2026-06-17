@@ -14,7 +14,7 @@ from diffit.constants import INCEPTION_MEAN, INCEPTION_STD
 
 def load_inception_model(device):
     """Load InceptionV3 (torchvision DEFAULT weights) in eval mode on ``device``."""
-    from torchvision.models import inception_v3, Inception_V3_Weights
+    from torchvision.models import Inception_V3_Weights, inception_v3
 
     model = inception_v3(weights=Inception_V3_Weights.DEFAULT)
     model.eval()

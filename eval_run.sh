@@ -14,7 +14,7 @@ SAMPLE_BATCH=$(ls ${SAMPLE_DIR}/samples_*.npz 2>/dev/null | head -1)
 
 if [ -z "$SAMPLE_BATCH" ]; then
     echo "Error: No samples .npz found in ${SAMPLE_DIR}"
-    echo "Run sample.py first to generate samples."
+    echo "Run 'torchrun -m scripts.sample' first to generate samples."
     exit 1
 fi
 
@@ -22,4 +22,4 @@ echo "Reference: ${REF_BATCH}"
 echo "Samples:   ${SAMPLE_BATCH}"
 echo ""
 
-python evaluator.py --ref-batch "${REF_BATCH}" --sample-batch "${SAMPLE_BATCH}"
+diffit-eval --ref-batch "${REF_BATCH}" --sample-batch "${SAMPLE_BATCH}"

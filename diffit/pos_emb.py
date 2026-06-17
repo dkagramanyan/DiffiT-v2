@@ -1,10 +1,8 @@
 import pickle
 
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.modules.conv as conv
-import numpy as np
-
 
 FORCE_DEPLOY = False
 global bias_indx

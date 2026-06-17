@@ -11,3 +11,7 @@ experiments/logs/*
 __pycache__/
 *.py[cod]
 .pytest_cache/
+# Editable-install / build artifacts
+*.egg-info/
+build/
+dist/

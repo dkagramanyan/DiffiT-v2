@@ -7,7 +7,6 @@ math against accidental regressions during refactors. Run with:
     pytest tests/ -q
 """
 
-import numpy as np
 import pytest
 import torch
 

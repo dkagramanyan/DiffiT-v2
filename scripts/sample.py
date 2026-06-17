@@ -24,7 +24,7 @@ from diffusers.models import AutoencoderKL
 import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults
 from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
-from diffit.dist_util import setup_dist, dev, load_state_dict, get_rank, get_world_size
+from diffit.dist_util import dev, get_rank, get_world_size, load_state_dict, setup_dist
 
 
 @click.command()

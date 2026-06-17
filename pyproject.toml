@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diffit"
+version = "2.0.0"
+description = "DiffiT: Diffusion Vision Transformers for Image Generation (v2 performance refresh)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "NVIDIA Source Code License-NC" }
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "timm==0.9.16",
+    "diffusers>=0.26.3",
+    "tqdm>=4.64.1",
+    "click>=8.0",
+    "numpy>=1.24.0",
+    "Pillow>=9.0",
+    "safetensors>=0.3.0",
+    "scipy>=1.10.0,<=1.14.1",
+    "accelerate>=0.27.2",
+    "tensorboard>=2.14.0",
+    "psutil>=5.9.0",
+    "h5py>=3.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.4.0",
+]
+
+# Console entry-points. After `pip install -e .` these are available on PATH.
+# (For distributed sampling use `torchrun ... -m scripts.sample` instead, since
+# torchrun launches the module itself.)
+[project.scripts]
+diffit-train = "scripts.train:main"
+diffit-sample = "scripts.sample:generate_samples"
+diffit-gen-images = "scripts.gen_images:generate_images"
+diffit-eval = "scripts.evaluator:main"
+diffit-prepare-data = "scripts.dataset_tool_for_imagenet:convert_dataset"
+diffit-download-models = "scripts.download_models:main"
+
+[tool.setuptools]
+packages = ["diffit", "scripts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+# experiments/ is research scratch code; don't hold it to the same bar.
+extend-exclude = ["experiments"]
+
+[tool.ruff.lint]
+# Pragmatic set for a research codebase: pyflakes (F, real problems) and import
+# sorting (I). pycodestyle style noise (E4/E7 multi-statement, import position)
+# is intentionally not enforced — those patterns are common in ML entry scripts.
+select = ["F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# dpm_solver keeps a couple of named log-SNR intermediates for readability of
+# the sampling math even though they are not all consumed.
+"diffit/dpm_solver.py" = ["F841"]

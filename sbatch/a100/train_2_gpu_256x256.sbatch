@@ -17,7 +17,7 @@ source activate diffit
 
 cd ..
 
-python train.py --outdir=./training-runs \
+diffit-train --outdir=./training-runs \
         --cfg=diffit-256 \
         --data=./datasets/imagenet_256x256.zip \
         --gpus=2 \

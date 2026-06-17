@@ -20,7 +20,7 @@ cd ..
 MODEL="./training-runs/CHANGE_ME/network-final.pt"
 OUTDIR="./samples/256"
 
-torchrun --nproc_per_node=4 sample.py \
+torchrun --nproc_per_node=4 -m scripts.sample \
     --model-path $MODEL \
     --outdir $OUTDIR \
     --image-size 256 \
