@@ -15,6 +15,8 @@ import numpy as np
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
+from diffit.constants import PIXEL_NORM_HALF
+
 
 def load_data(
     *,
@@ -162,7 +164,7 @@ class ImageDataset(Dataset):
         if self.random_flip and random.random() < 0.5:
             arr = arr[:, ::-1]
 
-        arr = arr.astype(np.float32) / 127.5 - 1
+        arr = arr.astype(np.float32) / PIXEL_NORM_HALF - 1
 
         out_dict = {}
         if self.classes is not None:
@@ -247,7 +249,7 @@ class ZipImageDataset(Dataset):
         if self.random_flip and random.random() < 0.5:
             arr = arr[:, ::-1]
 
-        arr = arr.astype(np.float32) / 127.5 - 1
+        arr = arr.astype(np.float32) / PIXEL_NORM_HALF - 1
 
         out_dict = {}
         if self.class_cond and fname in self._labels:

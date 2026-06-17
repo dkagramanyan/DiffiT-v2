@@ -20,6 +20,7 @@ Single GPU:
 """
 
 import copy
+import dataclasses
 import json
 import os
 import re
@@ -39,14 +40,15 @@ from tqdm import tqdm
 
 import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults
+from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
 from diffit.dist_util import setup_dist, dev, get_rank, get_world_size, synchronize
 from diffit.image_datasets import load_data
+from diffit.inception import InceptionFeatureExtractor
 from diffit.nn import update_ema
 from diffit import logger
 from diffit.timestep_sampler import create_named_schedule_sampler
 from diffit.dpm_solver import dpm_solver_sample
 from diffit.metrics import (
-    InceptionFeatureExtractor,
     compute_activations,
     evaluate_metrics,
 )
@@ -61,8 +63,8 @@ def save_image_grid(img, fname, drange, grid_size):
     """Save a grid of images as a single PNG (SAN-v2 style)."""
     lo, hi = drange
     img = np.asarray(img, dtype=np.float32)
-    img = (img - lo) * (255 / (hi - lo))
-    img = np.rint(img).clip(0, 255).astype(np.uint8)
+    img = (img - lo) * (UINT8_MAX / (hi - lo))
+    img = np.rint(img).clip(0, UINT8_MAX).astype(np.uint8)
 
     gw, gh = grid_size
     _N, C, H, W = img.shape
@@ -115,8 +117,8 @@ def generate_snapshot_images(
                 noise=z_cfg,
             )
             sample, _ = sample.chunk(2, dim=0)
-            decoded = vae.decode(sample.float() / 0.18215).sample
-        decoded = ((decoded + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+            decoded = vae.decode(sample.float() / VAE_SCALE_FACTOR).sample
+        decoded = ((decoded + 1) * PIXEL_NORM_HALF).clamp(0, UINT8_MAX).to(torch.uint8)
         all_samples.append(decoded.permute(0, 2, 3, 1).cpu().numpy())
 
     # Return as NCHW uint8 for save_image_grid
@@ -354,7 +356,7 @@ def training_loop(
         n_collected = 0
         while n_collected < num_fid_samples:
             batch_ref, _ = next(ref_iter)
-            batch_np = ((batch_ref + 1) * 127.5).clamp(0, 255).to(torch.uint8).numpy()
+            batch_np = ((batch_ref + 1) * PIXEL_NORM_HALF).clamp(0, UINT8_MAX).to(torch.uint8).numpy()
             ref_images.append(batch_np)
             n_collected += batch_np.shape[0]
         ref_images = np.concatenate(ref_images, axis=0)[:num_fid_samples]
@@ -389,7 +391,7 @@ def training_loop(
             for i in range(img_batch.shape[0]):
                 c = int(cond_batch["y"][i].item())
                 if c in class_images and len(class_images[c]) < class_count_needed.get(c, 0):
-                    img_np = ((img_batch[i:i+1] + 1) * 127.5).clamp(0, 255).to(torch.uint8).numpy()
+                    img_np = ((img_batch[i:i+1] + 1) * PIXEL_NORM_HALF).clamp(0, UINT8_MAX).to(torch.uint8).numpy()
                     class_images[c].append(img_np)
 
         # Assemble grid: row by row
@@ -476,7 +478,7 @@ def training_loop(
 
             # Encode to latent space
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype_torch, enabled=amp_enabled):
-                latent = vae.encode(batch).latent_dist.sample() * 0.18215
+                latent = vae.encode(batch).latent_dist.sample() * VAE_SCALE_FACTOR
 
             # Sample timesteps
             t, weights = schedule_sampler.sample(latent.shape[0], device)
@@ -740,56 +742,40 @@ def launch_training(c, desc, outdir, dry_run):
 # Base configurations (selected via --cfg, like SAN-v2)
 # ---------------------------------------------------------------------------
 
+@dataclasses.dataclass(frozen=True)
+class TrainConfig:
+    """Preset training hyperparameters selected via ``--cfg``.
+
+    These are the values that used to live in the ``BASE_CONFIGS`` dicts, now
+    typed and with shared defaults factored out. Any field can still be
+    overridden from the command line (see ``main``). Fields that differ between
+    presets are passed explicitly below; everything else uses the defaults.
+    """
+
+    image_size: int
+    cfg_scale: float
+    lr: float
+    model_name: str = "Diffit"
+    total_kimg: int = 400000
+    kimg_per_tick: int = 4
+    snap: int = 50
+    ema_rate: float = 0.9999
+    use_fp16: bool = True
+    schedule_sampler_name: str = "uniform"
+    num_fid_samples: int = 10000
+    grad_accum_steps: int = 1
+    gradient_checkpointing: bool = False
+    lr_warmup_kimg: int = 0
+
+
 BASE_CONFIGS = {
-    "diffit-256": dict(
-        image_size=256,
-        model_name="Diffit",
-        lr=3e-4,
-        total_kimg=400000,
-        kimg_per_tick=4,
-        snap=50,
-        ema_rate=0.9999,
-        use_fp16=True,
-        schedule_sampler_name="uniform",
-        num_fid_samples=10000,
-        cfg_scale=4.4,
-        grad_accum_steps=1,
-        gradient_checkpointing=False,
-        lr_warmup_kimg=0,
-    ),
-    "diffit-512": dict(
-        image_size=512,
-        model_name="Diffit",
-        lr=1e-4,
-        total_kimg=400000,
-        kimg_per_tick=4,
-        snap=50,
-        ema_rate=0.9999,
-        use_fp16=True,
-        schedule_sampler_name="uniform",
-        num_fid_samples=10000,
-        cfg_scale=1.49,
-        grad_accum_steps=1,
-        gradient_checkpointing=False,
-        lr_warmup_kimg=0,
-    ),
-    "diffit-1024": dict(
-        image_size=1024,
-        model_name="Diffit",
-        lr=1e-4,
-        total_kimg=400000,
-        kimg_per_tick=4,
-        snap=50,
-        ema_rate=0.9999,
-        use_fp16=True,
-        schedule_sampler_name="uniform",
-        num_fid_samples=10000,
-        cfg_scale=1.49,
-        # 1024² is memory-bound: enable checkpointing by default and
-        # use 2-step accumulation to double the effective batch.
-        grad_accum_steps=2,
-        gradient_checkpointing=True,
-        lr_warmup_kimg=1000,
+    "diffit-256": TrainConfig(image_size=256, lr=3e-4, cfg_scale=4.4),
+    "diffit-512": TrainConfig(image_size=512, lr=1e-4, cfg_scale=1.49),
+    # 1024² is memory-bound: enable checkpointing by default and use 2-step
+    # accumulation to double the effective batch.
+    "diffit-1024": TrainConfig(
+        image_size=1024, lr=1e-4, cfg_scale=1.49,
+        grad_accum_steps=2, gradient_checkpointing=True, lr_warmup_kimg=1000,
     ),
 }
 
@@ -839,65 +825,67 @@ def main(**kwargs):
     """Train DiffiT on class-conditional ImageNet."""
     opts = kwargs
 
-    # Start from base configuration.
-    cfg = dict(BASE_CONFIGS[opts["cfg"]])
-
-    # CLI overrides: any explicitly provided option takes precedence.
+    # Start from base configuration, then apply CLI overrides: any explicitly
+    # provided option takes precedence. (None means "not provided".)
+    overrides = {}
     if opts["image_size"] is not None:
-        cfg["image_size"] = opts["image_size"]
+        overrides["image_size"] = opts["image_size"]
     if opts["model_name"] is not None:
-        cfg["model_name"] = opts["model_name"]
+        overrides["model_name"] = opts["model_name"]
     if opts["kimg"] is not None:
-        cfg["total_kimg"] = opts["kimg"]
+        overrides["total_kimg"] = opts["kimg"]
     if opts["tick"] is not None:
-        cfg["kimg_per_tick"] = opts["tick"]
+        overrides["kimg_per_tick"] = opts["tick"]
     if opts["snap"] is not None:
-        cfg["snap"] = opts["snap"]
+        overrides["snap"] = opts["snap"]
     if opts["lr"] is not None:
-        cfg["lr"] = opts["lr"]
+        overrides["lr"] = opts["lr"]
     if opts["fp32"] is not None:
-        cfg["use_fp16"] = not opts["fp32"]
+        overrides["use_fp16"] = not opts["fp32"]
     if opts["ema_rate"] is not None:
-        cfg["ema_rate"] = opts["ema_rate"]
+        overrides["ema_rate"] = opts["ema_rate"]
     if opts["schedule_sampler_name"] is not None:
-        cfg["schedule_sampler_name"] = opts["schedule_sampler_name"]
+        overrides["schedule_sampler_name"] = opts["schedule_sampler_name"]
     if opts["num_fid_samples"] is not None:
-        cfg["num_fid_samples"] = opts["num_fid_samples"]
+        overrides["num_fid_samples"] = opts["num_fid_samples"]
     if opts["cfg_scale"] is not None:
-        cfg["cfg_scale"] = opts["cfg_scale"]
+        overrides["cfg_scale"] = opts["cfg_scale"]
     if opts["grad_accum"] is not None:
-        cfg["grad_accum_steps"] = opts["grad_accum"]
+        overrides["grad_accum_steps"] = opts["grad_accum"]
     if opts["gradient_checkpointing"] is not None:
-        cfg["gradient_checkpointing"] = opts["gradient_checkpointing"]
+        overrides["gradient_checkpointing"] = opts["gradient_checkpointing"]
     if opts["lr_warmup"] is not None:
-        cfg["lr_warmup_kimg"] = opts["lr_warmup"]
+        overrides["lr_warmup_kimg"] = opts["lr_warmup"]
 
-    # Build full config dict.
+    cfg = dataclasses.replace(BASE_CONFIGS[opts["cfg"]], **overrides)
+
+    # Build full config dict (kept as a plain dict for JSON serialization and
+    # spawn/**kwargs unpacking into training_loop).
     c = dict(
         data=opts["data"],
-        image_size=cfg["image_size"],
+        image_size=cfg.image_size,
         num_gpus=opts["gpus"],
         batch_size=opts["batch_gpu"] * opts["gpus"],
         batch_gpu=opts["batch_gpu"],
-        total_kimg=cfg["total_kimg"],
-        kimg_per_tick=cfg["kimg_per_tick"],
-        snap=cfg["snap"],
+        total_kimg=cfg.total_kimg,
+        kimg_per_tick=cfg.kimg_per_tick,
+        snap=cfg.snap,
         seed=opts["seed"],
-        lr=cfg["lr"],
-        use_fp16=cfg["use_fp16"],
+        lr=cfg.lr,
+        use_fp16=cfg.use_fp16,
         amp_dtype=opts["amp_dtype"],
-        ema_rate=cfg["ema_rate"],
+        ema_rate=cfg.ema_rate,
         resume=opts["resume"],
-        model_name=cfg["model_name"],
-        schedule_sampler_name=cfg["schedule_sampler_name"],
+        model_name=cfg.model_name,
+        schedule_sampler_name=cfg.schedule_sampler_name,
         allow_tf32=opts["allow_tf32"],
         workers=opts["workers"],
         cache_in_ram=opts["cache_in_ram"],
-        num_fid_samples=cfg["num_fid_samples"],
-        cfg_scale=cfg["cfg_scale"],
-        grad_accum_steps=cfg["grad_accum_steps"],
-        gradient_checkpointing=cfg["gradient_checkpointing"],
-        lr_warmup_kimg=cfg["lr_warmup_kimg"],
+        num_fid_samples=cfg.num_fid_samples,
+        cfg_scale=cfg.cfg_scale,
+        grad_accum_steps=cfg.grad_accum_steps,
+        gradient_checkpointing=cfg.gradient_checkpointing,
+        lr_warmup_kimg=cfg.lr_warmup_kimg,
         log_interval=10,
         save_interval=10000,
     )

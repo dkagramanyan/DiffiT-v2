@@ -1,10 +1,13 @@
 
 datasets/*
-diffit/__pycache__/*
 training-runs/*
 *.log
 
 logs/*
 experiments/runs/*
 experiments/logs/*
-experiments/__pycache__/*
+
+# Python caches (any directory)
+__pycache__/
+*.py[cod]
+.pytest_cache/

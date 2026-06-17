@@ -8,7 +8,7 @@ For business inquiries, please visit our website and submit the form: [NVIDIA Re
 
 **DiffiT** (Diffusion Vision Transformers) is a generative model that combines the expressive power of diffusion models with Vision Transformers (ViTs), introducing **Time-dependent Multihead Self Attention (TMSA)** for fine-grained control over the denoising at each timestep. DiffiT achieves SOTA performance on class-conditional ImageNet generation at multiple resolutions, notably an **FID score of 1.73** on ImageNet-256.
 
-**DiffiT-v2** is a performance refresh of this codebase. TMSA is preserved exactly as defined in the paper (Section 3.2, Eqs 3–5). What changes is the attention plumbing around it — the learned relative-position bias is replaced with **RoPE-2D** so SDPA can dispatch to FlashAttention, **QK-norm** is added for bf16 stability, LayerNorm becomes RMSNorm, and the MLP switches to SwiGLU. Training and sampling are rebuilt around `torchrun`, `torch.compile`, and `click`. See the [v2 release notes](#v2-changes-at-a-glance) below.
+**DiffiT-v2** is a performance refresh of this codebase. TMSA is preserved exactly as defined in the paper (Section 3.2, Eqs 3–5). What changes is the attention plumbing around it — the learned relative-position bias is replaced with **RoPE-2D** so SDPA can dispatch to FlashAttention, **QK-norm** is added for bf16 stability, LayerNorm becomes RMSNorm, and the MLP switches to SwiGLU. Training and sampling are rebuilt around `torchrun`, `torch.compile`, and `click`. See [Differences from the original NVlabs/DiffiT](#differences-from-the-original-nvlabsdiffit) below.
 
 ![teaser](./assets/imagenet.png)
 
@@ -21,7 +21,11 @@ For business inquiries, please visit our website and submit the form: [NVIDIA Re
 - **[04.02.2024]** Updated [manuscript](https://arxiv.org/abs/2312.02139) now available on arXiv!
 - **[12.04.2023]** Paper is published on arXiv!
 
-## v2 changes at a glance
+## Differences from the original NVlabs/DiffiT
+
+This repo is an engineering refresh of the upstream [NVlabs/DiffiT](https://github.com/NVlabs/DiffiT). The model's core contribution — **Time-dependent Multihead Self-Attention (TMSA)** — is preserved exactly as in the paper (Eqs 3–5, Fig 7b), and the parameter count stays at **561M** (matches Table 9). The changes are to the *engineering* around it: the attention internals, the training/sampling infrastructure, and the latent pipeline.
+
+**Architecture (per-block attention internals):**
 
 | Change | What it does | Why |
 |---|---|---|
@@ -31,11 +35,18 @@ For business inquiries, please visit our website and submit the form: [NVIDIA Re
 | **SwiGLU** MLP | Matched-param `hidden × 8/3` inner width, rounded to 64 | Modern FFN; small consistent quality gain. |
 | **TMSA preserved** | Additive time-token QKV projection | Paper's core contribution (Eqs 3–5, Fig 7b). Parameter count stays at **561M** — matches Table 9 of the paper. |
 | **CFG split fix** | Split at `self.in_channels` (=4 for SD-VAE) | Original code hardcoded `:3` which was wrong for 4-channel latents. |
-| **`torchrun` + `torch.compile`** | Modern distributed launch | Replaces MPI; `max-autotune` mode enabled for training. |
+
+**Pipeline, training & sampling infrastructure:**
+
+- **Latent diffusion** — operates in the Stable-Diffusion VAE latent space (`stabilityai/sd-vae-ft-ema`, scaled by `0.18215`), so the transformer denoises 4-channel latents rather than pixels.
+- **`torchrun` + `torch.compile`** — modern distributed launch (replaces MPI); `max-autotune` mode (with CUDA graphs, or `no-cudagraphs` when gradient checkpointing is on) for both training and eval. Fused AdamW, DDP with `no_sync()` gradient accumulation.
+- **kimg/tick training loop** with inline, **distributed** quality metrics (FID / IS / sFID / Precision / Recall) computed every `snap` ticks during training — no separate eval job needed.
+- **DPM-Solver++** for fast training-time sample snapshots; DDPM/DDIM available for full FID-50K sampling.
+- **CFG schedule** — power-cosine CFG schedule at 256² (`input_size ≤ 32`), constant CFG scale at 512²/1024².
 
 **Expected performance** (vs. original DiffiT): ~1.1–1.3× at 256², ~1.8–2.5× at 512², **~3–5× at 1024²** — dominated by FlashAttention at high resolution. Quality impact: ±0.1–0.3 FID, directionally positive.
 
-> **⚠️ Checkpoints from the original DiffiT are not compatible with v2** — parameter names and shapes changed. See the release notes for details.
+> **⚠️ Checkpoints from the original DiffiT are not compatible with v2** — parameter names and shapes changed (learned position bias removed, RoPE/QK-norm/SwiGLU added).
 
 ## Models
 
@@ -288,7 +299,7 @@ python train.py --outdir=./training-runs \
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--outdir` | required | Output directory for training runs |
-| `--cfg` | required | Base configuration (`diffit-256`, `diffit-512`) |
+| `--cfg` | required | Base configuration (`diffit-256`, `diffit-512`, `diffit-1024`) |
 | `--data` | required | Path to dataset directory or .zip |
 | `--gpus` | required | Number of GPUs |
 | `--batch-gpu` | required | Batch size per GPU (total batch = batch-gpu * gpus) |
@@ -299,12 +310,20 @@ python train.py --outdir=./training-runs \
 | `--snap` | from cfg | Snapshot save interval (ticks) |
 | `--seed` | 0 | Random seed |
 | `--lr` | from cfg | Learning rate override |
-| `--fp32` | from cfg | Disable mixed precision |
+| `--fp32` | from cfg | Disable mixed precision (sets `use_fp16=False`) |
+| `--amp-dtype` | bf16 | AMP dtype: `fp16` or `bf16` (bf16 preferred on A100/H100) |
 | `--ema-rate` | from cfg | EMA decay rate override |
 | `--resume` | None | Path to checkpoint for resuming |
 | `--schedule-sampler` | from cfg | Timestep sampler override |
-| `--num-fid-samples` | 2048 | Samples for FID/IS eval during training (0=disable) |
+| `--cfg-scale` | from cfg | CFG scale used during training-time eval |
+| `--num-fid-samples` | from cfg (10000) | Samples for FID/IS eval during training (0=disable) |
+| `--grad-accum` | from cfg | Gradient accumulation steps (effective batch = batch-gpu × gpus × accum) |
+| `--grad-ckpt / --no-grad-ckpt` | from cfg | Toggle gradient checkpointing (trades compute for memory) |
+| `--lr-warmup` | from cfg | Linear LR warmup duration in kimg (0 = disabled) |
+| `--tf32 / --no-tf32` | tf32 on | Enable TF32 for matmul/conv |
 | `--workers` | 4 | DataLoader worker processes |
+| `--cache-in-ram / --no-cache-in-ram` | cache on | Cache entire dataset in RAM to reduce disk I/O |
+| `-n, --dry-run` | off | Print resolved training options and exit |
 
 ### Training output
 
@@ -329,7 +348,7 @@ training-runs/00000-diffit-256-gpus4-batch256/
 └── network-final.pt              # Final trained model
 ```
 
-Quality metrics (**IS**, **FID**, **sFID**, **Precision**, **Recall**) are computed automatically every `snap` ticks during training using 2048 samples by default. Results are logged to TensorBoard under `Metrics/` and to `stats.jsonl`. Adjust with `--num-fid-samples` (set to 0 to disable).
+Quality metrics (**IS**, **FID**, **sFID**, **Precision**, **Recall**) are computed automatically every `snap` ticks during training using 10000 samples by default (configurable per `--cfg`). Results are logged to TensorBoard under `Metrics/` and to `stats.jsonl`. Adjust with `--num-fid-samples` (set to 0 to disable).
 
 Monitor training with TensorBoard:
 
@@ -419,7 +438,7 @@ Quality metrics are computed **inline during training** every `snap` ticks. The 
 - **Precision** — fraction of generated samples in the real data manifold
 - **Recall** — fraction of real samples covered by the generated manifold
 
-By default, 2048 samples are generated for each evaluation (configurable via `--num-fid-samples`). For a full FID-50K evaluation, use the standalone evaluator:
+By default, 10000 samples are generated for each evaluation (configurable via `--num-fid-samples`). For a full FID-50K evaluation, use the standalone evaluator:
 
 ```bash
 python evaluator.py \
@@ -444,6 +463,16 @@ python evaluator.py \
 > **Note:** Small variations in the reported numbers are expected depending on the device used for sampling and due to numerical precision differences.
 
 
+## Tests
+
+A lightweight CPU smoke-test suite guards the model's forward contract and the
+core diffusion math (no GPU, dataset, or external weights required):
+
+```bash
+pip install pytest
+pytest tests/ -q
+```
+
 ## Project Structure
 
 ```
@@ -451,13 +480,16 @@ DiffiT-v2/
 ├── diffit/                          # Core model architecture
 │   ├── __init__.py                 # Diffusion creation & defaults
 │   ├── diffit.py                   # DiffiT model (ViT + TMSA)
+│   ├── constants.py                # Shared numeric constants (VAE scale, norm)
 │   ├── gaussian_diffusion.py       # Diffusion process (DDPM/DDIM)
+│   ├── dpm_solver.py               # DPM-Solver++ fast sampler
 │   ├── respace.py                  # Timestep respacing
 │   ├── dist_util.py                # Distributed training (PyTorch DDP)
 │   ├── image_datasets.py           # Dataset loading (dir/zip + DistributedSampler)
+│   ├── inception.py                # Shared InceptionV3 feature extractor (FID/IS)
+│   ├── metrics.py                  # Inline FID/IS/sFID/Precision/Recall
 │   ├── logger.py                   # Logging (stdout, JSON, CSV, TensorBoard)
-│   ├── fp16_util.py                # Mixed precision training
-│   ├── nn.py                       # Neural network utilities
+│   ├── nn.py                       # Neural network utilities (EMA, etc.)
 │   ├── timestep_sampler.py         # Timestep sampling strategies
 │   ├── diffusion_utils.py          # KL divergence & likelihood
 │   └── pos_emb.py                  # Positional embeddings (CoordConv, Swin)
@@ -468,6 +500,7 @@ DiffiT-v2/
 ├── dataset_tool_for_imagenet.py     # ImageNet -> ZIP dataset converter
 ├── download_models.py               # Pre-download VAE + InceptionV3 for offline nodes
 ├── eval_run.sh                      # Evaluation convenience script
+├── tests/                           # CPU smoke tests (forward, diffusion, RoPE)
 ├── sbatch/                          # SLURM job scripts
 │   ├── a100/                       # A100 cluster (2 GPU)
 │   │   ├── train_2_gpu_256x256.sbatch

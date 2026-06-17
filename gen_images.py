@@ -57,6 +57,7 @@ from tqdm.auto import tqdm
 
 import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults
+from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
 from diffit.dist_util import load_state_dict
 
 
@@ -349,8 +350,8 @@ def _run_sampling(model, vae, diffusion, dev, latent_size, num_classes,
     )
     sample, _ = sample.chunk(2, dim=0)
 
-    sample = vae.decode(sample / 0.18215).sample
-    sample = ((sample + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+    sample = vae.decode(sample / VAE_SCALE_FACTOR).sample
+    sample = ((sample + 1) * PIXEL_NORM_HALF).clamp(0, UINT8_MAX).to(torch.uint8)
     return sample.permute(0, 2, 3, 1).cpu().numpy()
 
 

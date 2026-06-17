@@ -48,6 +48,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults
+from diffit.constants import VAE_SCALE_FACTOR
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +187,8 @@ def cosine_distance(
             num_steps=num_steps, noise_seed=base_seed + batch_idx + 10000,
         )
 
-        img_a = vae.decode(img_a_lat / 0.18215).sample
-        img_b = vae.decode(img_b_lat / 0.18215).sample
+        img_a = vae.decode(img_a_lat / VAE_SCALE_FACTOR).sample
+        img_b = vae.decode(img_b_lat / VAE_SCALE_FACTOR).sample
 
         # Cosine distance on flattened decoded pixels
         a_flat = img_a.reshape(bs, -1).float()

@@ -27,6 +27,9 @@ import torch
 from scipy import linalg
 from tqdm.auto import tqdm
 
+from diffit.constants import UINT8_MAX
+from diffit.inception import InceptionFeatureExtractor, load_inception_model
+
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate FID and other metrics")
@@ -86,80 +89,11 @@ def main():
 
 
 # ---------------------------------------------------------------------------
-# Inception model
-# ---------------------------------------------------------------------------
-
-def load_inception_model(device):
-    """Load InceptionV3 for FID computation using torchvision."""
-    from torchvision.models import inception_v3, Inception_V3_Weights
-
-    model = inception_v3(weights=Inception_V3_Weights.DEFAULT)
-    model.eval()
-    model.to(device)
-    return model
-
-
-class InceptionFeatureExtractor(torch.nn.Module):
-    """Extract pool and spatial features from InceptionV3."""
-
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    @torch.no_grad()
-    def forward(self, x):
-        # x: (N, 3, 299, 299) in [0, 1]
-        # Inception expects (N, 3, 299, 299) normalized
-        x = torch.nn.functional.interpolate(x, size=(299, 299), mode="bilinear", align_corners=False)
-        # Normalize to ImageNet stats
-        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
-        x = (x - mean) / std
-
-        # Run through inception up to the pool layer
-        # Using internal layers
-        m = self.model
-
-        # N x 3 x 299 x 299
-        x = m.Conv2d_1a_3x3(x)
-        x = m.Conv2d_2a_3x3(x)
-        x = m.Conv2d_2b_3x3(x)
-        x = torch.nn.functional.max_pool2d(x, kernel_size=3, stride=2)
-        x = m.Conv2d_3b_1x1(x)
-        x = m.Conv2d_4a_3x3(x)
-        x = torch.nn.functional.max_pool2d(x, kernel_size=3, stride=2)
-        x = m.Mixed_5b(x)
-        x = m.Mixed_5c(x)
-        x = m.Mixed_5d(x)
-        x = m.Mixed_6a(x)
-        x = m.Mixed_6b(x)
-        spatial = x  # spatial features for sFID
-        x = m.Mixed_6c(x)
-        x = m.Mixed_6d(x)
-        x = m.Mixed_6e(x)
-        x = m.Mixed_7a(x)
-        x = m.Mixed_7b(x)
-        x = m.Mixed_7c(x)
-
-        # Pool features
-        pool = torch.nn.functional.adaptive_avg_pool2d(x, (1, 1))
-        pool = pool.flatten(1)  # (N, 2048)
-
-        # Logits for IS
-        logits = m.fc(pool)
-
-        # Spatial features
-        spatial = spatial.mean(dim=[-2, -1])  # (N, spatial_dim)
-
-        return {
-            "pool": pool,
-            "spatial": spatial,
-            "logits": logits,
-        }
-
-
-# ---------------------------------------------------------------------------
 # Activations computation
+#
+# The InceptionV3 loader and feature extractor live in ``diffit/inception.py``
+# so this standalone evaluator and the inline training metrics share one
+# implementation.
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -176,7 +110,7 @@ def compute_activations_from_npz(npz_path, inception_model, batch_size, device):
 
     for i in tqdm(range(0, len(images), batch_size), desc="Computing activations"):
         batch = images[i : i + batch_size]
-        batch = torch.from_numpy(batch).float().permute(0, 3, 1, 2) / 255.0
+        batch = torch.from_numpy(batch).float().permute(0, 3, 1, 2) / UINT8_MAX
         batch = batch.to(device)
 
         feats = extractor(batch)
