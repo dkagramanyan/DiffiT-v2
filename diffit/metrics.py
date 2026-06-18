@@ -14,6 +14,17 @@ from diffit import NUM_CLASSES
 from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
 from diffit.dpm_solver import dpm_solver_sample
 
+# Optional combra integration: score generated samples with combra's
+# generative-quality metrics during training. The import is guarded so training
+# runs unchanged when combra is not installed.
+try:
+    from combra.metrics import compute_all_metrics as _combra_compute_all_metrics
+
+    HAS_COMBRA = True
+except ImportError:
+    _combra_compute_all_metrics = None
+    HAS_COMBRA = False
+
 
 @torch.inference_mode()
 def compute_activations(images_uint8_nchw, extractor, batch_size, device, desc="Computing Inception features"):
@@ -225,10 +236,18 @@ def evaluate_metrics(
     rank=0, world_size=1,
     log_fn=None,
     class_list=None, null_class_idx=None,
+    ref_images=None, combra_cache=None,
 ):
     """Generate samples across all ranks, compute metrics on rank 0.
 
     class_list / null_class_idx: forwarded to generate_eval_samples. See there.
+
+    ref_images: NCHW uint8 reference images. When provided and combra is
+        installed, the generated batch is also scored with
+        ``combra.metrics.compute_all_metrics`` and the results are merged into
+        the returned dict under ``combra_*`` keys. combra_cache: a caller-owned
+        dict reused across calls to memoise the reference-side combra work.
+
     Returns dict of metrics on rank 0, None on other ranks.
     """
     if log_fn is None:
@@ -267,6 +286,15 @@ def evaluate_metrics(
     if rank == 0:
         metrics["Precision"] = prec
         metrics["Recall"] = rec
+        if ref_images is not None and HAS_COMBRA:
+            try:
+                combra_metrics = _combra_compute_all_metrics(
+                    ref_images, fake_images, device=device, reference_cache=combra_cache,
+                )
+                for k, v in combra_metrics.items():
+                    metrics[f"combra_{k}"] = float(v)
+            except Exception as e:  # combra failure must not abort the eval tick
+                log_fn(f"  combra metrics failed: {e}")
         for k, v in metrics.items():
             log_fn(f"  {k}: {v:.4f}")
         return metrics
