@@ -43,6 +43,7 @@ from diffit.dpm_solver import dpm_solver_sample
 from diffit.image_datasets import load_data
 from diffit.inception import InceptionFeatureExtractor
 from diffit.metrics import (
+    HAS_COMBRA,
     compute_activations,
     evaluate_metrics,
 )
@@ -335,6 +336,8 @@ def training_loop(
     # --- Load Inception model + pre-compute reference features (rank 0 only) ---
     inception_extractor = None
     ref_acts = None
+    combra_ref_images = None  # kept for combra metrics when combra is installed
+    combra_ref_cache = {} if HAS_COMBRA else None
     if is_main and num_fid_samples > 0:
         logger.log("Loading InceptionV3 for metric evaluation...")
         from torchvision.models import Inception_V3_Weights, inception_v3
@@ -356,7 +359,10 @@ def training_loop(
             n_collected += batch_np.shape[0]
         ref_images = np.concatenate(ref_images, axis=0)[:num_fid_samples]
         ref_acts = compute_activations(ref_images, inception_extractor, batch_size=64, device=device)
-        del ref_images
+        if HAS_COMBRA:
+            combra_ref_images = ref_images  # reused as the combra reference batch
+        else:
+            del ref_images
         logger.log("Reference features computed.")
 
     # Build class-sorted grid: each row cycles through classes
@@ -621,6 +627,7 @@ def training_loop(
                         log_fn=logger.log,
                         class_list=list(range(num_dataset_classes)),
                         null_class_idx=num_dataset_classes,
+                        ref_images=combra_ref_images, combra_cache=combra_ref_cache,
                     )
                     # Only rank 0 logs and saves metrics
                     if is_main and stats_metrics is not None:
