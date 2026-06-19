@@ -29,6 +29,7 @@ def load_data(
     num_workers=4,
     distributed=False,
     cache_in_ram=False,
+    drop_last=True,
 ):
     """
     Create a generator over (images, kwargs) pairs.
@@ -87,7 +88,7 @@ def load_data(
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True,
+        drop_last=drop_last,
         persistent_workers=num_workers > 0,
     )
     # Advance the DistributedSampler epoch each pass so every rank gets
@@ -111,6 +112,19 @@ def _list_image_files_recursively(data_dir):
         elif os.path.isdir(full_path):
             results.extend(_list_image_files_recursively(full_path))
     return results
+
+
+def count_data(data_dir):
+    """Return the number of images in a dataset directory or .zip archive."""
+    if not data_dir:
+        raise ValueError("unspecified data directory")
+    if data_dir.endswith(".zip"):
+        with zipfile.ZipFile(data_dir, "r") as zf:
+            return sum(
+                1 for name in zf.namelist()
+                if name.split(".")[-1].lower() in ("png", "jpg", "jpeg", "gif")
+            )
+    return len(_list_image_files_recursively(data_dir))
 
 
 class ImageDataset(Dataset):

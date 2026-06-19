@@ -39,13 +39,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults, logger
 from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
-from diffit.dpm_solver import dpm_solver_sample
-from diffit.image_datasets import load_data
+from diffit.image_datasets import count_data, load_data
 from diffit.inception import InceptionFeatureExtractor
 from diffit.metrics import (
     HAS_COMBRA,
     compute_activations,
     evaluate_metrics,
+    sample_latents,
 )
 from diffit.nn import update_ema
 from diffit.timestep_sampler import create_named_schedule_sampler
@@ -88,7 +88,7 @@ def setup_snapshot_image_grid(image_size, gw=None, gh=None):
 def generate_snapshot_images(
     ema_model, vae, diffusion, grid_z, grid_classes, batch_gpu, device,
     *,
-    cfg_scale, null_class_idx, num_sampling_steps=25, scale_pow=4.0,
+    cfg_scale, null_class_idx, num_sampling_steps=25, scale_pow=4.0, sampler="dpm++",
 ):
     """Generate a batch of images from the EMA model for snapshot grids."""
     all_samples = []
@@ -103,11 +103,12 @@ def generate_snapshot_images(
             "scale_pow": scale_pow,
         }
         with torch.amp.autocast("cuda", dtype=torch.float16):
-            sample = dpm_solver_sample(
+            sample = sample_latents(
                 ema_model.forward_with_cfg,
                 diffusion,
                 z_cfg.shape,
                 device,
+                sampler=sampler,
                 num_steps=num_sampling_steps,
                 model_kwargs=model_kwargs,
                 noise=z_cfg,
@@ -181,6 +182,8 @@ def training_loop(
     workers=4,
     cache_in_ram=False,
     num_fid_samples=10000,
+    eval_sampler="ddim",
+    eval_sampling_steps=100,
     **_extra,
 ):
     """Main training loop for DiffiT."""
@@ -246,11 +249,25 @@ def training_loop(
     ema_model = copy.deepcopy(model)
     ema_model.requires_grad_(False)
     ema_model.eval()
+    # Speed up reverse-diffusion sampling: the training model is compiled below,
+    # but the EMA model used for snapshot/eval sampling is not. Compile its
+    # sampling entry point in place. Safe because update_ema updates EMA params
+    # in place (mul_/add_), so tensor identity is preserved and the compiled
+    # graph stays valid across EMA steps.
+    ema_model.forward_with_cfg = torch.compile(ema_model.forward_with_cfg)
 
     # Create diffusion
     diff_config = diffusion_defaults()
     diffusion = create_diffusion(**diff_config)
     schedule_sampler = create_named_schedule_sampler(schedule_sampler_name, diffusion)
+
+    # Diffusion the eval/snapshot sampler runs on. DPM-Solver++ subsamples the full
+    # 1000-step schedule itself, so it reuses `diffusion`; DDIM/DDPM use the native
+    # loops on a spaced schedule whose num_timesteps == eval_sampling_steps.
+    if eval_sampler == "dpm++":
+        eval_diffusion = diffusion
+    else:
+        eval_diffusion = create_diffusion(**{**diff_config, "timestep_respacing": str(eval_sampling_steps)})
 
     # Optimizer — fused=True keeps param updates in a single CUDA kernel
     # and is ~15-20 % faster than the default loop on Ampere / Hopper.
@@ -333,6 +350,17 @@ def training_loop(
     grid_size = (gw, gh)
     n_grid = gw * gh
 
+    # When combra is installed, evaluate on the WHOLE training dataset: the
+    # reference is every real image once and we generate a matching number of
+    # samples. Without combra the eval path is unchanged (configured
+    # num_fid_samples, e.g. the 10k default). Computed on all ranks so the
+    # distributed eval generation agrees on the sample count.
+    full_dataset_eval = HAS_COMBRA and num_fid_samples > 0
+    if full_dataset_eval:
+        num_fid_samples = count_data(data)
+        if is_main:
+            logger.log(f"combra installed → evaluating on whole dataset ({num_fid_samples} images).")
+
     # --- Load Inception model + pre-compute reference features (rank 0 only) ---
     inception_extractor = None
     ref_acts = None
@@ -345,10 +373,13 @@ def training_loop(
         inception_extractor = InceptionFeatureExtractor(inception_model)
 
         logger.log(f"Pre-computing reference Inception features ({num_fid_samples} real images)...")
+        # Full-dataset mode walks the dataset once deterministically (no shuffle,
+        # keep the final partial batch) so every real image is used exactly once.
         ref_iter = load_data(
             data_dir=data, batch_size=min(num_fid_samples, 64), image_size=image_size,
             class_cond=True, random_flip=False, num_workers=workers,
             distributed=False,
+            deterministic=full_dataset_eval, drop_last=not full_dataset_eval,
         )
         ref_images = []
         n_collected = 0
@@ -426,10 +457,11 @@ def training_loop(
     # Save initial fakes
     if is_main:
         fakes_init = generate_snapshot_images(
-            ema_model, vae, diffusion, grid_z, grid_classes,
+            ema_model, vae, eval_diffusion, grid_z, grid_classes,
             batch_gpu=batch_gpu, device=device,
             cfg_scale=cfg_scale,
             null_class_idx=num_dataset_classes,
+            sampler=eval_sampler, num_sampling_steps=eval_sampling_steps,
         )
         save_image_grid(fakes_init, os.path.join(run_dir, "fakes_init.png"), drange=[0, 255], grid_size=grid_size)
 
@@ -606,10 +638,11 @@ def training_loop(
                 if is_main:
                     logger.log(f"Saving image snapshot (kimg={cur_nimg / 1e3:.1f})...")
                     fakes = generate_snapshot_images(
-                        ema_model, vae, diffusion, grid_z, grid_classes,
+                        ema_model, vae, eval_diffusion, grid_z, grid_classes,
                         batch_gpu=batch_gpu, device=device,
                         cfg_scale=cfg_scale,
                         null_class_idx=num_dataset_classes,
+                        sampler=eval_sampler, num_sampling_steps=eval_sampling_steps,
                     )
                     save_image_grid(
                         fakes, os.path.join(run_dir, f"fakes{cur_nimg // 1000:06d}.png"),
@@ -620,9 +653,10 @@ def training_loop(
                 # Evaluate quality metrics (ALL ranks generate samples)
                 if num_fid_samples > 0:
                     stats_metrics = evaluate_metrics(
-                        ema_model, vae, diffusion, ref_acts, inception_extractor,
+                        ema_model, vae, eval_diffusion, ref_acts, inception_extractor,
                         num_fid_samples, batch_gpu, latent_size, device,
                         cfg_scale=cfg_scale,
+                        sampler=eval_sampler, num_sampling_steps=eval_sampling_steps,
                         rank=rank, world_size=num_gpus,
                         log_fn=logger.log,
                         class_list=list(range(num_dataset_classes)),
@@ -661,10 +695,11 @@ def training_loop(
         # Final image snapshot
         logger.log("Saving final image snapshot...")
         fakes = generate_snapshot_images(
-            ema_model, vae, diffusion, grid_z, grid_classes,
+            ema_model, vae, eval_diffusion, grid_z, grid_classes,
             batch_gpu=batch_gpu, device=device,
             cfg_scale=cfg_scale,
             null_class_idx=num_dataset_classes,
+            sampler=eval_sampler, num_sampling_steps=eval_sampling_steps,
         )
         save_image_grid(
             fakes, os.path.join(run_dir, f"fakes{cur_nimg // 1000:06d}.png"),
@@ -764,6 +799,8 @@ class TrainConfig:
     use_fp16: bool = True
     schedule_sampler_name: str = "uniform"
     num_fid_samples: int = 10000
+    eval_sampler: str = "ddim"
+    eval_sampling_steps: int = 100
     grad_accum_steps: int = 1
     gradient_checkpointing: bool = False
     lr_warmup_kimg: int = 0
@@ -808,6 +845,8 @@ BASE_CONFIGS = {
 @click.option("--schedule-sampler", "schedule_sampler_name", help="Timestep sampler [default: from cfg]", type=str, default=None)
 @click.option("--num-fid-samples", help="Samples for FID eval during training (0=disable)", metavar="INT", type=click.IntRange(min=0), default=None)
 @click.option("--cfg-scale",    help="Classifier-free guidance scale used during training-time eval [default: from cfg]", metavar="FLOAT", type=float, default=None)
+@click.option("--eval-sampler", help="Sampler for training-time eval/snapshots [default: ddim]", type=click.Choice(["dpm++", "ddim", "ddpm"]), default=None)
+@click.option("--eval-sampling-steps", help="Eval sampler steps [default: dpm++=25, ddim=100, ddpm=250]", metavar="INT", type=click.IntRange(min=1), default=None)
 
 # Performance tuning.
 @click.option("--grad-accum",  help="Gradient accumulation steps (effective batch = batch-gpu × gpus × accum)", metavar="INT", type=click.IntRange(min=1), default=None)
@@ -851,6 +890,14 @@ def main(**kwargs):
         overrides["num_fid_samples"] = opts["num_fid_samples"]
     if opts["cfg_scale"] is not None:
         overrides["cfg_scale"] = opts["cfg_scale"]
+    if opts["eval_sampler"] is not None:
+        overrides["eval_sampler"] = opts["eval_sampler"]
+    # Resolve eval step count: explicit flag wins, else a sensible per-sampler default.
+    resolved_eval_sampler = opts["eval_sampler"] or BASE_CONFIGS[opts["cfg"]].eval_sampler
+    if opts["eval_sampling_steps"] is not None:
+        overrides["eval_sampling_steps"] = opts["eval_sampling_steps"]
+    else:
+        overrides["eval_sampling_steps"] = {"dpm++": 25, "ddim": 100, "ddpm": 250}[resolved_eval_sampler]
     if opts["grad_accum"] is not None:
         overrides["grad_accum_steps"] = opts["grad_accum"]
     if opts["gradient_checkpointing"] is not None:
@@ -884,6 +931,8 @@ def main(**kwargs):
         cache_in_ram=opts["cache_in_ram"],
         num_fid_samples=cfg.num_fid_samples,
         cfg_scale=cfg.cfg_scale,
+        eval_sampler=cfg.eval_sampler,
+        eval_sampling_steps=cfg.eval_sampling_steps,
         grad_accum_steps=cfg.grad_accum_steps,
         gradient_checkpointing=cfg.gradient_checkpointing,
         lr_warmup_kimg=cfg.lr_warmup_kimg,
