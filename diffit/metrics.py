@@ -43,11 +43,33 @@ def compute_activations(images_uint8_nchw, extractor, batch_size, device, desc="
     }
 
 
+def sample_latents(model_fn, diffusion, shape, device, *, sampler, num_steps, model_kwargs, noise, progress=False):
+    """Dispatch latent sampling to the chosen reverse-diffusion sampler.
+
+    sampler: "dpm++" runs DPM-Solver++(2M) on the full schedule (``diffusion`` must
+        carry the full 1000-step ``alphas_cumprod``; ``num_steps`` sets the solver
+        steps). "ddim" / "ddpm" use the native deterministic-DDIM / ancestral-DDPM
+        loops, in which case ``diffusion`` must be a SpacedDiffusion whose
+        ``num_timesteps`` already encodes the step count (``num_steps`` is ignored).
+        DDIM uses the default ``eta=0`` (deterministic).
+    """
+    if sampler == "dpm++":
+        return dpm_solver_sample(
+            model_fn, diffusion, shape, device,
+            num_steps=num_steps, model_kwargs=model_kwargs, noise=noise, progress=progress,
+        )
+    sample_fn = diffusion.ddim_sample_loop if sampler == "ddim" else diffusion.p_sample_loop
+    return sample_fn(
+        model_fn, shape, noise=noise, clip_denoised=False,
+        model_kwargs=model_kwargs, device=device, progress=progress,
+    )
+
+
 @torch.inference_mode()
 def generate_eval_samples(
     ema_model, vae, diffusion, num_samples, batch_gpu, latent_size, device,
     *,
-    cfg_scale, num_sampling_steps=25, scale_pow=4.0,
+    cfg_scale, num_sampling_steps=25, scale_pow=4.0, sampler="dpm++",
     rank=0, world_size=1,
     class_list=None, null_class_idx=None,
 ):
@@ -70,7 +92,7 @@ def generate_eval_samples(
     all_images = []
     generated = 0
     show_progress = (rank == 0)
-    pbar = tqdm(total=local_target, desc=f"Generating eval samples (dpm++{num_sampling_steps})", unit="img") if show_progress else None
+    pbar = tqdm(total=local_target, desc=f"Generating eval samples ({sampler}×{num_sampling_steps})", unit="img") if show_progress else None
     while generated < local_target:
         bs = min(batch_gpu, local_target - generated)
         z = torch.randn(bs, 4, latent_size, latent_size, device=device)
@@ -85,11 +107,12 @@ def generate_eval_samples(
             "scale_pow": scale_pow,
         }
         with torch.amp.autocast("cuda", dtype=torch.float16):
-            sample = dpm_solver_sample(
+            sample = sample_latents(
                 ema_model.forward_with_cfg,
                 diffusion,
                 z_cfg.shape,
                 device,
+                sampler=sampler,
                 num_steps=num_sampling_steps,
                 model_kwargs=model_kwargs,
                 noise=z_cfg,
@@ -233,6 +256,7 @@ def evaluate_metrics(
     num_fid_samples, batch_gpu, latent_size, device,
     *,
     cfg_scale,
+    sampler="dpm++", num_sampling_steps=25,
     rank=0, world_size=1,
     log_fn=None,
     class_list=None, null_class_idx=None,
@@ -257,11 +281,13 @@ def evaluate_metrics(
         n_cls = len(class_list) if class_list is not None else NUM_CLASSES
         log_fn(
             f"Evaluating metrics ({num_fid_samples} samples across "
-            f"{world_size} GPU(s), cfg_scale={cfg_scale}, classes={n_cls})..."
+            f"{world_size} GPU(s), sampler={sampler}×{num_sampling_steps}, "
+            f"cfg_scale={cfg_scale}, classes={n_cls})..."
         )
     fake_images = generate_eval_samples(
         ema_model, vae, diffusion, num_fid_samples, batch_gpu, latent_size, device,
         cfg_scale=cfg_scale,
+        num_sampling_steps=num_sampling_steps, sampler=sampler,
         rank=rank, world_size=world_size,
         class_list=class_list, null_class_idx=null_class_idx,
     )

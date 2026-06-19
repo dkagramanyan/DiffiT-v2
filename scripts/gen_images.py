@@ -59,6 +59,7 @@ import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults
 from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
 from diffit.dist_util import load_state_dict
+from diffit.metrics import sample_latents
 
 
 def parse_range(s: Union[str, List, None]) -> List[int]:
@@ -328,7 +329,7 @@ def _merge_shards_to_one_h5(
 
 def _run_sampling(model, vae, diffusion, dev, latent_size, num_classes,
                   bs, class_labels, gen, *, cfg_scale, scale_pow,
-                  diffusion_steps, use_ddim):
+                  diffusion_steps, sampler, num_sampling_steps):
     """Single forward pass: bs latents → bs decoded uint8 NHWC images."""
     z = torch.randn(bs, 4, latent_size, latent_size, device=dev, generator=gen)
     classes_null = torch.full((bs,), num_classes, device=dev, dtype=torch.long)
@@ -341,12 +342,15 @@ def _run_sampling(model, vae, diffusion, dev, latent_size, num_classes,
         "scale_pow": scale_pow,
     }
 
-    sample_fn = diffusion.ddim_sample_loop if use_ddim else diffusion.p_sample_loop
-    sample = sample_fn(
+    sample = sample_latents(
         model.forward_with_cfg,
-        z_cfg.shape, z_cfg,
-        clip_denoised=False, progress=False,
-        model_kwargs=model_kwargs, device=dev,
+        diffusion,
+        z_cfg.shape,
+        dev,
+        sampler=sampler,
+        num_steps=num_sampling_steps,
+        model_kwargs=model_kwargs,
+        noise=z_cfg,
     )
     sample, _ = sample.chunk(2, dim=0)
 
@@ -377,7 +381,7 @@ def _run_sampling(model, vae, diffusion, dev, latent_size, num_classes,
 @click.option("--class-idx", type=int, default=None, help="Seed mode: fixed class label (random if not specified)")
 @click.option("--cfg-scale", type=float, default=4.4, show_default=True, help="Classifier-free guidance scale")
 @click.option("--num-sampling-steps", type=int, default=250, show_default=True, help="Number of diffusion sampling steps")
-@click.option("--use-ddim/--no-use-ddim", default=False, show_default=True, help="Use DDIM sampling")
+@click.option("--sampler", type=click.Choice(["dpm++", "ddim", "ddpm"]), default="ddim", show_default=True, help="Reverse-diffusion sampler")
 @click.option("--scale-pow", type=float, default=4.0, show_default=True, help="Power for cosine CFG schedule (256)")
 @click.option("--vae-decoder", type=click.Choice(["ema", "mse"]), default="ema", show_default=True, help="VAE decoder variant")
 @click.option("--decode-layer", type=int, default=None, help="Decode layer override")
@@ -402,7 +406,7 @@ def generate_images(
     class_idx,
     cfg_scale,
     num_sampling_steps,
-    use_ddim,
+    sampler,
     scale_pow,
     vae_decoder,
     decode_layer,
@@ -468,8 +472,10 @@ def generate_images(
     print(f"Model loaded: {msg}")
     del state
 
+    # DPM-Solver++ subsamples the full 1000-step schedule itself; DDIM/DDPM use a
+    # spaced schedule whose num_timesteps == num_sampling_steps.
     diff_config = diffusion_defaults()
-    diff_config["timestep_respacing"] = str(num_sampling_steps)
+    diff_config["timestep_respacing"] = "" if sampler == "dpm++" else str(num_sampling_steps)
     diffusion = create_diffusion(**diff_config)
     diffusion_steps = diff_config["diffusion_steps"]
 
@@ -549,7 +555,8 @@ def generate_images(
                         model, vae, diffusion, dev, latent_size, num_classes,
                         bs, class_labels, gen,
                         cfg_scale=cfg_scale, scale_pow=scale_pow,
-                        diffusion_steps=diffusion_steps, use_ddim=use_ddim,
+                        diffusion_steps=diffusion_steps, sampler=sampler,
+                        num_sampling_steps=num_sampling_steps,
                     )
 
                     if save_mode == "hdf5":
@@ -580,7 +587,8 @@ def generate_images(
                         model, vae, diffusion, dev, latent_size, num_classes,
                         batch_sz, class_labels, gen,
                         cfg_scale=cfg_scale, scale_pow=scale_pow,
-                        diffusion_steps=diffusion_steps, use_ddim=use_ddim,
+                        diffusion_steps=diffusion_steps, sampler=sampler,
+                        num_sampling_steps=num_sampling_steps,
                     )
 
                     for i, img in enumerate(imgs):
@@ -622,7 +630,7 @@ def generate_images(
                 "num_classes": int(num_classes),
                 "cfg_scale": float(cfg_scale),
                 "num_sampling_steps": int(num_sampling_steps),
-                "use_ddim": bool(use_ddim),
+                "sampler": sampler,
             },
         )
         size_mb = merged_path.stat().st_size / (1024 * 1024)

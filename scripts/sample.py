@@ -25,6 +25,7 @@ import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults
 from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
 from diffit.dist_util import dev, get_rank, get_world_size, load_state_dict, setup_dist
+from diffit.metrics import sample_latents
 
 
 @click.command()
@@ -38,7 +39,7 @@ from diffit.dist_util import dev, get_rank, get_world_size, load_state_dict, set
 @click.option("--cfg-scale", type=float, default=4.4, show_default=True, help="Classifier-free guidance scale")
 @click.option("--cfg-cond/--no-cfg-cond", default=True, show_default=True, help="Use classifier-free guidance")
 @click.option("--class-cond/--no-class-cond", default=True, show_default=True, help="Use class conditioning")
-@click.option("--use-ddim/--no-use-ddim", default=False, show_default=True, help="Use DDIM sampling")
+@click.option("--sampler", type=click.Choice(["dpm++", "ddim", "ddpm"]), default="ddim", show_default=True, help="Reverse-diffusion sampler")
 @click.option("--scale-pow", type=float, default=4.0, show_default=True, help="Power for cosine CFG schedule (256 only)")
 @click.option("--vae-decoder", type=click.Choice(["ema", "mse"]), default="ema", show_default=True, help="VAE decoder variant")
 @click.option("--decode-layer", type=int, default=None, help="Decode layer override")
@@ -55,7 +56,7 @@ def generate_samples(
     cfg_scale,
     cfg_cond,
     class_cond,
-    use_ddim,
+    sampler,
     scale_pow,
     vae_decoder,
     decode_layer,
@@ -81,9 +82,10 @@ def generate_samples(
     msg = model.load_state_dict(load_state_dict(model_path, map_location="cpu"))
     print(f"Model loaded: {msg}")
 
-    # Create diffusion
+    # Create diffusion. DPM-Solver++ subsamples the full 1000-step schedule itself;
+    # DDIM/DDPM use a spaced schedule whose num_timesteps == num_sampling_steps.
     diff_config = diffusion_defaults()
-    diff_config["timestep_respacing"] = str(num_sampling_steps)
+    diff_config["timestep_respacing"] = "" if sampler == "dpm++" else str(num_sampling_steps)
     diffusion = create_diffusion(**diff_config)
 
     model.to(dev())
@@ -122,15 +124,16 @@ def generate_samples(
             else:
                 model_kwargs["y"] = classes
 
-            sample_fn = diffusion.ddim_sample_loop if use_ddim else diffusion.p_sample_loop
-            sample = sample_fn(
+            sample = sample_latents(
                 model.forward_with_cfg,
+                diffusion,
                 z.shape,
-                z,
-                clip_denoised=False,
-                progress=(get_rank() == 0),
+                dev(),
+                sampler=sampler,
+                num_steps=num_sampling_steps,
                 model_kwargs=model_kwargs,
-                device=dev(),
+                noise=z,
+                progress=(get_rank() == 0),
             )
 
             if cfg_cond:
