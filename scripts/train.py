@@ -40,7 +40,7 @@ import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults, logger
 from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
 from diffit.dpm_solver import dpm_solver_sample
-from diffit.image_datasets import load_data
+from diffit.image_datasets import count_data, load_data
 from diffit.inception import InceptionFeatureExtractor
 from diffit.metrics import (
     HAS_COMBRA,
@@ -246,6 +246,12 @@ def training_loop(
     ema_model = copy.deepcopy(model)
     ema_model.requires_grad_(False)
     ema_model.eval()
+    # Speed up reverse-diffusion sampling: the training model is compiled below,
+    # but the EMA model used for snapshot/eval sampling is not. Compile its
+    # sampling entry point in place. Safe because update_ema updates EMA params
+    # in place (mul_/add_), so tensor identity is preserved and the compiled
+    # graph stays valid across EMA steps.
+    ema_model.forward_with_cfg = torch.compile(ema_model.forward_with_cfg)
 
     # Create diffusion
     diff_config = diffusion_defaults()
@@ -333,6 +339,17 @@ def training_loop(
     grid_size = (gw, gh)
     n_grid = gw * gh
 
+    # When combra is installed, evaluate on the WHOLE training dataset: the
+    # reference is every real image once and we generate a matching number of
+    # samples. Without combra the eval path is unchanged (configured
+    # num_fid_samples, e.g. the 10k default). Computed on all ranks so the
+    # distributed eval generation agrees on the sample count.
+    full_dataset_eval = HAS_COMBRA and num_fid_samples > 0
+    if full_dataset_eval:
+        num_fid_samples = count_data(data)
+        if is_main:
+            logger.log(f"combra installed → evaluating on whole dataset ({num_fid_samples} images).")
+
     # --- Load Inception model + pre-compute reference features (rank 0 only) ---
     inception_extractor = None
     ref_acts = None
@@ -345,10 +362,13 @@ def training_loop(
         inception_extractor = InceptionFeatureExtractor(inception_model)
 
         logger.log(f"Pre-computing reference Inception features ({num_fid_samples} real images)...")
+        # Full-dataset mode walks the dataset once deterministically (no shuffle,
+        # keep the final partial batch) so every real image is used exactly once.
         ref_iter = load_data(
             data_dir=data, batch_size=min(num_fid_samples, 64), image_size=image_size,
             class_cond=True, random_flip=False, num_workers=workers,
             distributed=False,
+            deterministic=full_dataset_eval, drop_last=not full_dataset_eval,
         )
         ref_images = []
         n_collected = 0
