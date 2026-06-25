@@ -64,11 +64,26 @@ This repo is an engineering refresh of the upstream [NVlabs/DiffiT](https://gith
 
 ## Installation
 
+Create and activate a Python 3.12 conda env:
+
 ```bash
-conda create -n diffit python=3.11 -y
+conda create -n diffit python=3.12 -y
 conda activate diffit
+```
+
+Install the latest **PyTorch** first, from the CUDA 13.2 wheels (H200; the wheel
+bundles the CUDA runtime), then install the package:
+
+```bash
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu132
 pip install -e .
 ```
+
+Unlike SAN-v2, DiffiT-v2 has **no custom CUDA ops to JIT-compile** — attention
+runs through PyTorch's built-in `scaled_dot_product_attention` (FlashAttention),
+so no `nvcc`/`ninja` toolchain is required. Installing torch from the `cu132`
+index first means the `torch>=2.0.0` lower bound below is already satisfied, so
+`pip install -e .` won't pull a different CUDA build over it.
 
 This installs the package (editable) along with its dependencies and the
 console entry-points used throughout this README: `diffit-train`,
