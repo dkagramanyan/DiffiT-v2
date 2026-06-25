@@ -1,0 +1,22 @@
+# Hydra config for DiffiT training. Defaults for every option come from the
+# train.py click CLI (see train_hydra.py), so this file only declares the
+# required fields; override any other train.py option here or on the command
+# line by its Python name (e.g. `combra_metrics=false`, `save_inference_only=true`).
+defaults:
+  - _self_
+
+# Required (no default in the CLI either -- must be provided here or on the
+# command line).
+outdir: ???
+cfg: ???
+data: ???
+gpus: ???
+batch_gpu: ???
+
+# Keep the working directory at the repo root so relative --data / --outdir
+# paths behave exactly like the click CLI.
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .

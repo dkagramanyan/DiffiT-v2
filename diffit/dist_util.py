@@ -107,6 +107,24 @@ def load_state_dict(path, **kwargs):
     return th.load(path, **kwargs)
 
 
+def extract_inference_state_dict(obj):
+    """Return the inference (EMA) weights from anything ``load_state_dict`` yields.
+
+    Training writes full resumable checkpoints ``{"model", "ema", "opt", ...}``
+    by default, plus optional EMA-only inference snapshots. Older snapshots were
+    a bare ``state_dict``. This normalises all three so inference loaders
+    (gen_images.py, sample.py) get a plain weights dict regardless of source:
+    prefer EMA weights, fall back to the raw model, else assume it already is a
+    state_dict.
+    """
+    if isinstance(obj, dict):
+        if "ema" in obj:
+            return obj["ema"]
+        if "model" in obj:
+            return obj["model"]
+    return obj
+
+
 def sync_params(params):
     """Synchronize a sequence of Tensors across ranks from rank 0."""
     for p in params:

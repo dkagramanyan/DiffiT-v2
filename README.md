@@ -90,6 +90,16 @@ This caches the following models locally:
 - **stabilityai/sd-vae-ft-ema** (335 MB) — VAE for latent diffusion (`~/.cache/huggingface/`)
 - **stabilityai/sd-vae-ft-mse** (335 MB) — VAE variant for `diffit-gen-images --vae-decoder mse`
 - **InceptionV3** (104 MB) — for IS/FID metrics during training (`~/.cache/torch/hub/`)
+- **combra backbones** (InceptionV3-FID / CLIP / DINOv2) — only when the optional `combra` package is installed, for `--combra-metrics`
+
+Alternatively, for fully offline nodes without a Python environment, a pure
+`wget`/`curl`/`git` variant fetches the torch-hub / CLIP weights directly into the
+caches (and the VAEs via `huggingface-cli` when present):
+
+```bash
+bash download_models.sh                         # caches under ~/.cache
+MODEL_CACHE=/shared/team/caches bash download_models.sh
+```
 
 > If your compute nodes use a shared filesystem with the login node, the cached files will be available automatically. Otherwise, ensure `~/.cache/huggingface/` and `~/.cache/torch/hub/` are synced.
 
@@ -305,6 +315,22 @@ diffit-train --outdir=./training-runs \
     --resume ./training-runs/00000-diffit-256-gpus2-batch192/network-snapshot-001000.pt
 ```
 
+### Hydra entry point (optional)
+
+`train_hydra.py` is a thin wrapper over the same training code, for users who
+prefer Hydra/YAML config management. It derives every default by introspecting
+the `train.py` click options (single source of truth), so `configs/config.yaml`
+only declares the required fields and any new flag propagates automatically:
+
+```bash
+python train_hydra.py outdir=./training-runs cfg=diffit-256 \
+    data=./datasets/imagenet_256x256.zip gpus=2 batch_gpu=42 \
+    combra_metrics=false save_inference_only=true snap=100
+```
+
+Override any `train.py` option by its Python name (dashes → underscores). Both
+entry points call the same `launch_from_opts`, so runs are identical.
+
 ### Training options
 
 | Option | Default | Description |
@@ -328,6 +354,8 @@ diffit-train --outdir=./training-runs \
 | `--schedule-sampler` | from cfg | Timestep sampler override |
 | `--cfg-scale` | from cfg | CFG scale used during training-time eval |
 | `--num-fid-samples` | from cfg (10000) | Samples for FID/IS eval during training (0=disable) |
+| `--combra-metrics` | true | Compute combra generative-quality metrics each snapshot tick (independent of `--num-fid-samples`); warns if requested but combra is not installed |
+| `--save-inference-only` | false | Also write a small `network-snapshot-<kimg>-inference.pt` (EMA weights only, no optimizer/resume state) each snapshot tick — the smallest artifact for `gen_images.py` / `sample.py` |
 | `--grad-accum` | from cfg | Gradient accumulation steps (effective batch = batch-gpu × gpus × accum) |
 | `--grad-ckpt / --no-grad-ckpt` | from cfg | Toggle gradient checkpointing (trades compute for memory) |
 | `--lr-warmup` | from cfg | Linear LR warmup duration in kimg (0 = disabled) |
@@ -353,13 +381,20 @@ training-runs/00000-diffit-256-gpus4-batch256/
 ├── fakes000200.png               # Generated images at 200 kimg
 ├── fakes000400.png               # Generated images at 400 kimg
 ├── ...
-├── network-snapshot-001000.pt    # Periodic checkpoint
+├── network-snapshot-001000.pt    # Periodic checkpoint (full resumable state)
+├── network-snapshot-001000-inference.pt  # (only with --save-inference-only) EMA weights only
 ├── network-snapshot-002000.pt
 ├── ...
-└── network-final.pt              # Final trained model
+└── network-final.pt              # Final trained model (full resumable state)
 ```
 
-Quality metrics (**IS**, **FID**, **sFID**, **Precision**, **Recall**) are computed automatically every `snap` ticks during training using 10000 samples by default (configurable per `--cfg`). Results are logged to TensorBoard under `Metrics/` and to `stats.jsonl`. Adjust with `--num-fid-samples` (set to 0 to disable).
+`network-snapshot-*.pt` / `network-final.pt` hold the **full** resumable state
+(`model`, `ema`, `opt`, optional `scaler`, `cur_nimg`) so `--resume` can continue
+training exactly. The inference loaders (`gen_images.py`, `sample.py`) transparently
+extract the EMA weights from any of these — a full checkpoint, an older bare
+EMA `state_dict`, or a `--save-inference-only` `*-inference.pt` file.
+
+Quality metrics (**IS**, **FID**, **sFID**, **Precision**, **Recall**) are computed automatically every `snap` ticks during training using 10000 samples by default (configurable per `--cfg`). Results are logged to TensorBoard under `Metrics/` and to `stats.jsonl`. Adjust with `--num-fid-samples` (set to 0 to disable). When the optional `combra` package is installed (`pip install -e ".[combra]"`) and `--combra-metrics` is on (default), additional `combra_*` metrics (e.g. CMMD, FD-DINOv2) are logged each tick too — and the eval reference becomes the whole training set. Pre-fetch combra's CLIP/DINOv2 backbones for offline nodes with `python scripts/download_models.py` or `bash download_models.sh`.
 
 Monitor training with TensorBoard:
 

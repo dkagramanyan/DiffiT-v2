@@ -24,7 +24,14 @@ from diffusers.models import AutoencoderKL
 import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults
 from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
-from diffit.dist_util import dev, get_rank, get_world_size, load_state_dict, setup_dist
+from diffit.dist_util import (
+    dev,
+    extract_inference_state_dict,
+    get_rank,
+    get_world_size,
+    load_state_dict,
+    setup_dist,
+)
 from diffit.metrics import sample_latents
 
 
@@ -79,7 +86,9 @@ def generate_samples(
     model = diffit_module.__dict__[model_name](
         input_size=latent_size, decode_layer=decode_layer, num_classes=num_classes,
     )
-    msg = model.load_state_dict(load_state_dict(model_path, map_location="cpu"))
+    msg = model.load_state_dict(
+        extract_inference_state_dict(load_state_dict(model_path, map_location="cpu"))
+    )
     print(f"Model loaded: {msg}")
 
     # Create diffusion. DPM-Solver++ subsamples the full 1000-step schedule itself;

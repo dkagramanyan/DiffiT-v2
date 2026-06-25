@@ -26,6 +26,7 @@ import os
 import re
 import tempfile
 import time
+import warnings
 from contextlib import nullcontext
 
 import click
@@ -125,6 +126,25 @@ def generate_snapshot_images(
     return images
 
 
+def build_checkpoint(model, ema_model, opt, scaler, use_grad_scaler, cur_nimg):
+    """Assemble a full resumable checkpoint dict (matches the --resume loader).
+
+    Contains the raw model + EMA weights, optimizer state, the GradScaler state
+    (when AMP fp16 is active), and the image counter so training can resume
+    exactly. ``--save-inference-only`` additionally writes a tiny companion file
+    holding only ``ema_model.state_dict()`` for downstream inference.
+    """
+    ckpt = {
+        "model": model.state_dict(),
+        "ema": ema_model.state_dict(),
+        "opt": opt.state_dict(),
+        "cur_nimg": cur_nimg,
+    }
+    if use_grad_scaler:
+        ckpt["scaler"] = scaler.state_dict()
+    return ckpt
+
+
 def subprocess_fn(rank, c, temp_dir):
     """Entry point for each DDP worker."""
     logger.configure(log_dir=c["run_dir"])
@@ -184,6 +204,8 @@ def training_loop(
     num_fid_samples=10000,
     eval_sampler="ddim",
     eval_sampling_steps=100,
+    combra_metrics=True,
+    save_inference_only=False,
     **_extra,
 ):
     """Main training loop for DiffiT."""
@@ -350,22 +372,35 @@ def training_loop(
     grid_size = (gw, gh)
     n_grid = gw * gh
 
-    # When combra is installed, evaluate on the WHOLE training dataset: the
+    # Warn early (once, on rank 0) if combra metrics are requested but the
+    # package is missing, so the user is not left wondering why no combra_*
+    # values ever appear.
+    if combra_metrics and is_main and not HAS_COMBRA:
+        warnings.warn(
+            "--combra-metrics=True but the `combra` package is not installed -- "
+            "combra metrics will be skipped. Install it to enable them, or pass "
+            "--combra-metrics=false to silence this warning."
+        )
+
+    # combra metrics run only when requested AND installed.
+    use_combra = combra_metrics and HAS_COMBRA
+
+    # When combra metrics are active, evaluate on the WHOLE training dataset: the
     # reference is every real image once and we generate a matching number of
-    # samples. Without combra the eval path is unchanged (configured
-    # num_fid_samples, e.g. the 10k default). Computed on all ranks so the
-    # distributed eval generation agrees on the sample count.
-    full_dataset_eval = HAS_COMBRA and num_fid_samples > 0
+    # samples. Otherwise the eval path is unchanged (configured num_fid_samples,
+    # e.g. the 10k default). Computed on all ranks so the distributed eval
+    # generation agrees on the sample count.
+    full_dataset_eval = use_combra and num_fid_samples > 0
     if full_dataset_eval:
         num_fid_samples = count_data(data)
         if is_main:
-            logger.log(f"combra installed → evaluating on whole dataset ({num_fid_samples} images).")
+            logger.log(f"combra metrics enabled → evaluating on whole dataset ({num_fid_samples} images).")
 
     # --- Load Inception model + pre-compute reference features (rank 0 only) ---
     inception_extractor = None
     ref_acts = None
-    combra_ref_images = None  # kept for combra metrics when combra is installed
-    combra_ref_cache = {} if HAS_COMBRA else None
+    combra_ref_images = None  # kept for combra metrics when combra is active
+    combra_ref_cache = {} if use_combra else None
     if is_main and num_fid_samples > 0:
         logger.log("Loading InceptionV3 for metric evaluation...")
         from torchvision.models import Inception_V3_Weights, inception_v3
@@ -390,7 +425,7 @@ def training_loop(
             n_collected += batch_np.shape[0]
         ref_images = np.concatenate(ref_images, axis=0)[:num_fid_samples]
         ref_acts = compute_activations(ref_images, inception_extractor, batch_size=64, device=device)
-        if HAS_COMBRA:
+        if use_combra:
             combra_ref_images = ref_images  # reused as the combra reference batch
         else:
             del ref_images
@@ -677,20 +712,26 @@ def training_loop(
                                 stats_tfevents.add_scalar(f"Metrics/{name}", value, global_step=global_step, walltime=walltime)
                             stats_tfevents.flush()
 
-                # Save checkpoint (rank 0 only) — inference-only: EMA weights as a raw state_dict
+                # Save checkpoint (rank 0 only) — full resumable state by default.
                 if is_main:
                     save_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}.pt")
                     logger.log(f"Saving checkpoint to {save_path}...")
-                    torch.save(ema_model.state_dict(), save_path)
+                    torch.save(build_checkpoint(model, ema_model, opt, scaler, use_grad_scaler, cur_nimg), save_path)
+                    if save_inference_only:
+                        inf_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}-inference.pt")
+                        torch.save(ema_model.state_dict(), inf_path)
+                        logger.log(f"Inference-only snapshot saved to {inf_path}")
                     logger.log(f"Checkpoint saved (kimg={cur_nimg / 1e3:.1f})")
 
                     maintenance_time = time.time() - snap_start
 
-    # Final save — inference-only: EMA weights as a raw state_dict
+    # Final save — full resumable state by default.
     if is_main:
         save_path = os.path.join(run_dir, "network-final.pt")
         logger.log(f"Saving final model to {save_path}...")
-        torch.save(ema_model.state_dict(), save_path)
+        torch.save(build_checkpoint(model, ema_model, opt, scaler, use_grad_scaler, cur_nimg), save_path)
+        if save_inference_only:
+            torch.save(ema_model.state_dict(), os.path.join(run_dir, "network-final-inference.pt"))
 
         # Final image snapshot
         logger.log("Saving final image snapshot...")
@@ -856,6 +897,8 @@ BASE_CONFIGS = {
 # Misc settings.
 @click.option("--desc",         help="String to include in result dir name", metavar="STR",    type=str, default=None)
 @click.option("--metrics",      help="Quality metrics", metavar="NAME",                        type=str, default="fid50k", show_default=True)
+@click.option("--combra-metrics", help="Compute combra generative-quality metrics each snapshot tick (independent of --metrics)", metavar="BOOL", type=bool, default=True, show_default=True)
+@click.option("--save-inference-only", help="Also write a small inference-only snapshot (EMA weights only, no optimizer/resume state) each snapshot tick", metavar="BOOL", type=bool, default=False, show_default=True)
 @click.option("--tf32/--no-tf32", "allow_tf32", help="Enable TF32 for matmul/conv",            default=True, show_default=True)
 @click.option("--workers",      help="DataLoader worker processes", metavar="INT",             type=click.IntRange(min=1), default=4, show_default=True)
 @click.option("--cache-in-ram/--no-cache-in-ram", help="Cache entire dataset in RAM to reduce disk I/O", default=True, show_default=True)
@@ -863,8 +906,17 @@ BASE_CONFIGS = {
 
 def main(**kwargs):
     """Train DiffiT on class-conditional ImageNet."""
-    opts = kwargs
+    launch_from_opts(kwargs)
 
+
+def launch_from_opts(opts):
+    """Build the run config from a CLI-style opts dict and launch training.
+
+    Shared by the click entry point (``main``) and the Hydra entry point
+    (``train_hydra.py``) so both paths produce identical runs. ``opts`` is a
+    dict keyed by the click option Python names (the same keys click passes to
+    ``main`` as ``**kwargs``).
+    """
     # Start from base configuration, then apply CLI overrides: any explicitly
     # provided option takes precedence. (None means "not provided".)
     overrides = {}
@@ -936,6 +988,8 @@ def main(**kwargs):
         grad_accum_steps=cfg.grad_accum_steps,
         gradient_checkpointing=cfg.gradient_checkpointing,
         lr_warmup_kimg=cfg.lr_warmup_kimg,
+        combra_metrics=opts["combra_metrics"],
+        save_inference_only=opts["save_inference_only"],
         log_interval=10,
         save_interval=10000,
     )

@@ -103,7 +103,7 @@ def download_models():
 
     # --- VAE (EMA variant) ---
     print("=" * 60)
-    print("[1/3] Downloading stabilityai/sd-vae-ft-ema ...")
+    print("[1/4] Downloading stabilityai/sd-vae-ft-ema ...")
     print("=" * 60)
     from diffusers.models import AutoencoderKL
 
@@ -112,19 +112,47 @@ def download_models():
 
     # --- VAE (MSE variant, used by gen_images.py --vae-decoder mse) ---
     print("=" * 60)
-    print("[2/3] Downloading stabilityai/sd-vae-ft-mse ...")
+    print("[2/4] Downloading stabilityai/sd-vae-ft-mse ...")
     print("=" * 60)
     AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
     print("  -> cached.\n")
 
     # --- InceptionV3 (used by train.py for inline FID/IS evaluation) ---
     print("=" * 60)
-    print("[3/3] Downloading InceptionV3 (torchvision) ...")
+    print("[3/4] Downloading InceptionV3 (torchvision) ...")
     print("=" * 60)
     from torchvision.models import Inception_V3_Weights, inception_v3
 
     inception_v3(weights=Inception_V3_Weights.DEFAULT)
     print("  -> cached.\n")
+
+    # --- combra backbones (CLIP / DINOv2 / pytorch-fid InceptionV3) ---
+    # Only when combra is installed and --combra-metrics is used during training.
+    # Running each metric on a tiny dummy batch triggers the one-time weight
+    # download into the standard torch hub / clip caches.
+    print("=" * 60)
+    print("[4/4] Downloading combra metric backbones (CLIP / DINOv2 / FID) ...")
+    print("=" * 60)
+    try:
+        import importlib
+
+        if importlib.util.find_spec("combra") is None:
+            print("  combra not installed -- skipping (install it to enable combra metrics).\n")
+        else:
+            import numpy as np
+            from combra.metrics import compute_cmmd, compute_fd_dinov2, compute_fid
+
+            dummy = np.random.randint(0, 256, size=(8, 64, 64, 3), dtype=np.uint8)
+            for label, fn in [
+                ("InceptionV3 (fid)", compute_fid),
+                ("CLIP (cmmd)", compute_cmmd),
+                ("DINOv2 (fd_dinov2)", compute_fd_dinov2),
+            ]:
+                print(f"  - {label}")
+                fn(dummy, dummy, device="cpu")
+            print("  -> cached.\n")
+    except Exception as e:
+        print(f"  combra backbone download skipped/failed: {e}\n")
 
     print("All models downloaded successfully.")
     print(f"  HuggingFace cache: {os.path.expanduser('~/.cache/huggingface/')}")
