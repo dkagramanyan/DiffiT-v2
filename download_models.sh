@@ -70,18 +70,26 @@ else
 fi
 
 # --- SD-VAE decoders (HuggingFace cache) ---------------------------------
-# These live in the HF cache (snapshots/blobs layout), so use huggingface-cli
-# when available; otherwise fall back to the Python downloader which uses the
-# diffusers/HF hub client directly.
+# These live in the HF cache (snapshots/blobs layout), so use the HF CLI when
+# available; otherwise fall back to the Python downloader which uses the
+# diffusers/HF hub client directly. Newer huggingface_hub ships `hf` and turns
+# `huggingface-cli` into a deprecation stub that exits non-zero, so prefer `hf`.
 echo; echo "[VAE] stabilityai/sd-vae-ft-ema + sd-vae-ft-mse -> HuggingFace cache"
-if command -v huggingface-cli >/dev/null 2>&1; then
+if command -v hf >/dev/null 2>&1; then
+    hf_cmd="hf"
+elif command -v huggingface-cli >/dev/null 2>&1; then
+    hf_cmd="huggingface-cli"
+else
+    hf_cmd=""
+fi
+if [[ -n "$hf_cmd" ]]; then
     for repo in stabilityai/sd-vae-ft-ema stabilityai/sd-vae-ft-mse; do
         echo "  downloading: $repo"
-        huggingface-cli download "$repo" >/dev/null \
+        "$hf_cmd" download "$repo" >/dev/null \
             || { echo "  FAILED: $repo"; status=1; }
     done
 else
-    echo "  huggingface-cli not found -- fetch the VAEs with:"
+    echo "  hf / huggingface-cli not found -- fetch the VAEs with:"
     echo "      python scripts/download_models.py"
 fi
 
