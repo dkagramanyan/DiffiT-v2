@@ -34,7 +34,7 @@ nvidia-smi
 
 diffit-train --outdir=./runs/diffit_h200_51 \
         --cfg=diffit-1024 \
-        --data=./datasets/imagenet_1024x1024.zip \
+        --data=./datasets/imagenet_9to4_1024x1024_1024x1024.zip \
         --gpus=2 \
         --batch-gpu 8 \
         --combra-metrics True \

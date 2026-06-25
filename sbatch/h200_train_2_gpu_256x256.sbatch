@@ -16,7 +16,7 @@ while [[ ! -f "$REPO_DIR/pyproject.toml" && "$REPO_DIR" != / ]]; do
 done
 cd "$REPO_DIR" || exit 1
 
-conda activate diffit_rocky_51
+conda activate diffit_rocky
 
 export CC=/usr/bin/gcc
 export CXX=/usr/bin/g++
@@ -34,7 +34,7 @@ nvidia-smi
 
 diffit-train --outdir=./runs/diffit_h200_51 \
         --cfg=diffit-256 \
-        --data=./datasets/imagenet_256x256.zip \
+        --data=./datasets/imagenet_9to4_1024x1024_256x256.zip \
         --gpus=2 \
         --batch-gpu 42 \
         --combra-metrics True \
