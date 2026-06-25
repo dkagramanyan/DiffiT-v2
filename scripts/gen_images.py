@@ -58,7 +58,7 @@ from tqdm.auto import tqdm
 import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults
 from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
-from diffit.dist_util import load_state_dict
+from diffit.dist_util import extract_inference_state_dict, load_state_dict
 from diffit.metrics import sample_latents
 
 
@@ -441,7 +441,7 @@ def generate_images(
     # threads never touch the same model.
     print(f'Loading model from "{model_path}" onto {world_size} device(s)...')
     latent_size = image_size // 8
-    state = load_state_dict(model_path, map_location="cpu")
+    state = extract_inference_state_dict(load_state_dict(model_path, map_location="cpu"))
 
     # Auto-detect num_classes from the checkpoint's class embedding table.
     # Last row is the CFG null token, so subtract 1.
