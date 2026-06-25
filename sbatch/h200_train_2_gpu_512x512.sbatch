@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=DiffiT-256
+#SBATCH --job-name=DiffiT-512
 #SBATCH --gpus=2
 #SBATCH --cpus-per-task=16
 #SBATCH --time=3-0:0
@@ -16,9 +16,7 @@ while [[ ! -f "$REPO_DIR/pyproject.toml" && "$REPO_DIR" != / ]]; do
 done
 cd "$REPO_DIR" || exit 1
 
-module purge
-module load Python
-conda activate diffit_rocky_51
+conda activate diffit_rocky
 
 export CC=/usr/bin/gcc
 export CXX=/usr/bin/g++
@@ -35,10 +33,10 @@ nvidia-smi
 # module / CUDA_HOME is required -- the conda env's torch ships its own runtime.
 
 diffit-train --outdir=./runs/diffit_h200_51 \
-        --cfg=diffit-256 \
-        --data=./datasets/imagenet_256x256.zip \
+        --cfg=diffit-512 \
+        --data=./datasets/imagenet_512x512.zip \
         --gpus=2 \
-        --batch-gpu 42 \
+        --batch-gpu 25 \
         --combra-metrics True \
         --save-inference-only True \
         --snap 100
