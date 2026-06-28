@@ -261,6 +261,7 @@ def evaluate_metrics(
     log_fn=None,
     class_list=None, null_class_idx=None,
     ref_images=None, combra_cache=None,
+    inception_metrics=True,
 ):
     """Generate samples across all ranks, compute metrics on rank 0.
 
@@ -268,9 +269,18 @@ def evaluate_metrics(
 
     ref_images: NCHW uint8 reference images. When provided and combra is
         installed, the generated batch is also scored with
-        ``combra.metrics.compute_all_metrics`` and the results are merged into
-        the returned dict under ``combra_*`` keys. combra_cache: a caller-owned
-        dict reused across calls to memoise the reference-side combra work.
+        ``combra.metrics.compute_all_metrics`` (with ``image_metrics=True`` so the
+        ``fid`` / ``cmmd`` / ``fd_dinov2`` image-feature metrics run too) and the
+        results are merged into the returned dict under ``combra_*`` keys.
+        combra_cache: a caller-owned dict reused across calls to memoise the
+        reference-side combra work.
+
+    inception_metrics: when True (default) compute the InceptionV3-based suite
+        (IS / FID / sFID / Precision / Recall). Set False to skip it entirely --
+        the skip is collective (it also bypasses the multi-rank
+        ``compute_precision_recall`` all-reduce, so every rank must pass the same
+        value) and leaves only the combra metrics. ``inception_extractor`` /
+        ``ref_acts`` may be None in that case.
 
     Returns dict of metrics on rank 0, None on other ranks.
     """
@@ -293,29 +303,33 @@ def evaluate_metrics(
     )
 
     if rank == 0:
-        fake_acts = compute_activations(fake_images, inception_extractor, batch_size=64, device=device)
         metrics = {}
-        metrics["IS"] = compute_inception_score(fake_acts["logits"])
-        metrics["FID"] = compute_fid(ref_acts["pool"], fake_acts["pool"])
-        metrics["sFID"] = compute_fid(ref_acts["spatial"], fake_acts["spatial"])
-        ref_pool = ref_acts["pool"]
-        fake_pool = fake_acts["pool"]
+        if inception_metrics:
+            fake_acts = compute_activations(fake_images, inception_extractor, batch_size=64, device=device)
+            metrics["IS"] = compute_inception_score(fake_acts["logits"])
+            metrics["FID"] = compute_fid(ref_acts["pool"], fake_acts["pool"])
+            metrics["sFID"] = compute_fid(ref_acts["spatial"], fake_acts["spatial"])
+            ref_pool = ref_acts["pool"]
+            fake_pool = fake_acts["pool"]
     else:
         metrics = {}
         ref_pool = None
         fake_pool = None
 
-    prec, rec = compute_precision_recall(
-        ref_pool, fake_pool, k=3, rank=rank, world_size=world_size, device=device,
-    )
+    if inception_metrics:
+        prec, rec = compute_precision_recall(
+            ref_pool, fake_pool, k=3, rank=rank, world_size=world_size, device=device,
+        )
+        if rank == 0:
+            metrics["Precision"] = prec
+            metrics["Recall"] = rec
 
     if rank == 0:
-        metrics["Precision"] = prec
-        metrics["Recall"] = rec
         if ref_images is not None and HAS_COMBRA:
             try:
                 combra_metrics = _combra_compute_all_metrics(
                     ref_images, fake_images, device=device, reference_cache=combra_cache,
+                    image_metrics=True,
                 )
                 for k, v in combra_metrics.items():
                     metrics[f"combra_{k}"] = float(v)

@@ -131,8 +131,9 @@ def build_checkpoint(model, ema_model, opt, scaler, use_grad_scaler, cur_nimg):
 
     Contains the raw model + EMA weights, optimizer state, the GradScaler state
     (when AMP fp16 is active), and the image counter so training can resume
-    exactly. ``--save-inference-only`` additionally writes a tiny companion file
-    holding only ``ema_model.state_dict()`` for downstream inference.
+    exactly. ``--save-inference-only`` instead writes a single tiny snapshot
+    holding only ``ema_model.state_dict()`` for downstream inference (no full
+    resumable checkpoint is written in that mode).
     """
     ckpt = {
         "model": model.state_dict(),
@@ -396,18 +397,16 @@ def training_loop(
         if is_main:
             logger.log(f"combra metrics enabled → evaluating on whole dataset ({num_fid_samples} images).")
 
-    # --- Load Inception model + pre-compute reference features (rank 0 only) ---
+    # --- Pre-load reference images + (diffit mode only) Inception features ---
+    # combra and the DiffiT Inception suite are mutually exclusive: when combra
+    # metrics are active the Inception model and reference activations are never
+    # built, and evaluate_metrics is told to skip IS/FID/sFID/Precision/Recall.
     inception_extractor = None
     ref_acts = None
     combra_ref_images = None  # kept for combra metrics when combra is active
     combra_ref_cache = {} if use_combra else None
     if is_main and num_fid_samples > 0:
-        logger.log("Loading InceptionV3 for metric evaluation...")
-        from torchvision.models import Inception_V3_Weights, inception_v3
-        inception_model = inception_v3(weights=Inception_V3_Weights.DEFAULT).eval().to(device)
-        inception_extractor = InceptionFeatureExtractor(inception_model)
-
-        logger.log(f"Pre-computing reference Inception features ({num_fid_samples} real images)...")
+        logger.log(f"Pre-loading {num_fid_samples} reference images...")
         # Full-dataset mode walks the dataset once deterministically (no shuffle,
         # keep the final partial batch) so every real image is used exactly once.
         ref_iter = load_data(
@@ -424,10 +423,20 @@ def training_loop(
             ref_images.append(batch_np)
             n_collected += batch_np.shape[0]
         ref_images = np.concatenate(ref_images, axis=0)[:num_fid_samples]
-        ref_acts = compute_activations(ref_images, inception_extractor, batch_size=64, device=device)
+
         if use_combra:
             combra_ref_images = ref_images  # reused as the combra reference batch
+            logger.log(
+                "combra metrics enabled → DiffiT Inception metrics "
+                "(IS/FID/sFID/Precision/Recall) disabled."
+            )
         else:
+            logger.log("Loading InceptionV3 for metric evaluation...")
+            from torchvision.models import Inception_V3_Weights, inception_v3
+            inception_model = inception_v3(weights=Inception_V3_Weights.DEFAULT).eval().to(device)
+            inception_extractor = InceptionFeatureExtractor(inception_model)
+            logger.log(f"Pre-computing reference Inception features ({num_fid_samples} real images)...")
+            ref_acts = compute_activations(ref_images, inception_extractor, batch_size=64, device=device)
             del ref_images
         logger.log("Reference features computed.")
 
@@ -697,6 +706,7 @@ def training_loop(
                         class_list=list(range(num_dataset_classes)),
                         null_class_idx=num_dataset_classes,
                         ref_images=combra_ref_images, combra_cache=combra_ref_cache,
+                        inception_metrics=not use_combra,
                     )
                     # Only rank 0 logs and saves metrics
                     if is_main and stats_metrics is not None:
@@ -712,26 +722,32 @@ def training_loop(
                                 stats_tfevents.add_scalar(f"Metrics/{name}", value, global_step=global_step, walltime=walltime)
                             stats_tfevents.flush()
 
-                # Save checkpoint (rank 0 only) — full resumable state by default.
+                # Save checkpoint (rank 0 only). --save-inference-only writes ONLY
+                # the small EMA-weights snapshot; otherwise a full resumable state.
                 if is_main:
-                    save_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}.pt")
-                    logger.log(f"Saving checkpoint to {save_path}...")
-                    torch.save(build_checkpoint(model, ema_model, opt, scaler, use_grad_scaler, cur_nimg), save_path)
                     if save_inference_only:
-                        inf_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}-inference.pt")
-                        torch.save(ema_model.state_dict(), inf_path)
-                        logger.log(f"Inference-only snapshot saved to {inf_path}")
+                        save_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}-inference.pt")
+                        logger.log(f"Saving inference-only snapshot to {save_path}...")
+                        torch.save(ema_model.state_dict(), save_path)
+                    else:
+                        save_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}.pt")
+                        logger.log(f"Saving checkpoint to {save_path}...")
+                        torch.save(build_checkpoint(model, ema_model, opt, scaler, use_grad_scaler, cur_nimg), save_path)
                     logger.log(f"Checkpoint saved (kimg={cur_nimg / 1e3:.1f})")
 
                     maintenance_time = time.time() - snap_start
 
-    # Final save — full resumable state by default.
+    # Final save. --save-inference-only writes ONLY the EMA-weights snapshot;
+    # otherwise a full resumable state.
     if is_main:
-        save_path = os.path.join(run_dir, "network-final.pt")
-        logger.log(f"Saving final model to {save_path}...")
-        torch.save(build_checkpoint(model, ema_model, opt, scaler, use_grad_scaler, cur_nimg), save_path)
         if save_inference_only:
-            torch.save(ema_model.state_dict(), os.path.join(run_dir, "network-final-inference.pt"))
+            save_path = os.path.join(run_dir, "network-final-inference.pt")
+            logger.log(f"Saving final inference-only model to {save_path}...")
+            torch.save(ema_model.state_dict(), save_path)
+        else:
+            save_path = os.path.join(run_dir, "network-final.pt")
+            logger.log(f"Saving final model to {save_path}...")
+            torch.save(build_checkpoint(model, ema_model, opt, scaler, use_grad_scaler, cur_nimg), save_path)
 
         # Final image snapshot
         logger.log("Saving final image snapshot...")
@@ -897,8 +913,8 @@ BASE_CONFIGS = {
 # Misc settings.
 @click.option("--desc",         help="String to include in result dir name", metavar="STR",    type=str, default=None)
 @click.option("--metrics",      help="Quality metrics", metavar="NAME",                        type=str, default="fid50k", show_default=True)
-@click.option("--combra-metrics", help="Compute combra generative-quality metrics each snapshot tick (independent of --metrics)", metavar="BOOL", type=bool, default=True, show_default=True)
-@click.option("--save-inference-only", help="Also write a small inference-only snapshot (EMA weights only, no optimizer/resume state) each snapshot tick", metavar="BOOL", type=bool, default=False, show_default=True)
+@click.option("--combra-metrics", help="Compute combra generative-quality metrics each snapshot tick; when on, the DiffiT Inception metrics (IS/FID/sFID/Precision/Recall) are disabled", metavar="BOOL", type=bool, default=True, show_default=True)
+@click.option("--save-inference-only", help="Save ONLY a small inference snapshot (EMA weights, no optimizer/resume state) each snapshot tick, instead of the full resumable checkpoint", metavar="BOOL", type=bool, default=False, show_default=True)
 @click.option("--tf32/--no-tf32", "allow_tf32", help="Enable TF32 for matmul/conv",            default=True, show_default=True)
 @click.option("--workers",      help="DataLoader worker processes", metavar="INT",             type=click.IntRange(min=1), default=4, show_default=True)
 @click.option("--cache-in-ram/--no-cache-in-ram", help="Cache entire dataset in RAM to reduce disk I/O", default=True, show_default=True)
