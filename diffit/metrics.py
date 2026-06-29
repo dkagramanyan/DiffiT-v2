@@ -18,11 +18,21 @@ from diffit.dpm_solver import dpm_solver_sample
 # generative-quality metrics during training. The import is guarded so training
 # runs unchanged when combra is not installed.
 try:
-    from combra.metrics import compute_all_metrics as _combra_compute_all_metrics
+    from combra.metrics import (
+        cmmd_features as _combra_cmmd_features,
+        cmmd_from_features as _combra_cmmd_from_features,
+        compute_all_metrics as _combra_compute_all_metrics,
+        fd_dinov2_features as _combra_fd_dinov2_features,
+        fd_dinov2_from_features as _combra_fd_dinov2_from_features,
+        fid_features as _combra_fid_features,
+        fid_from_features as _combra_fid_from_features,
+    )
 
     HAS_COMBRA = True
 except ImportError:
     _combra_compute_all_metrics = None
+    _combra_fid_features = _combra_cmmd_features = _combra_fd_dinov2_features = None
+    _combra_fid_from_features = _combra_cmmd_from_features = _combra_fd_dinov2_from_features = None
     HAS_COMBRA = False
 
 # The three combra image-feature metrics carry their generated-sample count in the
@@ -72,18 +82,17 @@ def sample_latents(model_fn, diffusion, shape, device, *, sampler, num_steps, mo
 
 
 @torch.inference_mode()
-def generate_eval_samples(
+def _generate_local_shard(
     ema_model, vae, diffusion, num_samples, batch_gpu, latent_size, device,
     *,
     cfg_scale, num_sampling_steps=25, scale_pow=4.0, sampler="dpm++",
     rank=0, world_size=1,
     class_list=None, null_class_idx=None,
 ):
-    """Generate N random images for metric evaluation (NCHW uint8 numpy).
+    """Generate this rank's shard of the eval samples (NCHW uint8 numpy).
 
-    class_list: list of int class IDs to sample from. Defaults to range(NUM_CLASSES).
-    null_class_idx: CFG null-token embedding index. Defaults to NUM_CLASSES
-        (matches a model built with num_classes=NUM_CLASSES).
+    The ``num_samples`` are split evenly across ranks; each rank returns only the
+    images it generated. Use :func:`_gather_eval_images` to collect them on rank 0.
     """
     if class_list is None:
         class_list = list(range(NUM_CLASSES))
@@ -133,34 +142,59 @@ def generate_eval_samples(
     if pbar is not None:
         pbar.close()
 
-    local_images = np.concatenate(all_images, axis=0)[:local_target] if all_images else np.empty((0, 3, 0, 0), dtype=np.uint8)
+    return np.concatenate(all_images, axis=0)[:local_target] if all_images else np.empty((0, 3, 0, 0), dtype=np.uint8)
 
-    if world_size > 1:
-        local_tensor = torch.from_numpy(local_images).to(device)
-        local_count = torch.tensor([local_tensor.shape[0]], device=device, dtype=torch.long)
-        all_counts = [torch.zeros_like(local_count) for _ in range(world_size)]
-        dist.all_gather(all_counts, local_count)
 
-        if rank == 0:
-            max_count = max(c.item() for c in all_counts)
-            if local_tensor.shape[0] < max_count:
-                pad = torch.zeros(max_count - local_tensor.shape[0], *local_tensor.shape[1:], device=device, dtype=local_tensor.dtype)
-                local_tensor = torch.cat([local_tensor, pad], 0)
-            gathered = [torch.zeros_like(local_tensor) for _ in range(world_size)]
-            dist.gather(local_tensor, gathered, dst=0)
-            result = []
-            for i, g in enumerate(gathered):
-                result.append(g[:all_counts[i].item()].cpu().numpy())
-            return np.concatenate(result, axis=0)[:num_samples]
-        else:
-            max_count = max(c.item() for c in all_counts)
-            if local_tensor.shape[0] < max_count:
-                pad = torch.zeros(max_count - local_tensor.shape[0], *local_tensor.shape[1:], device=device, dtype=local_tensor.dtype)
-                local_tensor = torch.cat([local_tensor, pad], 0)
-            dist.gather(local_tensor, dst=0)
-            return None
+def _gather_eval_images(local_images, device, rank, world_size, num_samples):
+    """Gather per-rank image shards to rank 0 (full set on rank 0, None elsewhere).
 
-    return local_images[:num_samples]
+    Ranks may hold different counts, so each shard is padded to the max before the
+    collective gather and trimmed back to its true length on rank 0.
+    """
+    if world_size == 1:
+        return local_images[:num_samples]
+
+    local_tensor = torch.from_numpy(local_images).to(device)
+    local_count = torch.tensor([local_tensor.shape[0]], device=device, dtype=torch.long)
+    all_counts = [torch.zeros_like(local_count) for _ in range(world_size)]
+    dist.all_gather(all_counts, local_count)
+
+    max_count = max(c.item() for c in all_counts)
+    if local_tensor.shape[0] < max_count:
+        pad = torch.zeros(max_count - local_tensor.shape[0], *local_tensor.shape[1:], device=device, dtype=local_tensor.dtype)
+        local_tensor = torch.cat([local_tensor, pad], 0)
+
+    if rank == 0:
+        gathered = [torch.zeros_like(local_tensor) for _ in range(world_size)]
+        dist.gather(local_tensor, gathered, dst=0)
+        result = [g[:all_counts[i].item()].cpu().numpy() for i, g in enumerate(gathered)]
+        return np.concatenate(result, axis=0)[:num_samples]
+    dist.gather(local_tensor, dst=0)
+    return None
+
+
+@torch.inference_mode()
+def generate_eval_samples(
+    ema_model, vae, diffusion, num_samples, batch_gpu, latent_size, device,
+    *,
+    cfg_scale, num_sampling_steps=25, scale_pow=4.0, sampler="dpm++",
+    rank=0, world_size=1,
+    class_list=None, null_class_idx=None,
+):
+    """Generate N random images for metric evaluation (NCHW uint8 numpy).
+
+    Splits generation across ranks and gathers the full set to rank 0 (None on
+    other ranks). class_list: list of int class IDs to sample from. Defaults to
+    range(NUM_CLASSES). null_class_idx: CFG null-token embedding index. Defaults
+    to NUM_CLASSES (matches a model built with num_classes=NUM_CLASSES).
+    """
+    local_images = _generate_local_shard(
+        ema_model, vae, diffusion, num_samples, batch_gpu, latent_size, device,
+        cfg_scale=cfg_scale, num_sampling_steps=num_sampling_steps, scale_pow=scale_pow,
+        sampler=sampler, rank=rank, world_size=world_size,
+        class_list=class_list, null_class_idx=null_class_idx,
+    )
+    return _gather_eval_images(local_images, device, rank, world_size, num_samples)
 
 
 def compute_fid(acts1, acts2, eps=1e-6):
@@ -256,6 +290,90 @@ def compute_precision_recall(ref_acts, sample_acts, k=3, rank=0, world_size=1, d
     return precision, recall
 
 
+# The three combra image-feature metrics, in a fixed order so every rank gathers
+# the same features in the same sequence. fid → InceptionV3, cmmd → CLIP,
+# fd_dinov2 → DINOv2; each extractor uses combra's own default backbone so the
+# distributed result matches the single-GPU compute_all_metrics(image_metrics=True).
+_COMBRA_IMAGE_METRICS = ("fid", "cmmd", "fd_dinov2")
+
+
+def _combra_extract_features(name, images, device):
+    if name == "fid":
+        return _combra_fid_features(images, device=device).astype(np.float32)
+    if name == "cmmd":
+        return _combra_cmmd_features(images, device=device).astype(np.float32)
+    return _combra_fd_dinov2_features(images, device=device).astype(np.float32)
+
+
+def _combra_distance(name, ref_features, gen_features):
+    if name == "fid":
+        return _combra_fid_from_features(ref_features, gen_features)
+    if name == "cmmd":
+        return _combra_cmmd_from_features(ref_features, gen_features)
+    return _combra_fd_dinov2_from_features(ref_features, gen_features)
+
+
+def _gather_feature_rows(local, device, rank, world_size):
+    """Gather per-rank feature rows ``[n_i, D]`` to rank 0, concatenated in rank
+    order (None on other ranks). Ranks may hold different ``n_i``, so each block
+    is padded to the max before the collective gather and trimmed on rank 0."""
+    if world_size == 1:
+        return local
+
+    t = torch.from_numpy(np.ascontiguousarray(local)).to(device)
+    count = torch.tensor([t.shape[0]], device=device, dtype=torch.long)
+    all_counts = [torch.zeros_like(count) for _ in range(world_size)]
+    dist.all_gather(all_counts, count)
+
+    max_count = max(c.item() for c in all_counts)
+    if t.shape[0] < max_count:
+        pad = torch.zeros(max_count - t.shape[0], *t.shape[1:], device=device, dtype=t.dtype)
+        t = torch.cat([t, pad], 0)
+
+    if rank == 0:
+        gathered = [torch.zeros_like(t) for _ in range(world_size)]
+        dist.gather(t, gathered, dst=0)
+        rows = [g[:all_counts[i].item()].cpu().numpy() for i, g in enumerate(gathered)]
+        return np.concatenate(rows, axis=0)
+    dist.gather(t, dst=0)
+    return None
+
+
+def _gather_combra_gen_features(local_images, device, rank, world_size):
+    """Each rank extracts the three image-feature sets from its own generated
+    shard; the rows are gathered to rank 0. Returns a ``{metric: [N, D]}`` dict on
+    rank 0 and a ``{metric: None}`` dict on other ranks (every rank still runs the
+    collective gather for each metric, in the same order)."""
+    return {
+        name: _gather_feature_rows(
+            _combra_extract_features(name, local_images, device), device, rank, world_size
+        )
+        for name in _COMBRA_IMAGE_METRICS
+    }
+
+
+def _combra_distributed_metrics(ref_images, fake_images, gen_feats, device, combra_cache):
+    """Rank-0 combra metrics: the cheap angle-density / Gaussian-fit metrics over
+    the full gathered image set, plus the image-feature metrics computed from the
+    gathered generated features against the (cached) reference features. Equivalent
+    to ``compute_all_metrics(image_metrics=True)`` but with the generated-side
+    feature extraction already sharded across ranks by the callers."""
+    metrics = dict(_combra_compute_all_metrics(
+        ref_images, fake_images, device=device,
+        reference_cache=combra_cache, image_metrics=False,
+    ))
+    for name in _COMBRA_IMAGE_METRICS:
+        ref_key = f"dist_ref_{name}"
+        if combra_cache is not None and ref_key in combra_cache:
+            ref_features = combra_cache[ref_key]
+        else:
+            ref_features = _combra_extract_features(name, ref_images, device)
+            if combra_cache is not None:
+                combra_cache[ref_key] = ref_features
+        metrics[name] = _combra_distance(name, ref_features, gen_feats[name])
+    return metrics
+
+
 @torch.inference_mode()
 def evaluate_metrics(
     ema_model, vae, diffusion, ref_acts, inception_extractor,
@@ -273,20 +391,24 @@ def evaluate_metrics(
 
     class_list / null_class_idx: forwarded to generate_eval_samples. See there.
 
-    ref_images: NCHW uint8 reference images. When provided and combra is
-        installed, the generated batch is also scored with
-        ``combra.metrics.compute_all_metrics`` (with ``image_metrics=True`` so the
-        ``fid`` / ``cmmd`` / ``fd_dinov2`` image-feature metrics run too) and the
-        results are merged into the returned dict under ``combra_*`` keys.
+    ref_images: NCHW uint8 reference images (rank 0 only). When combra is active
+        (``inception_metrics=False`` and combra installed) the generated batch is
+        also scored with combra's ``fid`` / ``cmmd`` / ``fd_dinov2`` image-feature
+        metrics plus the angle-density / Gaussian-fit metrics, merged into the
+        returned dict under ``combra_*`` keys. The image-feature extraction is
+        sharded: every rank extracts features from its own generated shard and the
+        feature rows are gathered to rank 0, so all GPUs share that work.
         combra_cache: a caller-owned dict reused across calls to memoise the
-        reference-side combra work.
+        reference-side combra work (features + angle density).
 
     inception_metrics: when True (default) compute the InceptionV3-based suite
         (IS / FID / sFID / Precision / Recall). Set False to skip it entirely --
         the skip is collective (it also bypasses the multi-rank
         ``compute_precision_recall`` all-reduce, so every rank must pass the same
         value) and leaves only the combra metrics. ``inception_extractor`` /
-        ``ref_acts`` may be None in that case.
+        ``ref_acts`` may be None in that case. ``inception_metrics`` is the uniform
+        per-rank signal for "combra active" (ref_images is rank-0 only), which the
+        sharded feature gather relies on for matched collectives across ranks.
 
     Returns dict of metrics on rank 0, None on other ranks.
     """
@@ -300,13 +422,24 @@ def evaluate_metrics(
             f"{world_size} GPU(s), sampler={sampler}×{num_sampling_steps}, "
             f"cfg_scale={cfg_scale}, classes={n_cls})..."
         )
-    fake_images = generate_eval_samples(
+    local_fakes = _generate_local_shard(
         ema_model, vae, diffusion, num_fid_samples, batch_gpu, latent_size, device,
         cfg_scale=cfg_scale,
         num_sampling_steps=num_sampling_steps, sampler=sampler,
         rank=rank, world_size=world_size,
         class_list=class_list, null_class_idx=null_class_idx,
     )
+
+    # combra image-feature metrics are sharded across ranks. The signal must be
+    # uniform across ranks (ref_images is rank-0 only), so key off inception_metrics,
+    # which train.py sets collectively. Every rank extracts features from its own
+    # shard and the rows are gathered to rank 0.
+    combra_active = (not inception_metrics) and HAS_COMBRA
+    gen_feats = _gather_combra_gen_features(local_fakes, device, rank, world_size) if combra_active else None
+
+    # Gather the full generated set to rank 0 for the Inception suite and/or the
+    # combra angle-density metrics (both run centrally on rank 0).
+    fake_images = _gather_eval_images(local_fakes, device, rank, world_size, num_fid_samples)
 
     if rank == 0:
         metrics = {}
@@ -331,11 +464,10 @@ def evaluate_metrics(
             metrics["Recall"] = rec
 
     if rank == 0:
-        if ref_images is not None and HAS_COMBRA:
+        if combra_active and ref_images is not None:
             try:
-                combra_metrics = _combra_compute_all_metrics(
-                    ref_images, fake_images, device=device, reference_cache=combra_cache,
-                    image_metrics=True,
+                combra_metrics = _combra_distributed_metrics(
+                    ref_images, fake_images, gen_feats, device, combra_cache,
                 )
                 for k, v in combra_metrics.items():
                     key = _COMBRA_IMAGE_RENAME.get(k, k)

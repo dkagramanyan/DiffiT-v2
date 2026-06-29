@@ -416,10 +416,10 @@ Quality metrics (**IS**, **FID**, **sFID**, **Precision**, **Recall**) are compu
 To enable combra metrics, install the optional extra:
 
 ```bash
-pip install -e ".[combra]"      # pulls combra + open-clip-torch (needed for CMMD)
+pip install -e ".[combra]"      # pulls combra (all image metrics included)
 ```
 
-`combra_cmmd10k` needs **open-clip-torch** (CLIP backbone); the `[combra]` extra installs it via `combra[gen-metrics]`. If it is missing, training continues but CMMD is logged as `NaN` (you'll see `cmmd failed: compute_cmmd needs open_clip` in the log). FID and FD-DINOv2 only need combra's base deps (pytorch-fid + a `torch.hub` DINOv2 download). Pre-fetch combra's CLIP/DINOv2 backbones for offline nodes with `python scripts/download_models.py` or `bash download_models.sh`.
+All combra image metrics are covered by combra's base dependencies: `combra_fid10k` (pytorch-fid + InceptionV3 weights), `combra_cmmd10k` (**open-clip-torch** CLIP backbone) and `combra_fd_dinov2_10k` (a `torch.hub` DINOv2 download) — so a plain `combra` install enables them all, no separate extra. Pre-fetch combra's CLIP/DINOv2 backbones for offline nodes with `python scripts/download_models.py` or `bash download_models.sh`.
 
 Monitor training with TensorBoard:
 

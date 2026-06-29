@@ -33,12 +33,11 @@ dev = [
     "ruff>=0.4.0",
 ]
 # Optional: enables combra.metrics.compute_all_metrics during training-time eval.
-# Training runs unchanged without it (the import is guarded). The [gen-metrics]
-# extra pulls open-clip-torch, which combra's CLIP-MMD (combra_cmmd10k) needs --
-# without it CMMD is logged as NaN. combra's base deps already cover the FID /
-# FD-DINOv2 image metrics (pytorch-fid + torch.hub DINOv2).
+# Training runs unchanged without it (the import is guarded). combra's base deps
+# cover every image metric -- FID (pytorch-fid), CLIP-MMD (open-clip-torch) and
+# FD-DINOv2 (torch.hub DINOv2) -- so plain `combra` is all that's needed.
 combra = [
-    "combra[gen-metrics]",
+    "combra",
 ]
 
 # Console entry-points. After `pip install -e .` these are available on PATH.
