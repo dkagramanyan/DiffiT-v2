@@ -32,7 +32,7 @@ nvidia-smi
 # DiffiT is pure PyTorch (no custom CUDA-op compilation), so no system CUDA
 # module / CUDA_HOME is required -- the conda env's torch ships its own runtime.
 
-diffit-train --outdir=./runs/diffit_h200_51 \
+diffit-train --outdir=./runs/wc_cv_combra \
         --cfg=diffit-1024 \
         --data=./datasets/imagenet_9to4_1024x1024_1024x1024.zip \
         --gpus=2 \
