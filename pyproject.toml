@@ -70,6 +70,12 @@ extend-exclude = ["experiments"]
 # is intentionally not enforced — those patterns are common in ML entry scripts.
 select = ["F", "I"]
 
+[tool.ruff.lint.isort]
+# Keep multiple aliased imports from one module in a single grouped statement
+# (e.g. the guarded combra.metrics import in diffit/metrics.py) instead of
+# exploding them into one `from x import (y as z)` line each.
+combine-as-imports = true
+
 [tool.ruff.lint.per-file-ignores]
 # dpm_solver keeps a couple of named log-SNR intermediates for readability of
 # the sampling math even though they are not all consumed.
