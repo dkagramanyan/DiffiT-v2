@@ -51,6 +51,12 @@ from diffit.metrics import (
 from diffit.nn import update_ema
 from diffit.timestep_sampler import create_named_schedule_sampler
 
+# Number of fake images generated each snapshot tick for the combra image metrics
+# (combra_fid10k / combra_cmmd10k / combra_fd_dinov2_10k), scored against the whole
+# training set as the real reference. Mirrors SAN-v2's COMBRA_NUM_GEN so the two
+# runs' TensorBoard tags line up.
+COMBRA_NUM_GEN = 10000
+
 # ---------------------------------------------------------------------------
 # Image grid utilities (matching SAN-v2 style)
 # ---------------------------------------------------------------------------
@@ -386,16 +392,21 @@ def training_loop(
     # combra metrics run only when requested AND installed.
     use_combra = combra_metrics and HAS_COMBRA
 
-    # When combra metrics are active, evaluate on the WHOLE training dataset: the
-    # reference is every real image once and we generate a matching number of
-    # samples. Otherwise the eval path is unchanged (configured num_fid_samples,
-    # e.g. the 10k default). Computed on all ranks so the distributed eval
-    # generation agrees on the sample count.
+    # When combra metrics are active, mirror SAN-v2: generate COMBRA_NUM_GEN fakes
+    # each eval (num_fid_samples is forced to it) and score them against the WHOLE
+    # training set as the real reference (combra_ref_count). Otherwise the eval path
+    # is unchanged (configured num_fid_samples, e.g. the 10k default). Computed on
+    # all ranks so the distributed eval generation agrees on the sample count.
     full_dataset_eval = use_combra and num_fid_samples > 0
+    combra_ref_count = 0
     if full_dataset_eval:
-        num_fid_samples = count_data(data)
+        combra_ref_count = count_data(data)
+        num_fid_samples = COMBRA_NUM_GEN
         if is_main:
-            logger.log(f"combra metrics enabled → evaluating on whole dataset ({num_fid_samples} images).")
+            logger.log(
+                f"combra metrics enabled → generating {num_fid_samples} fakes scored "
+                f"against the whole dataset ({combra_ref_count} reals)."
+            )
 
     # --- Pre-load reference images + (diffit mode only) Inception features ---
     # combra and the DiffiT Inception suite are mutually exclusive: when combra
@@ -406,23 +417,26 @@ def training_loop(
     combra_ref_images = None  # kept for combra metrics when combra is active
     combra_ref_cache = {} if use_combra else None
     if is_main and num_fid_samples > 0:
-        logger.log(f"Pre-loading {num_fid_samples} reference images...")
+        # Reals reference count: combra scores against the whole training set
+        # (combra_ref_count); the diffit Inception path uses num_fid_samples.
+        ref_count = combra_ref_count if use_combra else num_fid_samples
+        logger.log(f"Pre-loading {ref_count} reference images...")
         # Full-dataset mode walks the dataset once deterministically (no shuffle,
         # keep the final partial batch) so every real image is used exactly once.
         ref_iter = load_data(
-            data_dir=data, batch_size=min(num_fid_samples, 64), image_size=image_size,
+            data_dir=data, batch_size=min(ref_count, 64), image_size=image_size,
             class_cond=True, random_flip=False, num_workers=workers,
             distributed=False,
             deterministic=full_dataset_eval, drop_last=not full_dataset_eval,
         )
         ref_images = []
         n_collected = 0
-        while n_collected < num_fid_samples:
+        while n_collected < ref_count:
             batch_ref, _ = next(ref_iter)
             batch_np = ((batch_ref + 1) * PIXEL_NORM_HALF).clamp(0, UINT8_MAX).to(torch.uint8).numpy()
             ref_images.append(batch_np)
             n_collected += batch_np.shape[0]
-        ref_images = np.concatenate(ref_images, axis=0)[:num_fid_samples]
+        ref_images = np.concatenate(ref_images, axis=0)[:ref_count]
 
         if use_combra:
             combra_ref_images = ref_images  # reused as the combra reference batch
@@ -435,7 +449,7 @@ def training_loop(
             from torchvision.models import Inception_V3_Weights, inception_v3
             inception_model = inception_v3(weights=Inception_V3_Weights.DEFAULT).eval().to(device)
             inception_extractor = InceptionFeatureExtractor(inception_model)
-            logger.log(f"Pre-computing reference Inception features ({num_fid_samples} real images)...")
+            logger.log(f"Pre-computing reference Inception features ({ref_count} real images)...")
             ref_acts = compute_activations(ref_images, inception_extractor, batch_size=64, device=device)
             del ref_images
         logger.log("Reference features computed.")

@@ -409,7 +409,17 @@ training exactly. The inference loaders (`gen_images.py`, `sample.py`) transpare
 extract the EMA weights from any of these — a full checkpoint, an older bare
 EMA `state_dict`, or a `--save-inference-only` `*-inference.pt` file.
 
-Quality metrics (**IS**, **FID**, **sFID**, **Precision**, **Recall**) are computed automatically every `snap` ticks during training using 10000 samples by default (configurable per `--cfg`). Results are logged to TensorBoard under `Metrics/` and to `stats.jsonl`. Adjust with `--num-fid-samples` (set to 0 to disable). When the optional `combra` package is installed (`pip install -e ".[combra]"`) and `--combra-metrics` is on (default), additional `combra_*` metrics (e.g. CMMD, FD-DINOv2) are logged each tick too — and the eval reference becomes the whole training set. Pre-fetch combra's CLIP/DINOv2 backbones for offline nodes with `python scripts/download_models.py` or `bash download_models.sh`.
+Quality metrics (**IS**, **FID**, **sFID**, **Precision**, **Recall**) are computed automatically every `snap` ticks during training using 10000 samples by default (configurable per `--cfg`). Results are logged to TensorBoard under `Metrics/` and to `stats.jsonl`. Adjust with `--num-fid-samples` (set to 0 to disable).
+
+`--combra-metrics` (on by default) is **mutually exclusive** with the Inception suite above: when it is on, the IS/FID/sFID/Precision/Recall metrics are disabled and only `combra_*` metrics are logged. combra generates **10000 fakes** each tick (matching the SAN-v2 reference) scored against the **whole training set** as the real reference. The image-feature metrics are logged as `combra_fid10k`, `combra_cmmd10k`, `combra_fd_dinov2_10k` (the suffix mirrors SAN-v2); the angle-density metrics (`combra_w1`, `combra_mu1`, …) keep their bare names.
+
+To enable combra metrics, install the optional extra:
+
+```bash
+pip install -e ".[combra]"      # pulls combra + open-clip-torch (needed for CMMD)
+```
+
+`combra_cmmd10k` needs **open-clip-torch** (CLIP backbone); the `[combra]` extra installs it via `combra[gen-metrics]`. If it is missing, training continues but CMMD is logged as `NaN` (you'll see `cmmd failed: compute_cmmd needs open_clip` in the log). FID and FD-DINOv2 only need combra's base deps (pytorch-fid + a `torch.hub` DINOv2 download). Pre-fetch combra's CLIP/DINOv2 backbones for offline nodes with `python scripts/download_models.py` or `bash download_models.sh`.
 
 Monitor training with TensorBoard:
 
@@ -498,6 +508,8 @@ Quality metrics are computed **inline during training** every `snap` ticks. The 
 - **sFID** — spatial FID (captures spatial structure)
 - **Precision** — fraction of generated samples in the real data manifold
 - **Recall** — fraction of real samples covered by the generated manifold
+
+With `--combra-metrics` on (default) these Inception metrics are replaced by the combra suite instead — the angle-density metrics plus `combra_fid10k` / `combra_cmmd10k` / `combra_fd_dinov2_10k` (10k fakes vs the whole training set). See [Training output](#training-output) above for the install needed (CMMD requires `open-clip-torch`).
 
 By default, 10000 samples are generated for each evaluation (configurable via `--num-fid-samples`). For a full FID-50K evaluation, use the standalone evaluator:
 

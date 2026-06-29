@@ -25,6 +25,12 @@ except ImportError:
     _combra_compute_all_metrics = None
     HAS_COMBRA = False
 
+# The three combra image-feature metrics carry their generated-sample count in the
+# TensorBoard key, matching the SAN-v2 reference dashboards. combra is run on
+# COMBRA_NUM_GEN (10k) fakes scored against the whole training set (see train.py),
+# so the suffix is literal. The angle-density metrics keep their bare names.
+_COMBRA_IMAGE_RENAME = {"fid": "fid10k", "cmmd": "cmmd10k", "fd_dinov2": "fd_dinov2_10k"}
+
 
 @torch.inference_mode()
 def compute_activations(images_uint8_nchw, extractor, batch_size, device, desc="Computing Inception features"):
@@ -332,7 +338,8 @@ def evaluate_metrics(
                     image_metrics=True,
                 )
                 for k, v in combra_metrics.items():
-                    metrics[f"combra_{k}"] = float(v)
+                    key = _COMBRA_IMAGE_RENAME.get(k, k)
+                    metrics[f"combra_{key}"] = float(v)
             except Exception as e:  # combra failure must not abort the eval tick
                 log_fn(f"  combra metrics failed: {e}")
         for k, v in metrics.items():
