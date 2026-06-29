@@ -181,6 +181,39 @@ def subprocess_fn(rank, c, temp_dir):
 # ---------------------------------------------------------------------------
 
 
+def combra_smoke_test(ref_images, device, log_fn):
+    """Verify combra metrics actually *compute* (not just import) before training.
+
+    ``HAS_COMBRA`` only proves the package imports. The image-feature metrics
+    (FID / CMMD / FD-DINOv2) depend on optional backends (InceptionV3, CLIP,
+    DINOv2 weights / network) that combra records as ``nan`` rather than raising
+    when they are missing -- so a broken install silently produces useless
+    ``nan`` metrics every snapshot tick. Run the real combra pipeline once here,
+    on a tiny slice of the reference images used as both reference and generated
+    batch, and fail fast if anything comes back non-finite. Raises RuntimeError
+    on failure so the misconfiguration surfaces at startup instead of after the
+    first eval tick.
+    """
+    from combra.metrics import compute_all_metrics
+
+    sample = ref_images[: min(4, len(ref_images))]
+    try:
+        # Throwaway cache so the smoke test never pollutes the real reference cache.
+        metrics = compute_all_metrics(
+            sample, sample, device=device, image_metrics=True, reference_cache={},
+        )
+    except Exception as e:
+        raise RuntimeError(f"combra metrics smoke test failed to run: {e}") from e
+    bad = sorted(k for k, v in metrics.items() if not np.isfinite(v))
+    if bad:
+        raise RuntimeError(
+            f"combra metrics smoke test produced non-finite values for {bad} -- "
+            "a metric backend or optional dependency is missing/broken. Fix the "
+            "install or pass --combra-metrics=false."
+        )
+    log_fn(f"combra metrics smoke test passed ({len(metrics)} metrics computed).")
+
+
 def training_loop(
     rank,
     run_dir,
@@ -440,6 +473,8 @@ def training_loop(
 
         if use_combra:
             combra_ref_images = ref_images  # reused as the combra reference batch
+            logger.log("Running combra metrics smoke test...")
+            combra_smoke_test(combra_ref_images, device, logger.log)
             logger.log(
                 "combra metrics enabled → DiffiT Inception metrics "
                 "(IS/FID/sFID/Precision/Recall) disabled."
