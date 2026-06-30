@@ -46,6 +46,7 @@ from diffit.metrics import (
     HAS_COMBRA,
     compute_activations,
     evaluate_metrics,
+    precompute_combra_reference,
     sample_latents,
 )
 from diffit.nn import update_ema
@@ -212,6 +213,34 @@ def combra_smoke_test(ref_images, device, log_fn):
             "install or pass --combra-metrics=false."
         )
     log_fn(f"combra metrics smoke test passed ({len(metrics)} metrics computed).")
+
+
+def load_reference_shard(data, ref_count, image_size, workers, rank, world_size):
+    """Load this rank's deterministic slice of the first ``ref_count`` reals as an
+    NCHW uint8 array. Every rank walks the *same* deterministic stream and keeps the
+    images whose global index ``i`` satisfies ``i % world_size == rank``, so the
+    union of the per-rank shards is exactly the rank-0 reference set -- this lets the
+    expensive combra reference angle/feature extraction be sharded across ranks
+    instead of run rank-0-only. Memory-light: each rank holds ~1/world_size of the
+    reals."""
+    ref_iter = load_data(
+        data_dir=data, batch_size=min(ref_count, 64), image_size=image_size,
+        class_cond=True, random_flip=False, num_workers=workers,
+        distributed=False, deterministic=True, drop_last=False,
+    )
+    shard = []
+    seen = 0
+    while seen < ref_count:
+        batch_ref, _ = next(ref_iter)
+        batch_np = ((batch_ref + 1) * PIXEL_NORM_HALF).clamp(0, UINT8_MAX).to(torch.uint8).numpy()
+        for j in range(batch_np.shape[0]):
+            gidx = seen + j
+            if gidx >= ref_count:
+                break
+            if gidx % world_size == rank:
+                shard.append(batch_np[j])
+        seen += batch_np.shape[0]
+    return np.stack(shard, axis=0)
 
 
 def training_loop(
@@ -447,39 +476,49 @@ def training_loop(
     # built, and evaluate_metrics is told to skip IS/FID/sFID/Precision/Recall.
     inception_extractor = None
     ref_acts = None
-    combra_ref_images = None  # kept for combra metrics when combra is active
-    combra_ref_cache = {} if use_combra else None
-    if is_main and num_fid_samples > 0:
+    combra_ref = None  # precomputed sharded combra reference (rank 0 only)
+    if num_fid_samples > 0:
         # Reals reference count: combra scores against the whole training set
         # (combra_ref_count); the diffit Inception path uses num_fid_samples.
         ref_count = combra_ref_count if use_combra else num_fid_samples
-        logger.log(f"Pre-loading {ref_count} reference images...")
-        # Full-dataset mode walks the dataset once deterministically (no shuffle,
-        # keep the final partial batch) so every real image is used exactly once.
-        ref_iter = load_data(
-            data_dir=data, batch_size=min(ref_count, 64), image_size=image_size,
-            class_cond=True, random_flip=False, num_workers=workers,
-            distributed=False,
-            deterministic=full_dataset_eval, drop_last=not full_dataset_eval,
-        )
-        ref_images = []
-        n_collected = 0
-        while n_collected < ref_count:
-            batch_ref, _ = next(ref_iter)
-            batch_np = ((batch_ref + 1) * PIXEL_NORM_HALF).clamp(0, UINT8_MAX).to(torch.uint8).numpy()
-            ref_images.append(batch_np)
-            n_collected += batch_np.shape[0]
-        ref_images = np.concatenate(ref_images, axis=0)[:ref_count]
+        if is_main:
+            logger.log(f"Pre-loading {ref_count} reference images...")
 
         if use_combra:
-            combra_ref_images = ref_images  # reused as the combra reference batch
-            logger.log("Running combra metrics smoke test...")
-            combra_smoke_test(combra_ref_images, device, logger.log)
-            logger.log(
-                "combra metrics enabled → DiffiT Inception metrics "
-                "(IS/FID/sFID/Precision/Recall) disabled."
+            # All ranks load their deterministic slice of the reals and extract the
+            # combra reference angles/features in parallel; gathered to rank 0 here
+            # once so the (cached) reference side never recomputes and no reference
+            # collective recurs per eval tick. Runs on every rank (use_combra is
+            # rank-uniform) so the gather collectives stay matched.
+            local_ref = load_reference_shard(data, ref_count, image_size, workers, rank, num_gpus)
+            if is_main:
+                logger.log("Running combra metrics smoke test...")
+                combra_smoke_test(local_ref, device, logger.log)
+                logger.log(
+                    "combra metrics enabled → DiffiT Inception metrics "
+                    "(IS/FID/sFID/Precision/Recall) disabled."
+                )
+            combra_ref = precompute_combra_reference(local_ref, device, rank, num_gpus)
+            if is_main:
+                logger.log("Reference features computed.")
+        elif is_main:
+            # Full-dataset mode walks the dataset once deterministically (no shuffle,
+            # keep the final partial batch) so every real image is used exactly once.
+            ref_iter = load_data(
+                data_dir=data, batch_size=min(ref_count, 64), image_size=image_size,
+                class_cond=True, random_flip=False, num_workers=workers,
+                distributed=False,
+                deterministic=full_dataset_eval, drop_last=not full_dataset_eval,
             )
-        else:
+            ref_images = []
+            n_collected = 0
+            while n_collected < ref_count:
+                batch_ref, _ = next(ref_iter)
+                batch_np = ((batch_ref + 1) * PIXEL_NORM_HALF).clamp(0, UINT8_MAX).to(torch.uint8).numpy()
+                ref_images.append(batch_np)
+                n_collected += batch_np.shape[0]
+            ref_images = np.concatenate(ref_images, axis=0)[:ref_count]
+
             logger.log("Loading InceptionV3 for metric evaluation...")
             from torchvision.models import Inception_V3_Weights, inception_v3
             inception_model = inception_v3(weights=Inception_V3_Weights.DEFAULT).eval().to(device)
@@ -487,7 +526,7 @@ def training_loop(
             logger.log(f"Pre-computing reference Inception features ({ref_count} real images)...")
             ref_acts = compute_activations(ref_images, inception_extractor, batch_size=64, device=device)
             del ref_images
-        logger.log("Reference features computed.")
+            logger.log("Reference features computed.")
 
     # Build class-sorted grid: each row cycles through classes
     # Row 0 → class 0, row 1 → class 1, ..., row K → class K % num_classes
@@ -754,7 +793,7 @@ def training_loop(
                         log_fn=logger.log,
                         class_list=list(range(num_dataset_classes)),
                         null_class_idx=num_dataset_classes,
-                        ref_images=combra_ref_images, combra_cache=combra_ref_cache,
+                        combra_ref=combra_ref,
                         inception_metrics=not use_combra,
                     )
                     # Only rank 0 logs and saves metrics

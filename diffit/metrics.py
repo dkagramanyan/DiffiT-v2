@@ -19,18 +19,19 @@ from diffit.dpm_solver import dpm_solver_sample
 # runs unchanged when combra is not installed.
 try:
     from combra.metrics import (
+        angle_density_metrics_from_pooled as _combra_angle_metrics_from_pooled,
         cmmd_features as _combra_cmmd_features,
         cmmd_from_features as _combra_cmmd_from_features,
-        compute_all_metrics as _combra_compute_all_metrics,
         fd_dinov2_features as _combra_fd_dinov2_features,
         fd_dinov2_from_features as _combra_fd_dinov2_from_features,
         fid_features as _combra_fid_features,
         fid_from_features as _combra_fid_from_features,
+        images_to_pooled_angles as _combra_images_to_pooled_angles,
     )
 
     HAS_COMBRA = True
 except ImportError:
-    _combra_compute_all_metrics = None
+    _combra_angle_metrics_from_pooled = _combra_images_to_pooled_angles = None
     _combra_fid_features = _combra_cmmd_features = _combra_fd_dinov2_features = None
     _combra_fid_from_features = _combra_cmmd_from_features = _combra_fd_dinov2_from_features = None
     HAS_COMBRA = False
@@ -352,25 +353,50 @@ def _gather_combra_gen_features(local_images, device, rank, world_size):
     }
 
 
-def _combra_distributed_metrics(ref_images, fake_images, gen_feats, device, combra_cache):
-    """Rank-0 combra metrics: the cheap angle-density / Gaussian-fit metrics over
-    the full gathered image set, plus the image-feature metrics computed from the
-    gathered generated features against the (cached) reference features. Equivalent
-    to ``compute_all_metrics(image_metrics=True)`` but with the generated-side
-    feature extraction already sharded across ranks by the callers."""
-    metrics = dict(_combra_compute_all_metrics(
-        ref_images, fake_images, device=device,
-        reference_cache=combra_cache, image_metrics=False,
-    ))
+def _gather_pooled_angles(local_images, device, rank, world_size):
+    """Each rank extracts its image shard's pooled vertex angles and the 1-D angle
+    arrays are gathered to rank 0 (concatenated, ``None`` on other ranks). The
+    step-independent counterpart of the sharded feature gather: pooled angle arrays
+    from disjoint shards concatenate directly, so the rank-0 histogram over the
+    concatenation matches a single-GPU ``images_to_pooled_angles`` over the full
+    set. Reuses :func:`_gather_feature_rows` by treating the angles as ``[n_i, 1]``
+    rows."""
+    local = np.asarray(_combra_images_to_pooled_angles(local_images), np.float32).reshape(-1, 1)
+    gathered = _gather_feature_rows(local, device, rank, world_size)
+    return gathered.reshape(-1) if gathered is not None else None
+
+
+def precompute_combra_reference(local_ref_images, device, rank, world_size):
+    """All-ranks: extract the pooled angles and the three feature sets from this
+    rank's reference shard and gather them to rank 0. Returns
+    ``{"angles": [M], "feat": {name: [N, D]}}`` on rank 0 (``None`` elsewhere).
+
+    Called once before the training loop so the (cached) result is reused every
+    eval tick -- no reference extraction or collective recurs per tick, which keeps
+    the per-tick collective pattern uniform across ranks and the expensive
+    reference angle/feature extraction sharded instead of rank-0-only."""
+    angles = _gather_pooled_angles(local_ref_images, device, rank, world_size)
+    feat = {
+        name: _gather_feature_rows(
+            _combra_extract_features(name, local_ref_images, device), device, rank, world_size
+        )
+        for name in _COMBRA_IMAGE_METRICS
+    }
+    if rank == 0:
+        return {"angles": angles, "feat": feat}
+    return None
+
+
+def _combra_distributed_metrics(combra_ref, gen_angles, gen_feats):
+    """Rank-0 combra metrics from sharded, already-gathered inputs: the angle-density
+    / Gaussian-fit metrics from the pooled reference/generated angles, plus the
+    image-feature distances from the gathered reference/generated features.
+    Equivalent to ``compute_all_metrics(image_metrics=True)`` but with both sides'
+    angle and feature extraction sharded across ranks by the callers
+    (``combra_ref`` is the cached reference from :func:`precompute_combra_reference`)."""
+    metrics = dict(_combra_angle_metrics_from_pooled(combra_ref["angles"], gen_angles))
     for name in _COMBRA_IMAGE_METRICS:
-        ref_key = f"dist_ref_{name}"
-        if combra_cache is not None and ref_key in combra_cache:
-            ref_features = combra_cache[ref_key]
-        else:
-            ref_features = _combra_extract_features(name, ref_images, device)
-            if combra_cache is not None:
-                combra_cache[ref_key] = ref_features
-        metrics[name] = _combra_distance(name, ref_features, gen_feats[name])
+        metrics[name] = _combra_distance(name, combra_ref["feat"][name], gen_feats[name])
     return metrics
 
 
@@ -384,22 +410,22 @@ def evaluate_metrics(
     rank=0, world_size=1,
     log_fn=None,
     class_list=None, null_class_idx=None,
-    ref_images=None, combra_cache=None,
+    combra_ref=None,
     inception_metrics=True,
 ):
     """Generate samples across all ranks, compute metrics on rank 0.
 
     class_list / null_class_idx: forwarded to generate_eval_samples. See there.
 
-    ref_images: NCHW uint8 reference images (rank 0 only). When combra is active
-        (``inception_metrics=False`` and combra installed) the generated batch is
-        also scored with combra's ``fid`` / ``cmmd`` / ``fd_dinov2`` image-feature
-        metrics plus the angle-density / Gaussian-fit metrics, merged into the
-        returned dict under ``combra_*`` keys. The image-feature extraction is
-        sharded: every rank extracts features from its own generated shard and the
-        feature rows are gathered to rank 0, so all GPUs share that work.
-        combra_cache: a caller-owned dict reused across calls to memoise the
-        reference-side combra work (features + angle density).
+    combra_ref: the precomputed sharded reference from
+        :func:`precompute_combra_reference` (rank 0 only; ``None`` elsewhere). When
+        combra is active (``inception_metrics=False`` and combra installed) the
+        generated batch is scored with combra's ``fid`` / ``cmmd`` / ``fd_dinov2``
+        image-feature metrics plus the angle-density / Gaussian-fit metrics, merged
+        into the returned dict under ``combra_*`` keys. Both the angle and the
+        feature extraction are sharded: every rank extracts from its own generated
+        shard and the rows are gathered to rank 0, so all GPUs share that work and
+        the (cached) reference side never recomputes.
 
     inception_metrics: when True (default) compute the InceptionV3-based suite
         (IS / FID / sFID / Precision / Recall). Set False to skip it entirely --
@@ -407,8 +433,8 @@ def evaluate_metrics(
         ``compute_precision_recall`` all-reduce, so every rank must pass the same
         value) and leaves only the combra metrics. ``inception_extractor`` /
         ``ref_acts`` may be None in that case. ``inception_metrics`` is the uniform
-        per-rank signal for "combra active" (ref_images is rank-0 only), which the
-        sharded feature gather relies on for matched collectives across ranks.
+        per-rank signal for "combra active" (combra_ref is rank-0 only), which the
+        sharded angle/feature gathers rely on for matched collectives across ranks.
 
     Returns dict of metrics on rank 0, None on other ranks.
     """
@@ -430,16 +456,21 @@ def evaluate_metrics(
         class_list=class_list, null_class_idx=null_class_idx,
     )
 
-    # combra image-feature metrics are sharded across ranks. The signal must be
-    # uniform across ranks (ref_images is rank-0 only), so key off inception_metrics,
-    # which train.py sets collectively. Every rank extracts features from its own
-    # shard and the rows are gathered to rank 0.
+    # combra metrics are sharded across ranks. The signal must be uniform across
+    # ranks (combra_ref is rank-0 only), so key off inception_metrics, which train.py
+    # sets collectively. Every rank extracts the image features and the pooled angles
+    # from its own generated shard and the rows are gathered to rank 0.
     combra_active = (not inception_metrics) and HAS_COMBRA
     gen_feats = _gather_combra_gen_features(local_fakes, device, rank, world_size) if combra_active else None
+    gen_angles = _gather_pooled_angles(local_fakes, device, rank, world_size) if combra_active else None
 
-    # Gather the full generated set to rank 0 for the Inception suite and/or the
-    # combra angle-density metrics (both run centrally on rank 0).
-    fake_images = _gather_eval_images(local_fakes, device, rank, world_size, num_fid_samples)
+    # Gather the full generated set to rank 0 only for the Inception suite (the
+    # combra path uses the sharded gen angles/features above, so it needs no central
+    # copy of the raw high-res images).
+    fake_images = (
+        _gather_eval_images(local_fakes, device, rank, world_size, num_fid_samples)
+        if inception_metrics else None
+    )
 
     if rank == 0:
         metrics = {}
@@ -464,10 +495,10 @@ def evaluate_metrics(
             metrics["Recall"] = rec
 
     if rank == 0:
-        if combra_active and ref_images is not None:
+        if combra_active and combra_ref is not None:
             try:
                 combra_metrics = _combra_distributed_metrics(
-                    ref_images, fake_images, gen_feats, device, combra_cache,
+                    combra_ref, gen_angles, gen_feats,
                 )
                 for k, v in combra_metrics.items():
                     key = _COMBRA_IMAGE_RENAME.get(k, k)
