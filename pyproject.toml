@@ -47,6 +47,7 @@ combra = [
 diffit-train = "scripts.train:main"
 diffit-sample = "scripts.sample:generate_samples"
 diffit-gen-images = "scripts.gen_images:generate_images"
+diffit-compare-samplers = "scripts.compare_samplers:main"
 diffit-eval = "scripts.evaluator:main"
 diffit-prepare-data = "scripts.dataset_tool_for_imagenet:convert_dataset"
 diffit-download-models = "scripts.download_models:main"

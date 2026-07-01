@@ -13,6 +13,7 @@ from tqdm import tqdm
 from diffit import NUM_CLASSES
 from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
 from diffit.dpm_solver import dpm_solver_sample
+from diffit.unipc_solver import unipc_sample
 
 # Optional combra integration: score generated samples with combra's
 # generative-quality metrics during training. The import is guarded so training
@@ -63,15 +64,21 @@ def compute_activations(images_uint8_nchw, extractor, batch_size, device, desc="
 def sample_latents(model_fn, diffusion, shape, device, *, sampler, num_steps, model_kwargs, noise, progress=False):
     """Dispatch latent sampling to the chosen reverse-diffusion sampler.
 
-    sampler: "dpm++" runs DPM-Solver++(2M) on the full schedule (``diffusion`` must
-        carry the full 1000-step ``alphas_cumprod``; ``num_steps`` sets the solver
-        steps). "ddim" / "ddpm" use the native deterministic-DDIM / ancestral-DDPM
-        loops, in which case ``diffusion`` must be a SpacedDiffusion whose
-        ``num_timesteps`` already encodes the step count (``num_steps`` is ignored).
-        DDIM uses the default ``eta=0`` (deterministic).
+    sampler: "dpm++" runs DPM-Solver++(2M) and "unipc" runs UniPC on the full
+        schedule (``diffusion`` must carry the full 1000-step ``alphas_cumprod`` /
+        ``betas``; ``num_steps`` sets the solver steps). "ddim" / "ddpm" use the
+        native deterministic-DDIM / ancestral-DDPM loops, in which case
+        ``diffusion`` must be a SpacedDiffusion whose ``num_timesteps`` already
+        encodes the step count (``num_steps`` is ignored). DDIM uses the default
+        ``eta=0`` (deterministic).
     """
     if sampler == "dpm++":
         return dpm_solver_sample(
+            model_fn, diffusion, shape, device,
+            num_steps=num_steps, model_kwargs=model_kwargs, noise=noise, progress=progress,
+        )
+    if sampler == "unipc":
+        return unipc_sample(
             model_fn, diffusion, shape, device,
             num_steps=num_steps, model_kwargs=model_kwargs, noise=noise, progress=progress,
         )
