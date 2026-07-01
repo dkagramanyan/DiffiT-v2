@@ -381,7 +381,7 @@ def _run_sampling(model, vae, diffusion, dev, latent_size, num_classes,
 @click.option("--class-idx", type=int, default=None, help="Seed mode: fixed class label (random if not specified)")
 @click.option("--cfg-scale", type=float, default=4.4, show_default=True, help="Classifier-free guidance scale")
 @click.option("--num-sampling-steps", type=int, default=250, show_default=True, help="Number of diffusion sampling steps")
-@click.option("--sampler", type=click.Choice(["dpm++", "ddim", "ddpm"]), default="ddim", show_default=True, help="Reverse-diffusion sampler")
+@click.option("--sampler", type=click.Choice(["dpm++", "unipc", "ddim", "ddpm"]), default="ddim", show_default=True, help="Reverse-diffusion sampler")
 @click.option("--scale-pow", type=float, default=4.0, show_default=True, help="Power for cosine CFG schedule (256)")
 @click.option("--vae-decoder", type=click.Choice(["ema", "mse"]), default="ema", show_default=True, help="VAE decoder variant")
 @click.option("--decode-layer", type=int, default=None, help="Decode layer override")

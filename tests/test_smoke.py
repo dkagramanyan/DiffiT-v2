@@ -101,3 +101,20 @@ def test_training_losses_finite():
     for key in ("loss", "mse", "vb"):
         assert key in losses
         assert torch.isfinite(losses[key]).all()
+
+
+# --- samplers ----------------------------------------------------------------
+
+def test_unipc_sample_shape_and_finite():
+    from diffit.unipc_solver import unipc_sample
+
+    model = _tiny_model(learn_sigma=True).eval()
+
+    def model_fn(x, t):
+        return model(x, t, torch.zeros(x.shape[0], dtype=torch.long))
+
+    diff = create_diffusion(**diffusion_defaults())
+    shape = (2, 4, 8, 8)
+    out = unipc_sample(model_fn, diff, shape, torch.device("cpu"), num_steps=3)
+    assert out.shape == shape
+    assert torch.isfinite(out).all()

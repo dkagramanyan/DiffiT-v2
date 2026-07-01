@@ -352,10 +352,10 @@ def training_loop(
     diffusion = create_diffusion(**diff_config)
     schedule_sampler = create_named_schedule_sampler(schedule_sampler_name, diffusion)
 
-    # Diffusion the eval/snapshot sampler runs on. DPM-Solver++ subsamples the full
-    # 1000-step schedule itself, so it reuses `diffusion`; DDIM/DDPM use the native
-    # loops on a spaced schedule whose num_timesteps == eval_sampling_steps.
-    if eval_sampler == "dpm++":
+    # Diffusion the eval/snapshot sampler runs on. DPM-Solver++ and UniPC subsample
+    # the full 1000-step schedule themselves, so they reuse `diffusion`; DDIM/DDPM
+    # use the native loops on a spaced schedule whose num_timesteps == eval_sampling_steps.
+    if eval_sampler in ("dpm++", "unipc"):
         eval_diffusion = diffusion
     else:
         eval_diffusion = create_diffusion(**{**diff_config, "timestep_respacing": str(eval_sampling_steps)})
@@ -990,8 +990,8 @@ BASE_CONFIGS = {
 @click.option("--schedule-sampler", "schedule_sampler_name", help="Timestep sampler [default: from cfg]", type=str, default=None)
 @click.option("--num-fid-samples", help="Samples for FID eval during training (0=disable)", metavar="INT", type=click.IntRange(min=0), default=None)
 @click.option("--cfg-scale",    help="Classifier-free guidance scale used during training-time eval [default: from cfg]", metavar="FLOAT", type=float, default=None)
-@click.option("--eval-sampler", help="Sampler for training-time eval/snapshots [default: ddim]", type=click.Choice(["dpm++", "ddim", "ddpm"]), default=None)
-@click.option("--eval-sampling-steps", help="Eval sampler steps [default: dpm++=25, ddim=100, ddpm=250]", metavar="INT", type=click.IntRange(min=1), default=None)
+@click.option("--eval-sampler", help="Sampler for training-time eval/snapshots [default: ddim]", type=click.Choice(["dpm++", "unipc", "ddim", "ddpm"]), default=None)
+@click.option("--eval-sampling-steps", help="Eval sampler steps [default: dpm++=25, unipc=20, ddim=100, ddpm=250]", metavar="INT", type=click.IntRange(min=1), default=None)
 
 # Performance tuning.
 @click.option("--grad-accum",  help="Gradient accumulation steps (effective batch = batch-gpu × gpus × accum)", metavar="INT", type=click.IntRange(min=1), default=None)
@@ -1053,7 +1053,7 @@ def launch_from_opts(opts):
     if opts["eval_sampling_steps"] is not None:
         overrides["eval_sampling_steps"] = opts["eval_sampling_steps"]
     else:
-        overrides["eval_sampling_steps"] = {"dpm++": 25, "ddim": 100, "ddpm": 250}[resolved_eval_sampler]
+        overrides["eval_sampling_steps"] = {"dpm++": 25, "unipc": 20, "ddim": 100, "ddpm": 250}[resolved_eval_sampler]
     if opts["grad_accum"] is not None:
         overrides["grad_accum_steps"] = opts["grad_accum"]
     if opts["gradient_checkpointing"] is not None:
