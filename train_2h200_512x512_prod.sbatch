@@ -70,6 +70,7 @@ python "$PROJECT_DIR/train.py" \
     --data="$DATASET" \
     --gpus=2 \
     --batch-gpu=64 \
+    --save-inference-only=0 \
     --snap=100
 
 EXIT_CODE=$?

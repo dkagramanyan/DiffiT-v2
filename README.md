@@ -282,6 +282,12 @@ sbatch train_2h200_1024x1024_prod.sbatch
 sbatch train_4h200_1024x1024_prod.sbatch
 ```
 
+These prod scripts pass `--save-inference-only=0`, so each tick refreshes the full
+rolling `network-snapshot-latest.pt` — the resume anchor the SLURM-dependency
+chaining below relies on. (The `sbatch/h200_train_2_gpu_*` scripts instead use
+`--save-inference-only=1` for the smaller inference-snapshot layout, resuming from
+`best_model.pt`.)
+
 For progressive finetuning, add `--resume=$PATH_TO_PREV_FINAL` to the sbatch's `diffit-train ...` line and lower the LR as shown above.
 
 ### Chaining runs with SLURM dependencies

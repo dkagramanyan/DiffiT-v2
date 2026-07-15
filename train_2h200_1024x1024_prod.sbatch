@@ -54,7 +54,7 @@ conda activate diffit_rocky
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 PROJECT_DIR=/home/dgkagramanyan/DiffiT-v2
-DATASET=$PROJECT_DIR/datasets/imagenet_9to4_1024x1024.zip
+DATASET=$PROJECT_DIR/datasets/imagenet_9to4_1024x1024_1024x1024.zip
 OUTDIR=$PROJECT_DIR/training-runs
 LOGDIR=$PROJECT_DIR/logs
 
@@ -79,6 +79,7 @@ python "$PROJECT_DIR/train.py" \
     --data="$DATASET" \
     --gpus=2 \
     --batch-gpu=8 \
+    --save-inference-only=0 \
     --snap=100
 
 EXIT_CODE=$?

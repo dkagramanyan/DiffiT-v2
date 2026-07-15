@@ -37,8 +37,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `scipy.linalg` / `scipy.special.softmax` APIs are used). (`requirements.txt`,
   `pyproject.toml`)
 - **sbatch / docs** — the `sbatch/h200_train_2_gpu_*` scripts pass
-  `--snapshot-keep-last 3` and document resuming from `best_model.pt`; the DiffiT
-  example doc and README describe the new checkpoint layout.
+  `--snapshot-keep-last 3` and document resuming from `best_model.pt`; the
+  `train_*h200_*_prod.sbatch` scripts explicitly pass `--save-inference-only=0`
+  so each tick refreshes the full rolling `network-snapshot-latest.pt` their
+  SLURM-dependency chaining resumes from; the DiffiT example doc and README
+  describe the new checkpoint layout.
 
 ## [Unreleased] — 2026-06-25
 
