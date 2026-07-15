@@ -3,6 +3,43 @@
 All notable changes to this fork (`DiffiT-v2`) are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] — 2026-07-16
+
+### Added
+- **`--snapshot-keep-last N` training flag** (default `3`) — keeps only the `N`
+  newest per-tick `network-snapshot-<kimg>-inference.pt` snapshots, pruning older
+  ones so inference-snapshot history stays bounded. `0` keeps everything. Never
+  touches `best_model.pt`, `network-snapshot-latest.pt`, or `network-final*.pt`.
+  (`scripts/train.py`)
+- **`best_model.pt`** — a full resumable checkpoint refreshed only when FID
+  improves (`combra_fid10k` in combra mode, else `FID`). Written in **both**
+  checkpoint modes, so a full resume anchor always exists even under
+  `--save-inference-only`. (`scripts/train.py`)
+
+### Changed
+- **Checkpointing reworked to "best of both".** Every snapshot tick now writes a
+  small G_ema `network-snapshot-<kimg>-inference.pt` for history (pruned to
+  `--snapshot-keep-last`) **plus** full checkpoints that never accumulate: a single
+  rolling `network-snapshot-latest.pt` overwritten in place each tick (atomic
+  temp-file + `os.replace`), and `best_model.pt`. Previously the full checkpoint was
+  one file **per tick** (`network-snapshot-<kimg>.pt`), which accumulated
+  unbounded. (`scripts/train.py`)
+- **`--save-inference-only` semantics** — now means "skip the rolling
+  `network-snapshot-latest.pt`". Per-tick inference snapshots and the full
+  `best_model.pt` are still written, so the mode remains resumable (it no longer
+  leaves a run without any full checkpoint). (`scripts/train.py`)
+- **Final save** — always writes a full `network-final.pt` (plus
+  `network-final-inference.pt`) regardless of `--save-inference-only`, so
+  progressive higher-resolution stages can always `--resume` from the previous
+  stage's final checkpoint.
+- **Library pins bumped** — `timm==0.9.16` → `timm>=1.0.11` (only `PatchEmbed` is
+  used, a stable import) and dropped the `scipy<=1.14.1` upper cap (only stable
+  `scipy.linalg` / `scipy.special.softmax` APIs are used). (`requirements.txt`,
+  `pyproject.toml`)
+- **sbatch / docs** — the `sbatch/h200_train_2_gpu_*` scripts pass
+  `--snapshot-keep-last 3` and document resuming from `best_model.pt`; the DiffiT
+  example doc and README describe the new checkpoint layout.
+
 ## [Unreleased] — 2026-06-25
 
 ### Added
@@ -58,6 +95,6 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - DiffiT-v2 is a latent-diffusion model, so several san-v2 changelog items do not
   apply and were intentionally **not** ported: `legacy.load_network_pkl` G_ema
   mirroring (no G/D/G_ema split), the `timm==0.4.12` pin (DiffiT requires
-  `timm==0.9.16`), the `imgui`/`glfw`/`pyopengl`/`imageio-ffmpeg`/`ninja`
+  `timm>=1.0.11`), the `imgui`/`glfw`/`pyopengl`/`imageio-ffmpeg`/`ninja`
   removals (never present), the `test.py`→`tests/test_cuda_ops.py` move (no custom
   CUDA ops), and the FFHQ-leftover removals (ImageNet-based).

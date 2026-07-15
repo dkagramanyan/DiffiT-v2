@@ -305,7 +305,7 @@ trap 'scontrol requeue $SLURM_JOB_ID' USR1
 Make sure your sbatch picks up the latest checkpoint on restart:
 
 ```bash
-LATEST_CKPT=$(ls -t "$OUTDIR"/*/network-snapshot-*.pt 2>/dev/null | head -1)
+LATEST_CKPT=$(ls -t "$OUTDIR"/*/network-snapshot-latest.pt 2>/dev/null | head -1)
 RESUME_FLAG=""
 [ -n "$LATEST_CKPT" ] && RESUME_FLAG="--resume=$LATEST_CKPT"
 
@@ -327,8 +327,13 @@ diffit-train --outdir=./training-runs \
     --data=./datasets/imagenet_256x256.zip \
     --gpus 2 \
     --batch-gpu 96 \
-    --resume ./training-runs/00000-diffit-256-gpus2-batch192/network-snapshot-001000.pt
+    --resume ./training-runs/00000-diffit-256-gpus2-batch192/network-snapshot-latest.pt
 ```
+
+Resume from any full checkpoint: the rolling `network-snapshot-latest.pt` (latest
+step), `best_model.pt` (lowest FID), or `network-final.pt`. Under
+`--save-inference-only` the rolling `latest` file is not written — resume from
+`best_model.pt` instead.
 
 ### Hydra entry point (optional)
 
@@ -370,7 +375,8 @@ entry points call the same `launch_from_opts`, so runs are identical.
 | `--cfg-scale` | from cfg | CFG scale used during training-time eval |
 | `--num-fid-samples` | from cfg (10000) | Samples for FID/IS eval during training (0=disable) |
 | `--combra-metrics` | true | Compute combra generative-quality metrics each snapshot tick (independent of `--num-fid-samples`); warns if requested but combra is not installed |
-| `--save-inference-only` | false | Also write a small `network-snapshot-<kimg>-inference.pt` (EMA weights only, no optimizer/resume state) each snapshot tick — the smallest artifact for `gen_images.py` / `sample.py` |
+| `--save-inference-only` | false | Skip the rolling full `network-snapshot-latest.pt`; per-tick inference snapshots and the full `best_model.pt` are still written, so resume stays possible with no repeated optimizer state on disk |
+| `--snapshot-keep-last` | 3 | Keep only the N newest `network-snapshot-<kimg>-inference.pt` snapshots (0 = keep all); never affects `best_model.pt` / `network-snapshot-latest.pt` / `network-final*.pt` |
 | `--grad-accum` | from cfg | Gradient accumulation steps (effective batch = batch-gpu × gpus × accum) |
 | `--grad-ckpt / --no-grad-ckpt` | from cfg | Toggle gradient checkpointing (trades compute for memory) |
 | `--lr-warmup` | from cfg | Linear LR warmup duration in kimg (0 = disabled) |
@@ -396,18 +402,27 @@ training-runs/00000-diffit-256-gpus4-batch256/
 ├── fakes000200.png               # Generated images at 200 kimg
 ├── fakes000400.png               # Generated images at 400 kimg
 ├── ...
-├── network-snapshot-001000.pt    # Periodic checkpoint (full resumable state)
-├── network-snapshot-001000-inference.pt  # (only with --save-inference-only) EMA weights only
-├── network-snapshot-002000.pt
+├── network-snapshot-001000-inference.pt  # Per-tick G_ema snapshot (newest --snapshot-keep-last kept)
+├── network-snapshot-002000-inference.pt
 ├── ...
-└── network-final.pt              # Final trained model (full resumable state)
+├── network-snapshot-latest.pt    # Rolling full checkpoint, overwritten each tick (omitted with --save-inference-only)
+├── best_model.pt                 # Full checkpoint of the lowest-FID tick
+├── network-final.pt              # Final trained model (full resumable state)
+└── network-final-inference.pt    # Final G_ema weights only
 ```
 
-`network-snapshot-*.pt` / `network-final.pt` hold the **full** resumable state
-(`model`, `ema`, `opt`, optional `scaler`, `cur_nimg`) so `--resume` can continue
-training exactly. The inference loaders (`gen_images.py`, `sample.py`) transparently
-extract the EMA weights from any of these — a full checkpoint, an older bare
-EMA `state_dict`, or a `--save-inference-only` `*-inference.pt` file.
+Each snapshot tick writes a small `network-snapshot-<kimg>-inference.pt` (G_ema
+weights only) for history — only the newest `--snapshot-keep-last` are retained —
+plus full checkpoints that never accumulate: a single rolling
+`network-snapshot-latest.pt` overwritten in place, and `best_model.pt` (rewritten
+only when FID improves). The full checkpoints hold the resumable state (`model`,
+`ema`, `opt`, optional `scaler`, `cur_nimg`) so `--resume` continues training
+exactly. `--save-inference-only` skips the rolling `latest` file (no repeated
+optimizer state on disk); `best_model.pt` and the final `network-final.pt` stay
+full, so resume — and progressive finetuning — still work. The inference loaders
+(`gen_images.py`, `sample.py`) transparently extract the EMA weights from any of
+these — a full checkpoint, an older bare EMA `state_dict`, or an `*-inference.pt`
+file.
 
 Quality metrics (**IS**, **FID**, **sFID**, **Precision**, **Recall**) are computed automatically every `snap` ticks during training using 10000 samples by default (configurable per `--cfg`). Results are logged to TensorBoard under `Metrics/` and to `stats.jsonl`. Adjust with `--num-fid-samples` (set to 0 to disable).
 

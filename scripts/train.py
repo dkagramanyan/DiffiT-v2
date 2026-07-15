@@ -21,6 +21,7 @@ Single GPU:
 
 import copy
 import dataclasses
+import glob
 import json
 import os
 import re
@@ -153,6 +154,43 @@ def build_checkpoint(model, ema_model, opt, scaler, use_grad_scaler, cur_nimg):
     return ckpt
 
 
+def atomic_save(obj, path):
+    """Write ``obj`` to ``path`` atomically (temp file + ``os.replace``).
+
+    Used for the single files we overwrite in place every tick
+    (``network-snapshot-latest.pt`` and ``best_model.pt``): a crash midway
+    through a plain ``torch.save`` would truncate the only resume anchor, so we
+    save to ``<path>.tmp`` first and atomically rename over the target.
+    """
+    tmp = f"{path}.tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def prune_inference_snapshots(run_dir, keep_last):
+    """Delete all but the ``keep_last`` newest inference snapshots.
+
+    ``keep_last <= 0`` keeps everything. Matches ONLY
+    ``network-snapshot-<kimg>-inference.pt`` so the rolling
+    ``network-snapshot-latest.pt``, ``best_model.pt`` and ``network-final*.pt``
+    are never touched.
+    """
+    if keep_last <= 0:
+        return
+    snaps = glob.glob(os.path.join(run_dir, "network-snapshot-*-inference.pt"))
+
+    def _kimg(path):
+        m = re.search(r"network-snapshot-(\d+)-inference\.pt$", os.path.basename(path))
+        return int(m.group(1)) if m else -1
+
+    snaps.sort(key=_kimg)
+    for old in snaps[:-keep_last]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+
 def subprocess_fn(rank, c, temp_dir):
     """Entry point for each DDP worker."""
     logger.configure(log_dir=c["run_dir"])
@@ -275,6 +313,7 @@ def training_loop(
     eval_sampling_steps=100,
     combra_metrics=True,
     save_inference_only=False,
+    snapshot_keep_last=3,
     **_extra,
 ):
     """Main training loop for DiffiT."""
@@ -618,6 +657,10 @@ def training_loop(
     maintenance_time = start_time - time.time()  # negative initially
     cur_tick = 0
     opt_steps = 0
+    # Latest metrics dict (rank 0) and best FID seen so far, tracked across ticks
+    # to decide when to refresh best_model.pt.
+    stats_metrics = None
+    best_fid = float("inf")
 
     def _format_time(seconds):
         """Format seconds into human-readable string like SAN-v2."""
@@ -810,32 +853,51 @@ def training_loop(
                                 stats_tfevents.add_scalar(f"Metrics/{name}", value, global_step=global_step, walltime=walltime)
                             stats_tfevents.flush()
 
-                # Save checkpoint (rank 0 only). --save-inference-only writes ONLY
-                # the small EMA-weights snapshot; otherwise a full resumable state.
+                # Save checkpoints (rank 0 only). Every tick keeps a small G_ema
+                # inference snapshot for history (pruned to the newest
+                # --snapshot-keep-last), plus full checkpoints that never
+                # accumulate: a single rolling network-snapshot-latest.pt for
+                # resume (skipped under --save-inference-only) and best_model.pt,
+                # refreshed only when FID improves, as the always-available full
+                # resume anchor.
                 if is_main:
-                    if save_inference_only:
-                        save_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}-inference.pt")
-                        logger.log(f"Saving inference-only snapshot to {save_path}...")
-                        torch.save(ema_model.state_dict(), save_path)
-                    else:
-                        save_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}.pt")
-                        logger.log(f"Saving checkpoint to {save_path}...")
-                        torch.save(build_checkpoint(model, ema_model, opt, scaler, use_grad_scaler, cur_nimg), save_path)
+                    # 1) Small inference snapshot (G_ema only) + prune history.
+                    inf_path = os.path.join(run_dir, f"network-snapshot-{cur_nimg // 1000:06d}-inference.pt")
+                    logger.log(f"Saving inference snapshot to {inf_path}...")
+                    torch.save(ema_model.state_dict(), inf_path)
+                    prune_inference_snapshots(run_dir, snapshot_keep_last)
+
+                    # 2) Rolling full checkpoint for resume (overwrite in place).
+                    #    Skipped entirely under --save-inference-only.
+                    if not save_inference_only:
+                        latest_path = os.path.join(run_dir, "network-snapshot-latest.pt")
+                        logger.log(f"Updating rolling checkpoint {latest_path}...")
+                        atomic_save(build_checkpoint(model, ema_model, opt, scaler, use_grad_scaler, cur_nimg), latest_path)
+
+                    # 3) best_model.pt: full checkpoint of the lowest-FID tick.
+                    #    Written in both modes so a full resume anchor always exists.
+                    if stats_metrics is not None:
+                        cur_fid = stats_metrics.get("combra_fid10k", stats_metrics.get("FID"))
+                        if cur_fid is not None and np.isfinite(cur_fid) and cur_fid < best_fid:
+                            best_fid = cur_fid
+                            best_path = os.path.join(run_dir, "best_model.pt")
+                            logger.log(f"New best FID {cur_fid:.4f} → saving {best_path}...")
+                            atomic_save(build_checkpoint(model, ema_model, opt, scaler, use_grad_scaler, cur_nimg), best_path)
+
                     logger.log(f"Checkpoint saved (kimg={cur_nimg / 1e3:.1f})")
 
                     maintenance_time = time.time() - snap_start
 
-    # Final save. --save-inference-only writes ONLY the EMA-weights snapshot;
-    # otherwise a full resumable state.
+    # Final save. Always write a full network-final.pt (the resume anchor for
+    # progressive higher-resolution training) plus a small G_ema inference
+    # snapshot for downstream sampling, regardless of --save-inference-only.
     if is_main:
-        if save_inference_only:
-            save_path = os.path.join(run_dir, "network-final-inference.pt")
-            logger.log(f"Saving final inference-only model to {save_path}...")
-            torch.save(ema_model.state_dict(), save_path)
-        else:
-            save_path = os.path.join(run_dir, "network-final.pt")
-            logger.log(f"Saving final model to {save_path}...")
-            torch.save(build_checkpoint(model, ema_model, opt, scaler, use_grad_scaler, cur_nimg), save_path)
+        save_path = os.path.join(run_dir, "network-final.pt")
+        logger.log(f"Saving final model to {save_path}...")
+        atomic_save(build_checkpoint(model, ema_model, opt, scaler, use_grad_scaler, cur_nimg), save_path)
+        inf_path = os.path.join(run_dir, "network-final-inference.pt")
+        logger.log(f"Saving final inference model to {inf_path}...")
+        torch.save(ema_model.state_dict(), inf_path)
 
         # Final image snapshot
         logger.log("Saving final image snapshot...")
@@ -1002,7 +1064,8 @@ BASE_CONFIGS = {
 @click.option("--desc",         help="String to include in result dir name", metavar="STR",    type=str, default=None)
 @click.option("--metrics",      help="Quality metrics", metavar="NAME",                        type=str, default="fid50k", show_default=True)
 @click.option("--combra-metrics", help="Compute combra generative-quality metrics each snapshot tick; when on, the DiffiT Inception metrics (IS/FID/sFID/Precision/Recall) are disabled", metavar="BOOL", type=bool, default=True, show_default=True)
-@click.option("--save-inference-only", help="Save ONLY a small inference snapshot (EMA weights, no optimizer/resume state) each snapshot tick, instead of the full resumable checkpoint", metavar="BOOL", type=bool, default=False, show_default=True)
+@click.option("--save-inference-only", help="Skip the rolling full network-snapshot-latest.pt checkpoint; still writes per-tick G_ema inference snapshots and best_model.pt (full) for resume", metavar="BOOL", type=bool, default=False, show_default=True)
+@click.option("--snapshot-keep-last", help="Keep only the N newest per-tick inference snapshots (0 = keep all); never affects best_model.pt / latest / final", metavar="INT", type=click.IntRange(min=0), default=3, show_default=True)
 @click.option("--tf32/--no-tf32", "allow_tf32", help="Enable TF32 for matmul/conv",            default=True, show_default=True)
 @click.option("--workers",      help="DataLoader worker processes", metavar="INT",             type=click.IntRange(min=1), default=4, show_default=True)
 @click.option("--cache-in-ram/--no-cache-in-ram", help="Cache entire dataset in RAM to reduce disk I/O", default=True, show_default=True)
@@ -1094,6 +1157,7 @@ def launch_from_opts(opts):
         lr_warmup_kimg=cfg.lr_warmup_kimg,
         combra_metrics=opts["combra_metrics"],
         save_inference_only=opts["save_inference_only"],
+        snapshot_keep_last=opts["snapshot_keep_last"],
         log_interval=10,
         save_interval=10000,
     )

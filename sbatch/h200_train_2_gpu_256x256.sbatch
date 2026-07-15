@@ -39,4 +39,12 @@ diffit-train --outdir=./runs/wc_cv_combra \
         --batch-gpu 42 \
         --combra-metrics True \
         --save-inference-only True \
+        --snapshot-keep-last 3 \
         --snap 100
+
+# Checkpoints written to the run dir:
+#   network-snapshot-<kimg>-inference.pt  small G_ema snapshots (newest 3 kept)
+#   best_model.pt                         full checkpoint of the lowest-FID tick
+# --save-inference-only skips the rolling network-snapshot-latest.pt, so resume
+# (and progressive higher-res stages) from best_model.pt or the final network-final.pt:
+#   diffit-train ... --resume ./runs/wc_cv_combra/<run>/best_model.pt
