@@ -89,8 +89,9 @@ This installs the package (editable) along with its dependencies and the
 console entry-points used throughout this README: `diffit-train`,
 `diffit-sample`, `diffit-gen-images`, `diffit-eval`, `diffit-prepare-data`,
 and `diffit-download-models`. For development extras (tests + linter) use
-`pip install -e ".[dev]"`. A plain `pip install -r requirements.txt` still
-works if you prefer to invoke scripts as `python -m scripts.<name>`.
+`pip install -e ".[dev]"`; for the optional combra metrics use
+`pip install -e ".[combra]"` (combra is pulled over `git+https`). `pyproject.toml`
+is the only dependency declaration — there is no `requirements.txt`.
 
 
 ## Pre-download Models (Offline Nodes)
@@ -121,22 +122,25 @@ MODEL_CACHE=/shared/team/caches bash download_models.sh
 
 ## Data Preparation
 
-Use `diffit-prepare-data` to convert an ImageNet-style directory into a ZIP archive with resized images and a `dataset.json` containing class labels.
+`diffit-prepare-data` is a click group; its `convert` subcommand turns an
+ImageNet-style directory into a ZIP with resized RGB images and a `dataset.json`
+carrying both the integer `labels` and an index-aligned `class_names` list.
+Transforms: `center-crop` / `center-crop-wide` / `center-crop-dhariwal`.
 
 ```
-diffit-prepare-data \
+diffit-prepare-data convert \
     --source /path/to/ILSVRC \
     --dest ./datasets/imagenet_256x256.zip \
     --resolution 256x256 \
     --transform center-crop
 
-diffit-prepare-data \
+diffit-prepare-data convert \
     --source /path/to/ILSVRC \
     --dest ./datasets/imagenet_512x512.zip \
     --resolution 512x512 \
     --transform center-crop
 
-diffit-prepare-data \
+diffit-prepare-data convert \
     --source /path/to/ILSVRC \
     --dest ./datasets/imagenet_1024x1024.zip \
     --resolution 1024x1024 \
@@ -215,7 +219,7 @@ diffit-train --outdir=./training-runs \
     --batch-gpu 16 \
     --grad-accum 4
 ```
-Global effective batch = 16 × 2 × 4 = 128. With RoPE+FlashAttention you may be able to drop `--grad-accum` and/or disable checkpointing (`--no-grad-ckpt`) — start conservative and raise `--batch-gpu` once you confirm it fits.
+Global effective batch = 16 × 2 × 4 = 128. With RoPE+FlashAttention you may be able to drop `--grad-accum` and/or disable checkpointing (`--grad-ckpt False`) — start conservative and raise `--batch-gpu` once you confirm it fits.
 
 ---
 
@@ -242,12 +246,15 @@ diffit-train --outdir=./training-runs \
     --data=./datasets/imagenet_512x512.zip \
     --gpus 2 \
     --batch-gpu 64 \
-    --resume ./training-runs/00000-diffit-256-*/network-final.pt \
+    --init-weights ./training-runs/00000-diffit-256-*/diffit-snapshot-*-inference.pt \
     --lr 5e-5 \
     --lr-warmup 500 \
     --kimg 100000
 ```
-Lower LR (5e-5 ≈ half of the `diffit-512` default) for finetuning, short warmup, and a smaller total-kimg budget — finetuning converges faster than from-scratch.
+`--init-weights` is a weights-only warm start (loads the previous stage's EMA
+weights, fresh optimizer) — not a resume. Lower LR (5e-5 ≈ half of the
+`diffit-512` default) for finetuning, short warmup, and a smaller total-kimg
+budget — finetuning converges faster than from-scratch.
 
 **Step 3. Finetune 512² → 1024²**:
 
@@ -257,7 +264,7 @@ diffit-train --outdir=./training-runs \
     --data=./datasets/imagenet_1024x1024.zip \
     --gpus 2 \
     --batch-gpu 16 \
-    --resume ./training-runs/00001-diffit-512-*/network-final.pt \
+    --init-weights ./training-runs/00001-diffit-512-*/diffit-snapshot-*-inference.pt \
     --lr 2e-5 \
     --lr-warmup 500 \
     --kimg 50000
@@ -267,95 +274,38 @@ diffit-train --outdir=./training-runs \
 
 ---
 
-### SLURM sbatch scripts
+### Cluster launch (`sh/` scripts)
 
-> The sbatch scripts invoke the `diffit-*` console entry points (and
-> `torchrun -m scripts.sample`), so make sure the cluster conda env has the
-> package installed once: `pip install -e .` after `conda activate diffit`.
-
-Pre-configured sbatch files are provided for H200:
-
-```bash
-sbatch train_2h200_256x256_prod.sbatch
-sbatch train_2h200_512x512_prod.sbatch
-sbatch train_2h200_1024x1024_prod.sbatch
-sbatch train_4h200_1024x1024_prod.sbatch
-```
-
-These prod scripts pass `--save-inference-only=0`, so each tick refreshes the full
-rolling `network-snapshot-latest.pt` — the resume anchor the SLURM-dependency
-chaining below relies on. (The `sbatch/h200_train_2_gpu_*` scripts instead use
-`--save-inference-only=1` for the smaller inference-snapshot layout, resuming from
-`best_model.pt`.)
-
-For progressive finetuning, add `--resume=$PATH_TO_PREV_FINAL` to the sbatch's `diffit-train ...` line and lower the LR as shown above.
-
-### Chaining runs with SLURM dependencies
-
-Walltime caps will not fit `total_kimg=400000` in a single job. Chain jobs:
+Cluster launches are plain shell scripts under `sh/` — no `.sbatch` files in the
+repo. Each self-locates the repo root, activates the conda env (`CONDA_ENV`,
+default `diffit`), sets the offline-cluster contract (`HF_HUB_OFFLINE=1`,
+`TRANSFORMERS_OFFLINE=1`), and makes one `diffit-*` console call. SLURM specifics
+are supplied at submission time — never hardcoded:
 
 ```bash
-JID=$(sbatch --parsable train_2h200_256x256_prod.sbatch)
-for i in 1 2 3; do
-    JID=$(sbatch --parsable --dependency=afterany:$JID train_2h200_256x256_prod.sbatch)
-done
+# workstation
+DATA=./datasets/imagenet_256x256.zip bash sh/train_256.sh
+
+# cluster (account / partition / gpus at submit time)
+DATA=./datasets/imagenet_256x256.zip \
+  sbatch --account=<proj> --partition=<part> --gpus=2 sh/train_256.sh
 ```
 
-Or add self-requeue to the sbatch:
+Override `OUTDIR` / `GPUS` / `BATCH_GPU` (and, for generation, `NETWORK` /
+`SAMPLES_PER_CLASS`) via env vars; extra `diffit-train` flags pass through after
+the script name. Prefetch backbones once on a login node with
+`diffit-download-models` before an offline run.
 
-```bash
-#SBATCH --signal=B:USR1@300
-trap 'scontrol requeue $SLURM_JOB_ID' USR1
-```
+### No resume — size runs to the walltime
 
-Make sure your sbatch picks up the latest checkpoint on restart:
-
-```bash
-LATEST_CKPT=$(ls -t "$OUTDIR"/*/network-snapshot-latest.pt 2>/dev/null | head -1)
-RESUME_FLAG=""
-[ -n "$LATEST_CKPT" ] && RESUME_FLAG="--resume=$LATEST_CKPT"
-
-diffit-train \
-    --outdir="$OUTDIR" \
-    --cfg=diffit-256 \
-    --data="$DATASET" \
-    --gpus 2 \
-    --batch-gpu 96 \
-    --snap 100 \
-    $RESUME_FLAG
-```
-
-### Resume from checkpoint (manual)
-
-```bash
-diffit-train --outdir=./training-runs \
-    --cfg=diffit-256 \
-    --data=./datasets/imagenet_256x256.zip \
-    --gpus 2 \
-    --batch-gpu 96 \
-    --resume ./training-runs/00000-diffit-256-gpus2-batch192/network-snapshot-latest.pt
-```
-
-Resume from any full checkpoint: the rolling `network-snapshot-latest.pt` (latest
-step), `best_model.pt` (lowest FID), or `network-final.pt`. Under
-`--save-inference-only` the rolling `latest` file is not written — resume from
-`best_model.pt` instead.
-
-### Hydra entry point (optional)
-
-`train_hydra.py` is a thin wrapper over the same training code, for users who
-prefer Hydra/YAML config management. It derives every default by introspecting
-the `train.py` click options (single source of truth), so `configs/config.yaml`
-only declares the required fields and any new flag propagates automatically:
-
-```bash
-python train_hydra.py outdir=./training-runs cfg=diffit-256 \
-    data=./datasets/imagenet_256x256.zip gpus=2 batch_gpu=42 \
-    combra_metrics=false save_inference_only=true snap=100
-```
-
-Override any `train.py` option by its Python name (dashes → underscores). Both
-entry points call the same `launch_from_opts`, so runs are identical.
+Runs go start-to-finish: **there is no `--resume`, no auto-restart, and no
+rolling/best/final full checkpoint.** A crash or walltime kill cannot be
+continued, so size `--kimg` (or split into progressive `--init-weights` stages)
+to fit the job's time limit. Every snapshot is written atomically and the last
+tick always snapshots, so a completed run always ends in a usable model. Pick the
+best checkpoint post-hoc from `stats.jsonl` against the kept
+`diffit-snapshot-<kimg>-inference.pt` history (raise `--snapshot-keep-last` to
+keep more, `0` for all).
 
 ### Training options
 
@@ -371,24 +321,25 @@ entry points call the same `launch_from_opts`, so runs are identical.
 | `--kimg` | from cfg | Total training duration in kimg |
 | `--tick` | from cfg | Progress print interval (kimg) |
 | `--snap` | from cfg | Snapshot save interval (ticks) |
-| `--seed` | 0 | Random seed |
+| `--seed` | 0 | Random seed (weight init, data shuffle incl. DistributedSampler, eval/grid latents) |
 | `--lr` | from cfg | Learning rate override |
-| `--fp32` | from cfg | Disable mixed precision (sets `use_fp16=False`) |
-| `--amp-dtype` | bf16 | AMP dtype: `fp16` or `bf16` (bf16 preferred on A100/H100) |
+| `--precision` | from cfg (`bf16`) | Compute precision: `fp32` / `fp16` / `bf16` (GradScaler only for fp16) |
 | `--ema-rate` | from cfg | EMA decay rate override |
-| `--resume` | None | Path to checkpoint for resuming |
+| `--init-weights` | None | Warm-start from a previous stage's EMA snapshot (weights only, fresh optimizer) |
 | `--schedule-sampler` | from cfg | Timestep sampler override |
 | `--cfg-scale` | from cfg | CFG scale used during training-time eval |
-| `--num-fid-samples` | from cfg (10000) | Samples for FID/IS eval during training (0=disable) |
-| `--combra-metrics` | true | Compute combra generative-quality metrics each snapshot tick (independent of `--num-fid-samples`); warns if requested but combra is not installed |
-| `--save-inference-only` | false | Skip the rolling full `network-snapshot-latest.pt`; per-tick inference snapshots and the full `best_model.pt` are still written, so resume stays possible with no repeated optimizer state on disk |
-| `--snapshot-keep-last` | 3 | Keep only the N newest `network-snapshot-<kimg>-inference.pt` snapshots (0 = keep all); never affects `best_model.pt` / `network-snapshot-latest.pt` / `network-final*.pt` |
+| `--num-fid-samples` | from cfg (10000) | Fakes for eval / combra each tick (0=disable) |
+| `--combra-ref-count` | 0 | Cap the combra reference to a seeded random subset of N reals (0 = whole dataset) |
+| `--combra-metrics` | True | Compute combra generative-quality metrics each snapshot tick; warns if requested but combra is not installed |
+| `--snapshot-keep-last` | 3 | Keep only the N newest `diffit-snapshot-<kimg>-inference.pt` snapshots (0 = keep all) |
 | `--grad-accum` | from cfg | Gradient accumulation steps (effective batch = batch-gpu × gpus × accum) |
-| `--grad-ckpt / --no-grad-ckpt` | from cfg | Toggle gradient checkpointing (trades compute for memory) |
+| `--grad-ckpt` | from cfg | Gradient checkpointing (`True`/`False`) |
 | `--lr-warmup` | from cfg | Linear LR warmup duration in kimg (0 = disabled) |
-| `--tf32 / --no-tf32` | tf32 on | Enable TF32 for matmul/conv |
-| `--workers` | 4 | DataLoader worker processes |
-| `--cache-in-ram / --no-cache-in-ram` | cache on | Cache entire dataset in RAM to reduce disk I/O |
+| `--tf32` | True | Enable TF32 for matmul/conv (`True`/`False`) |
+| `--bench` | True | Enable cuDNN autotune / benchmark (`True`/`False`) |
+| `--mirror` | False | Stochastic per-item horizontal flip in the training loader (`True`/`False`) |
+| `--workers` | 3 | DataLoader worker processes |
+| `--cache-in-ram` | True | Cache entire dataset in RAM (`True`/`False`) |
 | `-n, --dry-run` | off | Print resolved training options and exit |
 
 ### Training output
@@ -397,42 +348,32 @@ Each run creates a directory with the following structure:
 
 ```
 training-runs/00000-diffit-256-gpus4-batch256/
-├── training_options.json         # All training hyperparameters
-├── log.txt                       # Human-readable training log
-├── progress.csv                  # CSV training metrics
-├── progress.json                 # JSON training metrics
-├── stats.jsonl                   # JSON Lines stats (SAN-v2 style)
-├── events.out.tfevents.*         # TensorBoard event files
-├── reals.png                     # Real training image grid
-├── fakes_init.png                # Initial generated images (before training)
-├── fakes000200.png               # Generated images at 200 kimg
-├── fakes000400.png               # Generated images at 400 kimg
+├── training_options.json                  # Resolved launch config
+├── 00000-diffit-256-gpus4-batch256.log    # Rank-0 console transcript
+├── stats.jsonl                            # Machine-readable scalar rows (one per tick)
+├── events.out.tfevents.*.<run-name>       # TensorBoard scalars/images (run-name suffix)
+├── reals.png                              # Real training image grid
+├── fakes_init.png                         # Initial generated images (before training)
+├── fakes000200.png                        # Generated images at 200 kimg
+├── fakes000400.png                        # Generated images at 400 kimg
 ├── ...
-├── network-snapshot-001000-inference.pt  # Per-tick G_ema snapshot (newest --snapshot-keep-last kept)
-├── network-snapshot-002000-inference.pt
-├── ...
-├── network-snapshot-latest.pt    # Rolling full checkpoint, overwritten each tick (omitted with --save-inference-only)
-├── best_model.pt                 # Full checkpoint of the lowest-FID tick
-├── network-final.pt              # Final trained model (full resumable state)
-└── network-final-inference.pt    # Final G_ema weights only
+├── diffit-snapshot-000998-inference.pt    # EMA-only snapshot + metadata (newest --snapshot-keep-last kept)
+├── diffit-snapshot-000999-inference.pt
+└── diffit-snapshot-001000-inference.pt    # Last tick always snapshots → this IS the final model
 ```
 
-Each snapshot tick writes a small `network-snapshot-<kimg>-inference.pt` (G_ema
-weights only) for history — only the newest `--snapshot-keep-last` are retained —
-plus full checkpoints that never accumulate: a single rolling
-`network-snapshot-latest.pt` overwritten in place, and `best_model.pt` (rewritten
-only when FID improves). The full checkpoints hold the resumable state (`model`,
-`ema`, `opt`, optional `scaler`, `cur_nimg`) so `--resume` continues training
-exactly. `--save-inference-only` skips the rolling `latest` file (no repeated
-optimizer state on disk); `best_model.pt` and the final `network-final.pt` stay
-full, so resume — and progressive finetuning — still work. The inference loaders
-(`gen_images.py`, `sample.py`) transparently extract the EMA weights from any of
-these — a full checkpoint, an older bare EMA `state_dict`, or an `*-inference.pt`
-file.
+There is exactly one checkpoint kind: `diffit-snapshot-<kimg>-inference.pt` — EMA
+weights only, plus self-describing metadata (`n_classes`, `resolution`,
+`class_names`, `cur_nimg`). It is written every `--snap` ticks **and always at the
+last tick**, atomically (temp file + `os.replace`), and pruned to the newest
+`--snapshot-keep-last`. No optimizer state, discriminators, or raw (non-EMA)
+weights ever touch disk; there is no resume, best-model, rolling `latest`, or
+final full checkpoint. The inference loaders (`gen_images.py`, `sample.py`)
+extract the EMA weights from any of these (or an older bare EMA `state_dict`).
 
-Quality metrics (**IS**, **FID**, **sFID**, **Precision**, **Recall**) are computed automatically every `snap` ticks during training using 10000 samples by default (configurable per `--cfg`). Results are logged to TensorBoard under `Metrics/` and to `stats.jsonl`. Adjust with `--num-fid-samples` (set to 0 to disable).
+Quality metrics (**IS**, **FID**, **sFID**, **Precision**, **Recall**) are computed automatically every `snap` ticks during training using 10000 samples by default (configurable per `--cfg`), when combra is **not** used. Results are logged to TensorBoard under `Metrics/` and to `stats.jsonl`. Adjust with `--num-fid-samples` (set to 0 to disable).
 
-`--combra-metrics` (on by default) is **mutually exclusive** with the Inception suite above: when it is on, the IS/FID/sFID/Precision/Recall metrics are disabled and only `combra_*` metrics are logged. combra generates **10000 fakes** each tick (matching the SAN-v2 reference) scored against the **whole training set** as the real reference. The image-feature metrics are logged as `combra_fid10k`, `combra_cmmd10k`, `combra_fd_dinov2_10k` (the suffix mirrors SAN-v2); the angle-density metrics (`combra_w1`, `combra_mu1`, …) keep their bare names.
+`--combra-metrics` (on by default) is **mutually exclusive** with the Inception suite above: when it is on, the IS/FID/sFID/Precision/Recall metrics are disabled and only `combra_*` metrics are logged. combra generates `--num-fid-samples` fakes each tick, scored against the training set (capped to a seeded random subset by `--combra-ref-count`). The image-feature metrics are logged as `combra_fid10k`, `combra_cmmd10k`, `combra_fd_dinov2_10k` (the `10k` suffix is literal and does not change with `--num-fid-samples`); the angle-density metrics (`combra_w1`, `combra_mu1`, …) keep their bare names.
 
 To enable combra metrics, install the optional extra:
 
@@ -457,38 +398,36 @@ Generate individual PNG images for visual inspection:
 
 ```bash
 diffit-gen-images \
-    --model-path ./training-runs/00000-diffit-256-gpus4-batch256/network-final.pt \
+    --network ./training-runs/00000-diffit-256-gpus4-batch256/diffit-snapshot-000400-inference.pt \
     --seeds 0-49 \
     --outdir ./generated/256 \
     --image-size 256 \
     --cfg-scale 4.4 \
-    --num-sampling-steps 250
+    --steps 250
 ```
 
 Options:
-- `--seeds`: Comma-separated list or ranges (e.g., `0,1,4-6`)
+- `--seeds`: Comma-separated list or ranges (e.g., `0,1,4-6`) — seed mode, one image per seed
 - `--class-idx`: Specific class label (random if not specified)
-- `--batch-sz`: Batch size per seed
-- `--use-ddim`: Use DDIM sampling instead of DDPM
+- `--sampler`: `dpm++` / `unipc` / `ddim` / `ddpm` (replaces the former `--use-ddim`)
+- `--steps` (alias `--num-sampling-steps`): sampler steps
 - `--cfg-scale`: Classifier-free guidance scale (4.4 for 256, 1.49 for 512)
 - `--scale-pow`: Power for cosine CFG schedule
 
-SLURM:
-```bash
-sbatch sbatch/a100/generate_1_gpu_256x256.sbatch
-sbatch sbatch/a100/generate_1_gpu_512x512.sbatch
-sbatch sbatch/h200/generate_4_gpu_256x256.sbatch
-sbatch sbatch/h200/generate_4_gpu_512x512.sbatch
-```
+For bulk per-class generation into the RankH5Writer HDF5 layout the wc_cv angle
+pipeline consumes, use `--samples-per-class` with self-spawning `--gpus N` and
+`sh/generate_<res>.sh`.
 
-### Bulk sampling for FID evaluation
+### Bulk sampling for FID evaluation (legacy)
 
-Generate 50K samples as `.npz` for FID evaluation:
+`scripts.sample` is a **legacy** bulk-`.npz` sampler for the upstream-paper FID
+protocol — outside the v2 generation contract, no guarantees. Prefer
+`diffit-gen-images` for WC-Co work.
 
 **ImageNet-256:**
 ```bash
 torchrun --nproc_per_node=4 -m scripts.sample \
-    --model-path ./training-runs/00000-diffit-256-gpus4-batch256/network-final.pt \
+    --model-path ./training-runs/00000-diffit-256-gpus4-batch256/diffit-snapshot-000400-inference.pt \
     --outdir ./samples/256 \
     --image-size 256 \
     --cfg-scale 4.4 \
@@ -496,27 +435,6 @@ torchrun --nproc_per_node=4 -m scripts.sample \
     --batch-size 16 \
     --num-sampling-steps 250 \
     --cfg-cond
-```
-
-**ImageNet-512:**
-```bash
-torchrun --nproc_per_node=4 -m scripts.sample \
-    --model-path ./training-runs/00000-diffit-512-gpus4-batch100/network-final.pt \
-    --outdir ./samples/512 \
-    --image-size 512 \
-    --cfg-scale 1.49 \
-    --num-samples 50000 \
-    --batch-size 8 \
-    --num-sampling-steps 250 \
-    --cfg-cond
-```
-
-SLURM:
-```bash
-sbatch sbatch/a100/sample_4_gpu_256x256.sbatch
-sbatch sbatch/a100/sample_4_gpu_512x512.sbatch
-sbatch sbatch/h200/sample_4_gpu_256x256.sbatch
-sbatch sbatch/h200/sample_4_gpu_512x512.sbatch
 ```
 
 
@@ -581,8 +499,8 @@ DiffiT-v2/
 │   ├── dist_util.py                # Distributed training (PyTorch DDP)
 │   ├── image_datasets.py           # Dataset loading (dir/zip + DistributedSampler)
 │   ├── inception.py                # Shared InceptionV3 feature extractor (FID/IS)
-│   ├── metrics.py                  # Inline FID/IS/sFID/Precision/Recall
-│   ├── logger.py                   # Logging (stdout, JSON, CSV, TensorBoard)
+│   ├── metrics.py                  # Inline FID/IS/sFID/Precision/Recall + combra split APIs
+│   ├── logger.py                   # Minimal rank-0 .log transcript + scalar accumulators
 │   ├── nn.py                       # Neural network utilities (EMA, etc.)
 │   ├── timestep_sampler.py         # Timestep sampling strategies
 │   ├── diffusion_utils.py          # KL divergence & likelihood
@@ -592,29 +510,14 @@ DiffiT-v2/
 │   ├── sample.py                   # Bulk FID sampling (.npz)       -> diffit-sample
 │   ├── gen_images.py               # Individual PNG generation      -> diffit-gen-images
 │   ├── evaluator.py                # FID/IS evaluation (PyTorch)    -> diffit-eval
-│   ├── dataset_tool_for_imagenet.py # ImageNet -> ZIP converter     -> diffit-prepare-data
+│   ├── dataset_tool_for_imagenet.py # dir -> ZIP converter (click group) -> diffit-prepare-data
 │   └── download_models.py          # Pre-download VAE + InceptionV3 -> diffit-download-models
 ├── tests/                           # CPU smoke tests (forward, diffusion, RoPE)
-├── eval_run.sh                      # Evaluation convenience script
-├── pyproject.toml                   # Packaging, entry points, ruff/pytest config
+├── sh/                              # Launch scripts (workstation or sbatch)
+│   ├── train_256.sh  train_512.sh  train_1024.sh
+│   └── generate_256.sh  generate_512.sh  generate_1024.sh
+├── pyproject.toml                   # Packaging, entry points, ruff/pytest config, deps
 ├── .github/workflows/ci.yml         # CI: ruff lint + pytest smoke tests
-├── sbatch/                          # SLURM job scripts
-│   ├── a100/                       # A100 cluster (2 GPU)
-│   │   ├── train_2_gpu_256x256.sbatch
-│   │   ├── train_2_gpu_512x512.sbatch
-│   │   ├── generate_1_gpu_256x256.sbatch
-│   │   ├── generate_1_gpu_512x512.sbatch
-│   │   ├── sample_4_gpu_256x256.sbatch
-│   │   └── sample_4_gpu_512x512.sbatch
-│   └── h200/                       # H200 cluster (4 GPU)
-│       ├── h200_train_4_gpu_256x256.sbatch
-│       ├── h200_train_4_gpu_512x512.sbatch
-│       ├── h200_train_1_gpu_256x256.sbatch
-│       ├── generate_4_gpu_256x256.sbatch
-│       ├── generate_4_gpu_512x512.sbatch
-│       ├── sample_4_gpu_256x256.sbatch
-│       └── sample_4_gpu_512x512.sbatch
-├── requirements.txt                 # Python dependencies (also declared in pyproject.toml)
 └── README.md
 ```
 

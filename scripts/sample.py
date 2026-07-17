@@ -2,6 +2,11 @@
 Generate a large batch of image samples from a DiffiT model and save them
 as a .npz file for FID evaluation.
 
+LEGACY: this bulk-.npz sampler exists only for the upstream-paper FID protocol
+and falls outside the v2 generation contract (§4) — it carries no contract
+guarantees. Use ``diffit-gen-images`` for the WC-Co angle pipeline. Its
+``--num-classes 1000`` default is an upstream ImageNet leftover.
+
 Usage with torchrun (multi-GPU):
     torchrun --nproc_per_node=4 sample.py \
         --model-path ckpts/diffit_256.safetensors \
