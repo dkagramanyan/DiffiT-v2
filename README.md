@@ -8,13 +8,14 @@ For business inquiries, please visit our website and submit the form: [NVIDIA Re
 
 **DiffiT** (Diffusion Vision Transformers) is a generative model that combines the expressive power of diffusion models with Vision Transformers (ViTs), introducing **Time-dependent Multihead Self Attention (TMSA)** for fine-grained control over the denoising at each timestep. DiffiT achieves SOTA performance on class-conditional ImageNet generation at multiple resolutions, notably an **FID score of 1.73** on ImageNet-256.
 
-**DiffiT-v2** is a performance refresh of this codebase. TMSA is preserved exactly as defined in the paper (Section 3.2, Eqs 3–5). What changes is the attention plumbing around it — the learned relative-position bias is replaced with **RoPE-2D** so SDPA can dispatch to FlashAttention, **QK-norm** is added for bf16 stability, LayerNorm becomes RMSNorm, and the MLP switches to SwiGLU. Training and sampling are rebuilt around `torchrun`, `torch.compile`, and `click`. See [Differences from the original NVlabs/DiffiT](#differences-from-the-original-nvlabsdiffit) below.
+**DiffiT-v2** is a performance refresh of this codebase. TMSA is preserved exactly as defined in the paper (Section 3.2, Eqs 3–5). What changes is the attention plumbing around it — the learned relative-position bias is replaced with **RoPE-2D** so SDPA can dispatch to FlashAttention, **QK-norm** is added for bf16 stability, LayerNorm becomes RMSNorm, and the MLP switches to SwiGLU. Training and sampling are rebuilt around **self-spawning `torch.multiprocessing`**, `torch.compile`, and a **`click` CLI**. The repo follows the shared **v2 convention** used across the WC-Co model repos (san-v2 / StyleSwin-v2 / EDM2-v2): a single EMA-only snapshot artifact, uniform training/generation flags, a self-describing dataset/label contract, and combra generative-quality metrics — see the [3.0.0 changelog](./CHANGELOG.md) and [Differences from the original NVlabs/DiffiT](#differences-from-the-original-nvlabsdiffit) below.
 
 ![teaser](./assets/imagenet.png)
 
 ![teaser](./assets/latent_diffit.png)
 
 ## News
+- **[07.17.2026]** DiffiT-v2 3.0.0 — adopts the shared **v2 convention**: EMA-only `diffit-snapshot-<kimg>-inference.pt` checkpoints (no resume/best/final), `--precision` / `True/False` flags / `--init-weights`, self-spawning `--gpus` generation with per-image seeds and unified HDF5, a `class_names` dataset/label contract, and scalar-only `stats.jsonl`. Breaking — see the [changelog](./CHANGELOG.md).
 - **[04.19.2026]** DiffiT-v2 performance refresh: RoPE-2D + FlashAttention, QK-norm, RMSNorm, SwiGLU. 1024² now a first-class config.
 - **[03.08.2026]** DiffiT code and pretrained model are released!
 - **[07.01.2024]** DiffiT has been accepted to [ECCV 2024](https://eccv.ecva.net/)!
@@ -39,9 +40,9 @@ This repo is an engineering refresh of the upstream [NVlabs/DiffiT](https://gith
 **Pipeline, training & sampling infrastructure:**
 
 - **Latent diffusion** — operates in the Stable-Diffusion VAE latent space (`stabilityai/sd-vae-ft-ema`, scaled by `0.18215`), so the transformer denoises 4-channel latents rather than pixels.
-- **`torchrun` + `torch.compile`** — modern distributed launch (replaces MPI); `max-autotune` mode (with CUDA graphs, or `no-cudagraphs` when gradient checkpointing is on) for both training and eval. Fused AdamW, DDP with `no_sync()` gradient accumulation.
-- **kimg/tick training loop** with inline, **distributed** quality metrics (FID / IS / sFID / Precision / Recall) computed every `snap` ticks during training — no separate eval job needed.
-- **DPM-Solver++** for fast training-time sample snapshots; DDPM/DDIM available for full FID-50K sampling.
+- **Self-spawning `torch.multiprocessing` + `torch.compile`** — `--gpus N` launches one worker per GPU for both training and generation (no `torchrun`, replaces MPI); `max-autotune` mode (with CUDA graphs, or `no-cudagraphs` when gradient checkpointing is on). Fused AdamW, DDP with `no_sync()` gradient accumulation.
+- **kimg/tick training loop** with inline, **distributed** quality metrics computed every `snap` ticks during training — no separate eval job needed. **combra** generative-quality metrics (FID / CMMD / FD-DINOv2 + angle-density) are the default; DiffiT's own Inception suite (IS / FID / sFID / Precision / Recall) is the fallback when combra is off.
+- **DPM-Solver++** for fast training-time sample snapshots; DDPM/DDIM/UniPC available for full sampling.
 - **CFG schedule** — power-cosine CFG schedule at 256² (`input_size ≤ 32`), constant CFG scale at 512²/1024².
 
 **Expected performance** (vs. original DiffiT): ~1.1–1.3× at 256², ~1.8–2.5× at 512², **~3–5× at 1024²** — dominated by FlashAttention at high resolution. Quality impact: ±0.1–0.3 FID, directionally positive.
