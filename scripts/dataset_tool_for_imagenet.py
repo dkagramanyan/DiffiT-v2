@@ -1,12 +1,19 @@
 """
-Tool for creating ZIP/PNG based datasets from ImageNet for DiffiT training.
+Dataset builder for DiffiT training (``diffit-prepare-data``).
 
-Reads ImageNet-style directory structure and creates a ZIP archive with
-resized/cropped images and a dataset.json containing class labels,
-compatible with the ZipImageDataset loader.
+Reads an ImageNet-style directory structure (or any ``train/<class>/`` layout)
+and writes a StyleGAN-style ZIP archive of resized/cropped RGB PNGs plus a
+``dataset.json`` carrying both the integer ``labels`` and the index-aligned
+``class_names`` (§5 label contract). Grayscale sources are converted to RGB
+here, at build time — the dataset loader asserts 3 channels instead of
+converting silently.
+
+``diffit-prepare-data`` is a click *group*; today it exposes a single
+``convert`` subcommand (mirroring the EDM2-v2 shape), sharing the transform set
+``center-crop`` / ``center-crop-wide`` / ``center-crop-dhariwal``.
 
 Usage:
-    python dataset_tool_for_imagenet.py \
+    diffit-prepare-data convert \
         --source /path/to/ILSVRC \
         --dest ./datasets/imagenet_256x256.zip \
         --resolution 256x256 \
@@ -21,7 +28,7 @@ import re
 import sys
 import zipfile
 from pathlib import Path
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import click
 import numpy as np
@@ -63,10 +70,14 @@ def is_image_ext(fname: Union[str, Path]) -> bool:
 
 
 def open_imagenet(source_dir, *, max_images: Optional[int]):
-    """Open ImageNet directory structure and yield images with labels."""
-    images = []
-    labels = []
+    """Open an ImageNet-style directory and yield RGB images with labels.
 
+    Returns ``(max_idx, class_names, iterator)``. The integer label is the index
+    of the class folder in alphabetical (``sorted``) order (§5 Rule 1), and
+    ``class_names`` is that same sorted folder-name list, index-aligned. Every
+    image is decoded and converted to 3-channel RGB here so the archive is RGB
+    end to end.
+    """
     # Look for standard ImageNet layout: Data/CLS-LOC/train/nXXXXXXXX/
     train_dirs = sorted(Path(source_dir).rglob("Data/CLS-LOC/train/*"))
     if not train_dirs:
@@ -76,6 +87,10 @@ def open_imagenet(source_dir, *, max_images: Optional[int]):
             train_root = train_root / "train"
         train_dirs = sorted([d for d in train_root.iterdir() if d.is_dir()])
 
+    class_names = [d.name for d in train_dirs]
+
+    images = []
+    labels = []
     for idx, input_dir in enumerate(train_dirs):
         input_images = sorted([
             str(f) for f in Path(input_dir).rglob("*")
@@ -90,11 +105,12 @@ def open_imagenet(source_dir, *, max_images: Optional[int]):
         for idx, fname in enumerate(images):
             if idx >= max_idx:
                 break
-            img = PIL.Image.open(fname)
-            img = np.array(img)
-            yield dict(img=img, label=labels[idx])
+            # Build-time grayscale/CMYK → RGB conversion (§5): the archive is
+            # 3-channel and the loader never converts.
+            img = PIL.Image.open(fname).convert("RGB")
+            yield dict(img=np.array(img), label=labels[idx])
 
-    return max_idx, iterate_images()
+    return max_idx, class_names, iterate_images()
 
 
 def make_transform(
@@ -136,16 +152,36 @@ def make_transform(
         canvas[(width - height) // 2 : (width + height) // 2, :] = img
         return canvas
 
+    def center_crop_dhariwal(width, height, img):
+        """ADM/Dhariwal center crop: iterative BOX halving then a single BICUBIC
+        resize of the short side, then a square center crop. Requires a square
+        output (width == height)."""
+        if width != height:
+            error("center-crop-dhariwal requires a square --resolution (W == H)")
+        size = width
+        pil = PIL.Image.fromarray(img, "RGB")
+        while min(*pil.size) >= 2 * size:
+            pil = pil.resize(tuple(x // 2 for x in pil.size), resample=PIL.Image.BOX)
+        scale_f = size / min(*pil.size)
+        pil = pil.resize(
+            tuple(round(x * scale_f) for x in pil.size), resample=PIL.Image.BICUBIC
+        )
+        arr = np.array(pil)
+        crop_y = (arr.shape[0] - size) // 2
+        crop_x = (arr.shape[1] - size) // 2
+        return arr[crop_y : crop_y + size, crop_x : crop_x + size]
+
     if transform is None:
         return functools.partial(scale, output_width, output_height)
-    if transform == "center-crop":
+    crops = {
+        "center-crop": center_crop,
+        "center-crop-wide": center_crop_wide,
+        "center-crop-dhariwal": center_crop_dhariwal,
+    }
+    if transform in crops:
         if output_width is None or output_height is None:
             error("must specify --resolution=WxH when using " + transform + " transform")
-        return functools.partial(center_crop, output_width, output_height)
-    if transform == "center-crop-wide":
-        if output_width is None or output_height is None:
-            error("must specify --resolution=WxH when using " + transform + " transform")
-        return functools.partial(center_crop_wide, output_width, output_height)
+        return functools.partial(crops[transform], output_width, output_height)
     assert False, "unknown transform"
 
 
@@ -176,12 +212,17 @@ def open_dest(dest: str):
         return dest, folder_write_bytes, lambda: None
 
 
-@click.command()
+@click.group()
+def prepare_data():
+    """DiffiT dataset preparation tools."""
+
+
+@prepare_data.command(name="convert")
 @click.pass_context
 @click.option("--source", required=True, type=str, help="Directory for input dataset", metavar="PATH")
 @click.option("--dest", required=True, type=str, help="Output directory or archive name", metavar="PATH")
 @click.option("--max-images", type=int, default=None, help="Output only up to `max-images` images")
-@click.option("--transform", type=click.Choice(["center-crop", "center-crop-wide"]), help="Input crop/resize mode")
+@click.option("--transform", type=click.Choice(["center-crop", "center-crop-wide", "center-crop-dhariwal"]), help="Input crop/resize mode")
 @click.option("--resolution", type=parse_tuple, help="Output resolution (e.g., '256x256')", metavar="WxH")
 def convert_dataset(
     ctx,
@@ -191,39 +232,26 @@ def convert_dataset(
     transform: Optional[str],
     resolution: Optional[Tuple[int, int]],
 ):
-    """Convert an ImageNet dataset into a ZIP archive usable with DiffiT.
+    """Convert an ImageNet-style dataset into a ZIP archive usable with DiffiT.
 
-    The input dataset format is guessed from the --source argument:
-
-    \b
-    --source path/                      Recursively load all images from path/
-    --source path/to/ILSVRC/            Load ImageNet from standard layout
-
-    Specifying the output format and path:
-
-    \b
-    --dest /path/to/dir                 Save output files under /path/to/dir
-    --dest /path/to/dataset.zip         Save output files into /path/to/dataset.zip
-
-    Images within the dataset archive will be stored as uncompressed PNG.
-
-    Class labels are stored in a file called 'dataset.json' at the dataset root:
+    Class labels and names are stored in a ``dataset.json`` at the dataset root:
 
     \b
     {
-        "labels": [
-            ["00000/img00000000.png", 6],
-            ["00000/img00000001.png", 9],
-            ...
-        ]
+        "labels": [["00000/img00000000.png", 1], ...],
+        "class_names": ["Ultra_Co11", "Ultra_Co25", "Ultra_Co6_2"]
     }
+
+    ``class_names`` is index-aligned with the integer labels, so grain-class
+    identity travels with the archive (§5 Rule 2). Images are stored as
+    uncompressed RGB PNG.
     """
     PIL.Image.init()
 
     if dest == "":
         ctx.fail("--dest output filename or directory must not be an empty string")
 
-    num_files, input_iter = open_imagenet(source, max_images=max_images)
+    num_files, class_names, input_iter = open_imagenet(source, max_images=max_images)
     archive_root_dir, save_bytes, close_dest_fn = open_dest(dest)
 
     if resolution is None:
@@ -231,12 +259,9 @@ def convert_dataset(
     transform_image = make_transform(transform, *resolution)
 
     dataset_attrs = None
-    labels = []
+    labels: List[Optional[list]] = []
 
     for idx, image in tqdm(enumerate(input_iter), total=num_files):
-        if image["img"].ndim == 2:
-            continue
-
         idx_str = f"{idx:08d}"
         archive_fname = f"{idx_str[:5]}/img{idx_str}.png"
 
@@ -256,8 +281,8 @@ def convert_dataset(
             height = dataset_attrs["height"]
             if width != height:
                 error(f"Image dimensions after scale and crop are required to be square. Got {width}x{height}")
-            if dataset_attrs["channels"] not in [1, 3]:
-                error("Input images must be stored as RGB or grayscale")
+            if dataset_attrs["channels"] != 3:
+                error("Input images must be stored as RGB (grayscale is converted to RGB at build time)")
             if width != 2 ** int(np.floor(np.log2(width))):
                 error("Image width/height after scale and crop are required to be power-of-two")
         elif dataset_attrs != cur_image_attrs:
@@ -267,20 +292,24 @@ def convert_dataset(
             ]
             error(f"Image {archive_fname} attributes must be equal across all images of the dataset.  Got:\n" + "\n".join(err))
 
-        img = PIL.Image.fromarray(img, {1: "L", 3: "RGB"}[channels])
+        img = PIL.Image.fromarray(img, "RGB")
         image_bits = io.BytesIO()
         img.save(image_bits, format="png", compress_level=0, optimize=False)
         save_bytes(os.path.join(archive_root_dir, archive_fname), image_bits.getbuffer())
         labels.append([archive_fname, image["label"]] if image["label"] is not None else None)
 
-    metadata = {
-        "labels": labels if all(x is not None for x in labels) else None
-    }
+    # Every image must carry a label — a single unlabeled image is an error, not
+    # a silent drop to unconditional (§5 label contract).
+    missing = [i for i, x in enumerate(labels) if x is None]
+    if missing:
+        error(f"{len(missing)} image(s) have no class label; refusing to write a partially-labeled dataset")
+
+    metadata = {"labels": labels, "class_names": class_names}
     save_bytes(os.path.join(archive_root_dir, "dataset.json"), json.dumps(metadata))
     close_dest_fn()
 
-    print(f"Done. Processed {len(labels)} images.")
+    print(f"Done. Processed {len(labels)} images across {len(class_names)} classes.")
 
 
 if __name__ == "__main__":
-    convert_dataset()
+    prepare_data()

@@ -1,387 +1,76 @@
-"""
-Logger copied from OpenAI baselines to avoid extra RL-based dependencies:
-https://github.com/openai/baselines/blob/ea25b9e8b234e6ee1bca43083f8f3cf974143998/baselines/logger.py
+"""Minimal training logger for DiffiT (v2 convention, §7).
+
+Replaces the vendored OpenAI-baselines logger. There is exactly one console
+transcript per run — a rank-0-only ``.log`` file named after the run directory,
+every line prefixed ``[YYYY-MM-DD HH:MM:SS]`` — plus stdout. No ``progress.csv``
+/ ``progress.json`` sidecars (``stats.jsonl`` is the machine-readable source of
+truth) and no interleaving of text records into ``stats.jsonl``.
+
+The scalar-accumulation helpers (:func:`logkv_mean` / :func:`dumpkvs`) average
+per-tick loss values; they no longer fan out to any file — the training loop
+owns writing scalars to ``stats.jsonl`` and TensorBoard.
 """
 
 import datetime
-import json
 import os
-import os.path as osp
-import sys
-import tempfile
-import time
 from collections import defaultdict
-from contextlib import contextmanager
 
-DEBUG = 10
-INFO = 20
-WARN = 30
-ERROR = 40
-
-DISABLED = 50
+_STATE = {
+    "file": None,      # rank-0 .log file handle (None on other ranks)
+    "name2val": defaultdict(float),
+    "name2cnt": defaultdict(int),
+}
 
 
-class KVWriter(object):
-    def writekvs(self, kvs):
-        raise NotImplementedError
+def configure(log_dir, run_name=None, is_main=True):
+    """Open the rank-0 ``<run_name>.log`` transcript in ``log_dir``.
 
-
-class SeqWriter(object):
-    def writeseq(self, seq):
-        raise NotImplementedError
-
-
-class HumanOutputFormat(KVWriter, SeqWriter):
-    def __init__(self, filename_or_file):
-        if isinstance(filename_or_file, str):
-            self.file = open(filename_or_file, "wt")
-            self.own_file = True
-        else:
-            assert hasattr(filename_or_file, "read"), (
-                "expected file or str, got %s" % filename_or_file
-            )
-            self.file = filename_or_file
-            self.own_file = False
-
-    def writekvs(self, kvs):
-        key2str = {}
-        for (key, val) in sorted(kvs.items()):
-            if hasattr(val, "__float__"):
-                valstr = "%-8.3g" % val
-            else:
-                valstr = str(val)
-            key2str[self._truncate(key)] = self._truncate(valstr)
-
-        if len(key2str) == 0:
-            print("WARNING: tried to write empty key-value dict")
-            return
-        else:
-            keywidth = max(map(len, key2str.keys()))
-            valwidth = max(map(len, key2str.values()))
-
-        dashes = "-" * (keywidth + valwidth + 7)
-        lines = [dashes]
-        for (key, val) in sorted(key2str.items(), key=lambda kv: kv[0].lower()):
-            lines.append(
-                "| %s%s | %s%s |"
-                % (key, " " * (keywidth - len(key)), val, " " * (valwidth - len(val)))
-            )
-        lines.append(dashes)
-        self.file.write("\n".join(lines) + "\n")
-        self.file.flush()
-
-    def _truncate(self, s):
-        maxlen = 30
-        return s[: maxlen - 3] + "..." if len(s) > maxlen else s
-
-    def writeseq(self, seq):
-        seq = list(seq)
-        for (i, elem) in enumerate(seq):
-            self.file.write(elem)
-            if i < len(seq) - 1:
-                self.file.write(" ")
-        self.file.write("\n")
-        self.file.flush()
-
-    def close(self):
-        if self.own_file:
-            self.file.close()
-
-
-class JSONOutputFormat(KVWriter):
-    def __init__(self, filename):
-        self.file = open(filename, "wt")
-
-    def writekvs(self, kvs):
-        for k, v in sorted(kvs.items()):
-            if hasattr(v, "dtype"):
-                kvs[k] = float(v)
-        self.file.write(json.dumps(kvs) + "\n")
-        self.file.flush()
-
-    def close(self):
-        self.file.close()
-
-
-class CSVOutputFormat(KVWriter):
-    def __init__(self, filename):
-        self.file = open(filename, "w+t")
-        self.keys = []
-        self.sep = ","
-
-    def writekvs(self, kvs):
-        extra_keys = list(kvs.keys() - self.keys)
-        extra_keys.sort()
-        if extra_keys:
-            self.keys.extend(extra_keys)
-            self.file.seek(0)
-            lines = self.file.readlines()
-            self.file.seek(0)
-            for (i, k) in enumerate(self.keys):
-                if i > 0:
-                    self.file.write(",")
-                self.file.write(k)
-            self.file.write("\n")
-            for line in lines[1:]:
-                self.file.write(line[:-1])
-                self.file.write(self.sep * len(extra_keys))
-                self.file.write("\n")
-        for (i, k) in enumerate(self.keys):
-            if i > 0:
-                self.file.write(",")
-            v = kvs.get(k)
-            if v is not None:
-                self.file.write(str(v))
-        self.file.write("\n")
-        self.file.flush()
-
-    def close(self):
-        self.file.close()
-
-
-class TBTextOutputFormat(SeqWriter):
-    """Mirror `logger.log(...)` text to TensorBoard add_text + stats.jsonl."""
-
-    def __init__(self, summary_writer, stats_jsonl=None):
-        self.writer = summary_writer
-        self.jsonl = stats_jsonl
-        self._step = 0
-
-    def writeseq(self, seq):
-        msg = " ".join(str(x) for x in seq)
+    ``is_main=False`` (non-rank-0 workers) logs to stdout only, so the ``.log``
+    file is a clean single-rank transcript.
+    """
+    _STATE["name2val"] = defaultdict(float)
+    _STATE["name2cnt"] = defaultdict(int)
+    if _STATE["file"] is not None:
         try:
-            self.writer.add_text("log", msg, global_step=self._step)
+            _STATE["file"].close()
         except Exception:
             pass
-        if self.jsonl is not None:
-            try:
-                self.jsonl.write(json.dumps({
-                    "kind": "text", "msg": msg, "time": time.time(), "step": self._step,
-                }) + "\n")
-                self.jsonl.flush()
-            except Exception:
-                pass
-        self._step += 1
-
-    def close(self):
-        pass
+        _STATE["file"] = None
+    if is_main and log_dir is not None:
+        os.makedirs(log_dir, exist_ok=True)
+        fname = f"{run_name}.log" if run_name else "log.txt"
+        _STATE["file"] = open(os.path.join(log_dir, fname), "at")
 
 
-def register_tb_writer(summary_writer, stats_jsonl=None):
-    """Attach a TB/jsonl text mirror to the current Logger so logger.log() fans out."""
-    if Logger.CURRENT is None:
-        _configure_default_logger()
-    Logger.CURRENT.output_formats.append(TBTextOutputFormat(summary_writer, stats_jsonl))
-
-
-def make_output_format(format, ev_dir, log_suffix=""):
-    os.makedirs(ev_dir, exist_ok=True)
-    if format == "stdout":
-        return HumanOutputFormat(sys.stdout)
-    elif format == "log":
-        return HumanOutputFormat(osp.join(ev_dir, "log%s.txt" % log_suffix))
-    elif format == "json":
-        return JSONOutputFormat(osp.join(ev_dir, "progress%s.json" % log_suffix))
-    elif format == "csv":
-        return CSVOutputFormat(osp.join(ev_dir, "progress%s.csv" % log_suffix))
-    else:
-        raise ValueError("Unknown format specified: %s" % (format,))
-
-
-# ================================================================
-# API
-# ================================================================
-
-
-def logkv(key, val):
-    get_current().logkv(key, val)
+def log(*args):
+    """Print a timestamped line to stdout and (rank 0) the ``.log`` file."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] " + " ".join(str(a) for a in args)
+    print(line, flush=True)
+    f = _STATE["file"]
+    if f is not None:
+        f.write(line + "\n")
+        f.flush()
 
 
 def logkv_mean(key, val):
-    get_current().logkv_mean(key, val)
-
-
-def logkvs(d):
-    for (k, v) in d.items():
-        logkv(k, v)
+    """Accumulate a running mean for ``key`` over the current tick."""
+    oldval, cnt = _STATE["name2val"][key], _STATE["name2cnt"][key]
+    _STATE["name2val"][key] = oldval * cnt / (cnt + 1) + val / (cnt + 1)
+    _STATE["name2cnt"][key] = cnt + 1
 
 
 def dumpkvs():
-    return get_current().dumpkvs()
+    """Return the accumulated means and reset the accumulators."""
+    out = dict(_STATE["name2val"])
+    _STATE["name2val"] = defaultdict(float)
+    _STATE["name2cnt"] = defaultdict(int)
+    return out
 
 
-def getkvs():
-    return get_current().name2val
-
-
-def log(*args, level=INFO):
-    get_current().log(*args, level=level)
-
-
-def debug(*args):
-    log(*args, level=DEBUG)
-
-
-def info(*args):
-    log(*args, level=INFO)
-
-
-def warn(*args):
-    log(*args, level=WARN)
-
-
-def error(*args):
-    log(*args, level=ERROR)
-
-
-def set_level(level):
-    get_current().set_level(level)
-
-
-def get_dir():
-    return get_current().get_dir()
-
-
-record_tabular = logkv
-dump_tabular = dumpkvs
-
-
-@contextmanager
-def profile_kv(scopename):
-    logkey = "wait_" + scopename
-    tstart = time.time()
-    try:
-        yield
-    finally:
-        get_current().name2val[logkey] += time.time() - tstart
-
-
-def profile(n):
-    def decorator_with_name(func):
-        def func_wrapper(*args, **kwargs):
-            with profile_kv(n):
-                return func(*args, **kwargs)
-        return func_wrapper
-    return decorator_with_name
-
-
-# ================================================================
-# Backend
-# ================================================================
-
-
-def get_current():
-    if Logger.CURRENT is None:
-        _configure_default_logger()
-    return Logger.CURRENT
-
-
-class Logger(object):
-    DEFAULT = None
-    CURRENT = None
-
-    def __init__(self, dir, output_formats, comm=None):
-        self.name2val = defaultdict(float)
-        self.name2cnt = defaultdict(int)
-        self.level = INFO
-        self.dir = dir
-        self.output_formats = output_formats
-        self.comm = comm
-
-    def logkv(self, key, val):
-        self.name2val[key] = val
-
-    def logkv_mean(self, key, val):
-        oldval, cnt = self.name2val[key], self.name2cnt[key]
-        self.name2val[key] = oldval * cnt / (cnt + 1) + val / (cnt + 1)
-        self.name2cnt[key] = cnt + 1
-
-    def dumpkvs(self):
-        d = self.name2val
-        out = d.copy()
-        for fmt in self.output_formats:
-            if isinstance(fmt, KVWriter) and not isinstance(fmt, HumanOutputFormat):
-                fmt.writekvs(d)
-        self.name2val.clear()
-        self.name2cnt.clear()
-        return out
-
-    def log(self, *args, level=INFO):
-        if self.level <= level:
-            self._do_log(args)
-
-    def set_level(self, level):
-        self.level = level
-
-    def get_dir(self):
-        return self.dir
-
-    def close(self):
-        for fmt in self.output_formats:
-            fmt.close()
-
-    def _do_log(self, args):
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        prefixed = [f"[{timestamp}]"] + list(map(str, args))
-        for fmt in self.output_formats:
-            if isinstance(fmt, SeqWriter):
-                fmt.writeseq(prefixed)
-
-
-def configure(log_dir=None, format_strs=None, log_suffix=""):
-    """
-    Configure the logger.
-
-    :param log_dir: output directory. Falls back to env OPENAI_LOGDIR or a temp dir.
-    :param format_strs: list of output format strings (e.g. ["stdout", "log", "csv"]).
-    :param log_suffix: suffix for log file names.
-    """
-    if log_dir is None:
-        log_dir = os.getenv("OPENAI_LOGDIR")
-    if log_dir is None:
-        log_dir = osp.join(
-            tempfile.gettempdir(),
-            datetime.datetime.now().strftime("diffit-%Y-%m-%d-%H-%M-%S-%f"),
-        )
-    assert isinstance(log_dir, str)
-    log_dir = os.path.expanduser(log_dir)
-    os.makedirs(log_dir, exist_ok=True)
-
-    rank = int(os.environ.get("RANK", 0))
-    if rank > 0:
-        log_suffix = log_suffix + "-rank%03i" % rank
-
-    if format_strs is None:
-        if rank == 0:
-            format_strs = os.getenv("OPENAI_LOG_FORMAT", "stdout,log,csv").split(",")
-        else:
-            format_strs = os.getenv("OPENAI_LOG_FORMAT_MPI", "log").split(",")
-    format_strs = filter(None, format_strs)
-    output_formats = [make_output_format(f, log_dir, log_suffix) for f in format_strs]
-
-    Logger.CURRENT = Logger(dir=log_dir, output_formats=output_formats)
-    if output_formats:
-        log("Logging to %s" % log_dir)
-
-
-def _configure_default_logger():
-    configure()
-    Logger.DEFAULT = Logger.CURRENT
-
-
-def reset():
-    if Logger.CURRENT is not Logger.DEFAULT:
-        Logger.CURRENT.close()
-        Logger.CURRENT = Logger.DEFAULT
-        log("Reset logger")
-
-
-@contextmanager
-def scoped_configure(dir=None, format_strs=None):
-    prevlogger = Logger.CURRENT
-    configure(log_dir=dir, format_strs=format_strs)
-    try:
-        yield
-    finally:
-        Logger.CURRENT.close()
-        Logger.CURRENT = prevlogger
+def close():
+    if _STATE["file"] is not None:
+        try:
+            _STATE["file"].close()
+        finally:
+            _STATE["file"] = None

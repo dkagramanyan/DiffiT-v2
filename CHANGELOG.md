@@ -3,6 +3,69 @@
 All notable changes to this fork (`DiffiT-v2`) are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [3.0.0] — 2026-07-17
+
+Adopts the shared **v2 convention** (`wc_cv` `models_api_proposal` §12). This is
+a **breaking** release: interrupted runs can no longer be resumed, and commands
+using removed or renamed flags fail.
+
+### Added
+- **`--init-weights <snapshot>`** — weights-only warm start for progressive
+  higher-resolution finetuning (loads a previous stage's EMA weights, fresh
+  optimizer). Replaces the removed `--resume` flow. (`scripts/train.py`)
+- **`--precision {fp32,fp16,bf16}`** replacing `--fp32` + `--amp-dtype`
+  (GradScaler only for fp16). (`scripts/train.py`)
+- **`--combra-ref-count N`** — cap the combra reference to a *seeded random
+  subset* of `N` reals (0 = whole dataset). (`scripts/train.py`)
+- **`--mirror` / `--bench` `True/False` flags**; boolean flags are now
+  `--flag True/False` throughout (no `--x/--no-x` pairs). (`scripts/train.py`)
+- **Self-describing checkpoints** — every snapshot embeds
+  `{n_classes, resolution, class_names, cur_nimg}`. (`scripts/train.py`)
+- **`class_names` in the label contract** — `diffit-prepare-data` writes an
+  index-aligned `class_names` into `dataset.json`; it flows into checkpoints and
+  generated `.h5`, and `diffit-gen-images --classes` accepts names.
+- **Generation self-spawns** — `diffit-gen-images --gpus N` launches one worker
+  per GPU via `torch.multiprocessing`; per-image seed
+  `base + class·samples_per_class + idx`; `--network` / `--steps` aliases; merged
+  `<desc>.h5`; the merge hard-fails on incomplete shards. (`scripts/gen_images.py`)
+- **`center-crop-dhariwal`** transform and `diffit-prepare-data` as a click group
+  with a `convert` subcommand. (`scripts/dataset_tool_for_imagenet.py`)
+- **`sh/` launch scripts** (`train_{256,512,1024}.sh`,
+  `generate_{256,512,1024}.sh`) — self-locating repo root, offline-cluster env
+  (`HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE`), no hardcoded homes/nodelists/accounts.
+
+### Changed
+- **Checkpoint scheme (§3)** — exactly one artifact kind:
+  `diffit-snapshot-<kimg>-inference.pt` (EMA-only, atomic, written every `--snap`
+  tick **and always at the last tick**, pruned to `--snapshot-keep-last`). No
+  resume, no `best_model.pt`, no rolling `network-snapshot-latest.pt`, no
+  `network-final*.pt`. A fresh run id is always allocated.
+- **Dataset item contract (§5)** — the dataset yields uint8 CHW images and
+  one-hot float32 labels; normalization moved into the training loop; grayscale→
+  RGB conversion is a build-time step (the loader asserts 3 channels). Class count
+  and names are read from `dataset.json` (no startup class probe, no label remap).
+- **`DistributedSampler` seeded from `--seed`** (multi-GPU data order reproducible).
+- **Logging (§7)** — `stats.jsonl` is scalar rows only; TensorBoard tags use the
+  `Loss/*` / `LearningRate/*` / `Timing/*` / `Resources/*` / `Metrics/*` / `Fakes`
+  namespaces with global step = `cur_nimg`; the event file carries the run-name
+  `filename_suffix`; the rank-0 `.log` transcript replaces the vendored logger's
+  `progress.csv` / `progress.json`.
+- **combra is pulled over `git+https`** via the `[combra]` extra.
+
+### Removed
+- **`--resume`**, `--save-inference-only`, `best_model.pt`,
+  `network-snapshot-latest.pt`, `network-final*.pt`, the unused `--metrics` flag,
+  the `--fp32` / `--amp-dtype` / `--grad-ckpt/--no-grad-ckpt` / `--tf32/--no-tf32`
+  / `--cache-in-ram/--no-cache-in-ram` flag forms, and the gen-images
+  `--batch-size` / `--batch-sz` / `--output-hdf5` flags and its `ThreadPool`.
+- **Hydra** (`train_hydra.py`, `configs/`, `hydra-core` dep), `requirements.txt`,
+  the duplicate `diffit/resample.py`, the `sbatch/` collection and the root
+  `train_*prod.sbatch` / `run_train.sh`.
+
+### Note
+- `scripts/sample.py` (bulk-`.npz` sampler) is retained as **legacy** — outside
+  the v2 generation contract, no guarantees.
+
 ## [Unreleased] — 2026-07-16
 
 ### Added

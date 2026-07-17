@@ -1,6 +1,13 @@
 """
 Image dataset utilities for DiffiT training and evaluation.
 Uses standard PyTorch data loading with DistributedSampler support.
+
+Dataset item contract (v2 convention, §5): every ``__getitem__`` yields a
+``uint8`` CHW image at the zip's resolution and, when class-conditional, a
+one-hot ``float32`` label. All normalization (uint8 → ``[-1, 1]``) and the
+one-hot → index reduction happen in the training loop, never inside the dataset
+class. Images are asserted to be 3-channel RGB — grayscale→RGB conversion is a
+build-time step (``diffit-prepare-data``), not a silent per-item convert.
 """
 
 import io
@@ -14,7 +21,40 @@ import numpy as np
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
-from diffit.constants import PIXEL_NORM_HALF
+
+def read_class_meta(data_dir):
+    """Return ``(class_names, num_classes)`` for a dataset directory or .zip.
+
+    ``class_names`` is the index-aligned list of grain-class names (§5 Rule 2)
+    when the source records them, else ``None``. For zips this is the
+    ``dataset.json`` ``class_names`` field; a legacy zip without it falls back to
+    ``max(label) + 1`` for the count and ``None`` names. For directory datasets
+    the classes are the sorted (alphabetical) set of immediate parent folder
+    names (§5 Rule 1).
+    """
+    if not data_dir:
+        raise ValueError("unspecified data directory")
+
+    if data_dir.endswith(".zip"):
+        with zipfile.ZipFile(data_dir, "r") as zf:
+            names = set(zf.namelist())
+            if "dataset.json" not in names:
+                return None, 1
+            with zf.open("dataset.json") as f:
+                meta = json.loads(f.read().decode("utf-8"))
+        class_names = meta.get("class_names")
+        labels = meta.get("labels")
+        if class_names is not None:
+            return list(class_names), len(class_names)
+        if labels:
+            num = max(int(lbl) for _, lbl in labels) + 1
+            return None, num
+        return None, 1
+
+    # Directory dataset: class = immediate parent folder name, alphabetical.
+    all_files = _list_image_files_recursively(data_dir)
+    class_names = sorted({os.path.basename(os.path.dirname(p)) for p in all_files})
+    return class_names, max(len(class_names), 1)
 
 
 def load_data(
@@ -22,30 +62,37 @@ def load_data(
     data_dir,
     batch_size,
     image_size,
+    num_classes,
     class_cond=False,
     deterministic=False,
     random_crop=False,
-    random_flip=True,
+    mirror=False,
     num_workers=4,
     distributed=False,
     cache_in_ram=False,
     drop_last=True,
+    seed=0,
 ):
     """
     Create a generator over (images, kwargs) pairs.
 
-    Each images is an NCHW float tensor, and the kwargs dict contains zero or
-    more keys, each of which map to a batched Tensor of their own.
+    Each ``images`` is an NCHW ``uint8`` tensor; the kwargs dict contains a
+    ``"y"`` key mapping to a batched one-hot ``float32`` label tensor when
+    ``class_cond`` is set. Normalization and the one-hot → index reduction are
+    the caller's responsibility (done in the training loop).
 
     :param data_dir: a dataset directory or zip file.
     :param batch_size: the batch size of each returned pair.
     :param image_size: the size to which images are resized.
+    :param num_classes: label width for the one-hot encoding.
     :param class_cond: if True, include a "y" key for class labels.
     :param deterministic: if True, yield results in a deterministic order.
     :param random_crop: if True, randomly crop the images for augmentation.
-    :param random_flip: if True, randomly flip the images for augmentation.
+    :param mirror: if True, apply a stochastic per-item horizontal flip
+        (the §2 loader-level augmentation). Eval/reference loaders pass False.
     :param num_workers: number of DataLoader workers.
     :param distributed: if True, use DistributedSampler for multi-GPU.
+    :param seed: base seed for the DistributedSampler shuffle (§2).
     """
     if not data_dir:
         raise ValueError("unspecified data directory")
@@ -54,31 +101,37 @@ def load_data(
         dataset = ZipImageDataset(
             data_dir,
             image_size,
+            num_classes=num_classes,
             class_cond=class_cond,
             random_crop=random_crop,
-            random_flip=random_flip,
+            mirror=mirror,
             cache_in_ram=cache_in_ram,
         )
     else:
         all_files = _list_image_files_recursively(data_dir)
         classes = None
         if class_cond:
-            class_names = [os.path.basename(path).split("_")[0] for path in all_files]
+            # Class identity is the immediate parent folder name, indexed by the
+            # alphabetical sort of the folder-name set (§5 Rule 1).
+            class_names = [os.path.basename(os.path.dirname(path)) for path in all_files]
             sorted_classes = {x: i for i, x in enumerate(sorted(set(class_names)))}
             classes = [sorted_classes[x] for x in class_names]
         dataset = ImageDataset(
             image_size,
             all_files,
+            num_classes=num_classes,
             classes=classes,
             random_crop=random_crop,
-            random_flip=random_flip,
+            mirror=mirror,
             cache_in_ram=cache_in_ram,
         )
 
     sampler = None
     shuffle = not deterministic
     if distributed:
-        sampler = DistributedSampler(dataset, shuffle=not deterministic)
+        # Seed the sampler from --seed so multi-GPU data order is reproducible
+        # and controlled by the run seed (§2).
+        sampler = DistributedSampler(dataset, shuffle=not deterministic, seed=seed)
         shuffle = False
 
     loader = DataLoader(
@@ -91,9 +144,9 @@ def load_data(
         drop_last=drop_last,
         persistent_workers=num_workers > 0,
     )
-    # Advance the DistributedSampler epoch each pass so every rank gets
-    # a fresh shuffle. (Previously we always passed epoch=0, so every
-    # epoch repeated the same rank-local shard order verbatim.)
+    # Advance the DistributedSampler epoch each pass so every rank gets a fresh
+    # shuffle. The sampler's per-epoch generator is seeded with (seed + epoch),
+    # so --seed fully determines the multi-GPU data order.
     epoch = 0
     while True:
         if sampler is not None and hasattr(sampler, "set_epoch"):
@@ -127,22 +180,54 @@ def count_data(data_dir):
     return len(_list_image_files_recursively(data_dir))
 
 
+def _prepare_arr(pil_image, resolution, random_crop, mirror):
+    """Decode a PIL image to a ``uint8`` CHW array at ``resolution``.
+
+    Asserts 3-channel RGB rather than silently converting: the pipeline is
+    3-channel end to end and grayscale→RGB conversion happens once at dataset
+    build time (§5).
+    """
+    if pil_image.mode != "RGB":
+        raise ValueError(
+            f"expected a 3-channel RGB image, got mode {pil_image.mode!r}; "
+            "convert grayscale sources to RGB at dataset build time "
+            "(diffit-prepare-data), not at load time"
+        )
+    if random_crop:
+        arr = random_crop_arr(pil_image, resolution)
+    else:
+        arr = center_crop_arr(pil_image, resolution)
+    if mirror and random.random() < 0.5:
+        arr = arr[:, ::-1]
+    assert arr.ndim == 3 and arr.shape[2] == 3, f"expected HWC RGB, got {arr.shape}"
+    # uint8 CHW; normalization is done in the training loop.
+    return np.ascontiguousarray(np.transpose(arr, [2, 0, 1])).astype(np.uint8)
+
+
+def _onehot(idx, num_classes):
+    v = np.zeros(num_classes, dtype=np.float32)
+    v[int(idx)] = 1.0
+    return v
+
+
 class ImageDataset(Dataset):
     def __init__(
         self,
         resolution,
         image_paths,
+        num_classes,
         classes=None,
         random_crop=False,
-        random_flip=True,
+        mirror=False,
         cache_in_ram=False,
     ):
         super().__init__()
         self.resolution = resolution
         self.image_paths = image_paths
+        self.num_classes = num_classes
         self.classes = classes
         self.random_crop = random_crop
-        self.random_flip = random_flip
+        self.mirror = mirror
         self._cache = None
 
         if cache_in_ram:
@@ -167,22 +252,13 @@ class ImageDataset(Dataset):
             with open(path, "rb") as f:
                 pil_image = Image.open(f)
                 pil_image.load()
-        pil_image = pil_image.convert("RGB")
 
-        if self.random_crop:
-            arr = random_crop_arr(pil_image, self.resolution)
-        else:
-            arr = center_crop_arr(pil_image, self.resolution)
-
-        if self.random_flip and random.random() < 0.5:
-            arr = arr[:, ::-1]
-
-        arr = arr.astype(np.float32) / PIXEL_NORM_HALF - 1
+        img = _prepare_arr(pil_image, self.resolution, self.random_crop, self.mirror)
 
         out_dict = {}
         if self.classes is not None:
-            out_dict["y"] = np.array(self.classes[idx], dtype=np.int64)
-        return np.transpose(arr, [2, 0, 1]), out_dict
+            out_dict["y"] = _onehot(self.classes[idx], self.num_classes)
+        return img, out_dict
 
 
 class ZipImageDataset(Dataset):
@@ -192,17 +268,19 @@ class ZipImageDataset(Dataset):
         self,
         zip_path,
         resolution,
+        num_classes,
         class_cond=False,
         random_crop=False,
-        random_flip=True,
+        mirror=False,
         cache_in_ram=False,
     ):
         super().__init__()
         self.zip_path = zip_path
         self.resolution = resolution
+        self.num_classes = num_classes
         self.class_cond = class_cond
         self.random_crop = random_crop
-        self.random_flip = random_flip
+        self.mirror = mirror
 
         self._zipfile = None
         self._image_fnames = []
@@ -252,22 +330,13 @@ class ZipImageDataset(Dataset):
             with zf.open(fname) as f:
                 pil_image = Image.open(f)
                 pil_image.load()
-        pil_image = pil_image.convert("RGB")
 
-        if self.random_crop:
-            arr = random_crop_arr(pil_image, self.resolution)
-        else:
-            arr = center_crop_arr(pil_image, self.resolution)
-
-        if self.random_flip and random.random() < 0.5:
-            arr = arr[:, ::-1]
-
-        arr = arr.astype(np.float32) / PIXEL_NORM_HALF - 1
+        img = _prepare_arr(pil_image, self.resolution, self.random_crop, self.mirror)
 
         out_dict = {}
         if self.class_cond and fname in self._labels:
-            out_dict["y"] = np.array(self._labels[fname], dtype=np.int64)
-        return np.transpose(arr, [2, 0, 1]), out_dict
+            out_dict["y"] = _onehot(self._labels[fname], self.num_classes)
+        return img, out_dict
 
 
 def center_crop_arr(pil_image, image_size):

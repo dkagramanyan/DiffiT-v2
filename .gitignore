@@ -1,16 +1,15 @@
-
-datasets/*
-training-runs/*
+runs/
+training-runs/
+datasets/
+generated/
+logs/
 *.log
 
-logs/*
-experiments/runs/*
-experiments/logs/*
-
-# Python caches (any directory)
+# Python caches
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
 # Editable-install / build artifacts
 *.egg-info/
 build/
