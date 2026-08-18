@@ -10,11 +10,14 @@ an offline compute node.  The script will:
      gen_images.py, and sample.py.
 
 Usage:
-    python download_models.py
+    diffit-download-models              # dependency + CUDA check, then download
+    diffit-download-models --skip-cuda-check
 """
 
 import importlib
 import sys
+
+import click
 
 # -----------------------------------------------------------------------
 # 1. Dependency check
@@ -164,14 +167,19 @@ def download_models():
 # Main
 # -----------------------------------------------------------------------
 
-def main():
+@click.command()
+@click.option("--skip-cuda-check", is_flag=True,
+              help="Skip the CUDA probe (for a CPU box that only needs the weights cached)")
+def main(skip_cuda_check):
+    """Verify dependencies and pre-cache every external model DiffiT downloads.
+
+    Run on a machine with network access before launching on an offline node.
+    """
     print()
-    deps_ok = check_dependencies()
-    if not deps_ok:
+    if not check_dependencies():
         sys.exit(1)
 
-    cuda_ok = check_cuda()
-    if not cuda_ok:
+    if not skip_cuda_check and not check_cuda():
         print("Continuing with model downloads anyway...\n")
 
     download_models()

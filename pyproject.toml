@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "diffit"
-version = "3.0.0"
+version = "3.1.0"
 description = "DiffiT: Diffusion Vision Transformers for Image Generation (v2 performance refresh)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = { text = "NVIDIA Source Code License-NC" }
 dependencies = [
     "torch>=2.0.0",
@@ -31,13 +31,17 @@ dev = [
     "pytest>=7.0.0",
     "ruff>=0.4.0",
 ]
-# Optional: enables combra.metrics.compute_all_metrics during training-time eval.
-# Training runs unchanged without it (the import is guarded). combra is pulled
-# from its private repo over git+https -- the single combra source shared by all
-# four v2 repos -- and its base deps cover every image metric: FID (pytorch-fid),
-# CLIP-MMD (open-clip-torch) and FD-DINOv2 (torch.hub DINOv2).
+# Optional: enables the combra metrics during training-time eval. Training runs
+# unchanged without it (the import is guarded). combra is pulled from its private
+# repo over git+https -- the single combra source shared by all four v2 repos.
+#
+# The [metrics] extra is REQUIRED, not optional: combra 0.5.0 moved torch,
+# torchvision, pytorch-fid and open-clip-torch out of its base dependencies, so a
+# bare `combra` install has no FID / CMMD / FD-DINOv2 backend and those three
+# metrics come back nan. combra also floors Python at 3.12, which is why this
+# package does too.
 combra = [
-    "combra @ git+https://github.com/dkagramanyan/combra.git",
+    "combra[metrics] @ git+https://github.com/dkagramanyan/combra.git",
 ]
 
 # Console entry-points. After `pip install -e .` these are available on PATH.

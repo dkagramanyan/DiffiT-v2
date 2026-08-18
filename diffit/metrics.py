@@ -2,6 +2,7 @@
 
 Shared by train.py and experiments/train_sample_split.py.
 """
+import os
 import warnings
 
 import numpy as np
@@ -24,24 +25,27 @@ try:
         cmmd_features as _combra_cmmd_features,
         cmmd_from_features as _combra_cmmd_from_features,
         fd_dinov2_features as _combra_fd_dinov2_features,
-        fd_dinov2_from_features as _combra_fd_dinov2_from_features,
         fid_features as _combra_fid_features,
-        fid_from_features as _combra_fid_from_features,
+        frechet_from_features as _combra_frechet_from_features,
         images_to_pooled_angles as _combra_images_to_pooled_angles,
     )
 
     HAS_COMBRA = True
-except ImportError:
+    COMBRA_IMPORT_ERROR = None
+except ImportError as _combra_exc:
     _combra_angle_metrics_from_pooled = _combra_images_to_pooled_angles = None
     _combra_fid_features = _combra_cmmd_features = _combra_fd_dinov2_features = None
-    _combra_fid_from_features = _combra_cmmd_from_features = _combra_fd_dinov2_from_features = None
+    _combra_cmmd_from_features = _combra_frechet_from_features = None
     HAS_COMBRA = False
+    # Keep the reason. "combra is not installed" is the wrong diagnosis when combra
+    # IS installed but has moved a symbol -- that misdirection is exactly how this
+    # integration stayed broken for a whole combra release. train.py prints this.
+    COMBRA_IMPORT_ERROR = _combra_exc
 
-# The three combra image-feature metrics carry their generated-sample count in the
-# TensorBoard key, matching the SAN-v2 reference dashboards. combra is run on
-# COMBRA_NUM_GEN (10k) fakes scored against the whole training set (see train.py),
-# so the suffix is literal. The angle-density metrics keep their bare names.
-_COMBRA_IMAGE_RENAME = {"fid": "fid10k", "cmmd": "cmmd10k", "fd_dinov2": "fd_dinov2_10k"}
+# combra metric keys are bare: combra_fid, combra_cmmd, combra_fd_dinov2. They used
+# to carry a "10k" suffix that stayed 10k whatever --num-fid-samples said, so every
+# chart built from them was mislabelled. The sample count is logged once instead, as
+# Metrics/combra_num_fid_samples.
 
 
 @torch.inference_mode()
@@ -315,10 +319,10 @@ def _combra_extract_features(name, images, device):
 
 def _combra_distance(name, ref_features, gen_features):
     if name == "fid":
-        return _combra_fid_from_features(ref_features, gen_features)
+        return _combra_frechet_from_features(ref_features, gen_features)
     if name == "cmmd":
         return _combra_cmmd_from_features(ref_features, gen_features)
-    return _combra_fd_dinov2_from_features(ref_features, gen_features)
+    return _combra_frechet_from_features(ref_features, gen_features)
 
 
 def _gather_feature_rows(local, device, rank, world_size):
@@ -347,6 +351,13 @@ def _gather_feature_rows(local, device, rank, world_size):
     return None
 
 
+def _combra_angle_workers(world_size):
+    # Per-rank CPU processes for the angle extraction, which was running
+    # single-threaded here and is the most expensive part of an eval at 512px.
+    # Divided by the rank count so an 8-GPU node does not oversubscribe itself.
+    return max(1, min(32, (os.cpu_count() or 1) // max(1, world_size)))
+
+
 def _gather_combra_gen_features(local_images, device, rank, world_size):
     """Each rank extracts the three image-feature sets from its own generated
     shard; the rows are gathered to rank 0. Returns a ``{metric: [N, D]}`` dict on
@@ -368,7 +379,10 @@ def _gather_pooled_angles(local_images, device, rank, world_size):
     concatenation matches a single-GPU ``images_to_pooled_angles`` over the full
     set. Reuses :func:`_gather_feature_rows` by treating the angles as ``[n_i, 1]``
     rows."""
-    local = np.asarray(_combra_images_to_pooled_angles(local_images), np.float32).reshape(-1, 1)
+    local = np.asarray(
+        _combra_images_to_pooled_angles(local_images, workers=_combra_angle_workers(world_size)),
+        np.float32,
+    ).reshape(-1, 1)
     gathered = _gather_feature_rows(local, device, rank, world_size)
     return gathered.reshape(-1) if gathered is not None else None
 
@@ -508,8 +522,8 @@ def evaluate_metrics(
                     combra_ref, gen_angles, gen_feats,
                 )
                 for k, v in combra_metrics.items():
-                    key = _COMBRA_IMAGE_RENAME.get(k, k)
-                    metrics[f"combra_{key}"] = float(v)
+                    metrics[f"combra_{k}"] = float(v)
+                metrics["combra_num_fid_samples"] = float(num_fid_samples)
             except Exception as e:  # combra failure must not abort the eval tick
                 log_fn(f"  combra metrics failed: {e}")
         for k, v in metrics.items():

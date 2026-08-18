@@ -374,7 +374,7 @@ extract the EMA weights from any of these (or an older bare EMA `state_dict`).
 
 Quality metrics (**IS**, **FID**, **sFID**, **Precision**, **Recall**) are computed automatically every `snap` ticks during training using 10000 samples by default (configurable per `--cfg`), when combra is **not** used. Results are logged to TensorBoard under `Metrics/` and to `stats.jsonl`. Adjust with `--num-fid-samples` (set to 0 to disable).
 
-`--combra-metrics` (on by default) is **mutually exclusive** with the Inception suite above: when it is on, the IS/FID/sFID/Precision/Recall metrics are disabled and only `combra_*` metrics are logged. combra generates `--num-fid-samples` fakes each tick, scored against the training set (capped to a seeded random subset by `--combra-ref-count`). The image-feature metrics are logged as `combra_fid10k`, `combra_cmmd10k`, `combra_fd_dinov2_10k` (the `10k` suffix is literal and does not change with `--num-fid-samples`); the angle-density metrics (`combra_w1`, `combra_mu1`, …) keep their bare names.
+`--combra-metrics` (on by default) is **mutually exclusive** with the Inception suite above: when it is on, the IS/FID/sFID/Precision/Recall metrics are disabled and only `combra_*` metrics are logged. combra generates `--num-fid-samples` fakes each tick, scored against the training set (capped to a seeded random subset by `--combra-ref-count`). The image-feature metrics are logged as `combra_fid`, `combra_cmmd`, `combra_fd_dinov2` plus `combra_fid_best` and `combra_num_fid_samples`, which records the sample count the run actually used; the angle-density metrics (`combra_w1`, `combra_mu1`, …) keep their bare names. (These keys used to carry a literal `10k` suffix that stayed `10k` whatever `--num-fid-samples` said, so every chart built from them was mislabelled.)
 
 To enable combra metrics, install the optional extra:
 
@@ -382,7 +382,7 @@ To enable combra metrics, install the optional extra:
 pip install -e ".[combra]"      # pulls combra (all image metrics included)
 ```
 
-All combra image metrics are covered by combra's base dependencies: `combra_fid10k` (pytorch-fid + InceptionV3 weights), `combra_cmmd10k` (**open-clip-torch** CLIP backbone) and `combra_fd_dinov2_10k` (a `torch.hub` DINOv2 download) — so a plain `combra` install enables them all, no separate extra. Pre-fetch combra's CLIP/DINOv2 backbones for offline nodes with `python scripts/download_models.py` or `bash download_models.sh`.
+The combra image metrics need combra's **`[metrics]` extra**: `combra_fid` (pytorch-fid + InceptionV3 weights), `combra_cmmd` (**open-clip-torch** CLIP backbone) and `combra_fd_dinov2` (a `torch.hub` DINOv2 download). combra 0.5.0 moved that torch stack out of its base dependencies, so a plain `combra` install leaves all three returning `nan`; the `[combra]` extra here requests `combra[metrics]` for you. combra also floors Python at **3.12**, which is why this package does too. Pre-fetch combra's CLIP/DINOv2 backbones for offline nodes with `python scripts/download_models.py` or `bash download_models.sh`.
 
 Monitor training with TensorBoard:
 
@@ -449,7 +449,7 @@ Quality metrics are computed **inline during training** every `snap` ticks. The 
 - **Precision** — fraction of generated samples in the real data manifold
 - **Recall** — fraction of real samples covered by the generated manifold
 
-With `--combra-metrics` on (default) these Inception metrics are replaced by the combra suite instead — the angle-density metrics plus `combra_fid10k` / `combra_cmmd10k` / `combra_fd_dinov2_10k` (10k fakes vs the whole training set). See [Training output](#training-output) above for the install needed (CMMD requires `open-clip-torch`).
+With `--combra-metrics` on (default) these Inception metrics are replaced by the combra suite instead — the angle-density metrics plus `combra_fid` / `combra_cmmd` / `combra_fd_dinov2` (`--num-fid-samples` fakes vs the whole training set). See [Training output](#training-output) above for the install needed (CMMD requires `open-clip-torch`).
 
 By default, 10000 samples are generated for each evaluation (configurable via `--num-fid-samples`). For a full FID-50K evaluation, use the standalone evaluator:
 
