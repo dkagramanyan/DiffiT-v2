@@ -17,7 +17,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          # Must satisfy this package's requires-python (>= 3.12, matching combra).
+          python-version: "3.12"
       - name: Install ruff
         run: pip install ruff
       - name: Lint
@@ -30,7 +31,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          # Must satisfy this package's requires-python (>= 3.12, matching combra).
+          python-version: "3.12"
           cache: pip
       - name: Install (CPU torch + deps + package)
         run: |
