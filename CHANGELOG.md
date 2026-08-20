@@ -6,6 +6,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **combra is pinned to a tag (`@v0.8.1`) instead of tracking `main`.** Unpinned, every
+  fresh env resolved whatever combra `main` was that day, so the FID / CMMD / FD-DINOv2 /
+  angle numbers a run is judged on could change with no signal and no record. combra
+  0.8.0 also stamps `combra/version` into this run's TensorBoard HPARAMS, so the metric
+  code behind a run is now recoverable from its log. Local development is unaffected --
+  the env's editable combra install shadows the URL.
 - **Console scripts are now covered by a packaging test** (`tests/test_entry_points.py`).
   It launches every entry point declared in `[project.scripts]` with `--help` from a
   temp cwd, which is the only way to see this class of bug: pytest runs with the repo
