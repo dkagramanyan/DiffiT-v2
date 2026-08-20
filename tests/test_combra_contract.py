@@ -74,9 +74,20 @@ def test_angle_metrics_run_on_pooled_angles():
     import numpy as np
     from combra.metrics import angle_density_metrics_from_pooled
 
+    # The sample must be genuinely BIMODAL. These are WC-Co vertex angles -- a
+    # convex mode and a reflex one -- and the gauss half of this metric fits two
+    # Gaussians to them. A single normal (which is what this fixture used to pass)
+    # leaves the second Gaussian with nothing to sit on, so combra reports the
+    # relative errors as nan rather than dividing by a phantom mode.
     rng = np.random.default_rng(0)
+
+    def angles(mu1, sigma1, mu2, sigma2, n=4000, share=0.7):
+        k = int(n * share)
+        both = [rng.normal(mu1, sigma1, k), rng.normal(mu2, sigma2, n - k)]
+        return np.concatenate(both) % 360
+
     out = angle_density_metrics_from_pooled(
-        rng.normal(120, 25, 4000) % 360, rng.normal(126, 27, 4000) % 360
+        angles(100, 20, 240, 25), angles(104, 21, 236, 26)
     )
     for key in ("w1", "w2", "circular_w1", "circular_w2", "mu1", "sigma1", "amp1"):
         assert np.isfinite(out[key]), f"{key} is not finite"

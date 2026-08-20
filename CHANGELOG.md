@@ -6,6 +6,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **The combra contract test fed a unimodal sample to a bimodal-fit metric.**
+  `test_angle_metrics_run_on_pooled_angles` drew two near-identical normals
+  (mu 120 and 126), so the second Gaussian had no mode to sit on. combra now
+  reports that as `nan` rather than dividing by the phantom, which turned the
+  assertion red. The fixture is now genuinely bimodal (a 70/30 mixture at
+  100 deg and 240 deg), which is what a WC-Co vertex-angle distribution
+  actually looks like.
 - **`scipy.linalg.sqrtm(..., disp=False)` raises under SciPy >= 1.18**, which
   removed the `disp` parameter. Fixed in `diffit/metrics.py` and `scripts/evaluator.py`. Calling `sqrtm(X)` without `disp` returns
   the matrix alone on every SciPy version, so the fix is version-agnostic. This
