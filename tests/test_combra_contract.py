@@ -24,11 +24,11 @@ REQUIRED = [
     "angle_density_metrics_from_pooled",
     "cmmd_features",
     "cmmd_from_features",
-    "compute_all_metrics",
     "fd_dinov2_features",
     "fid_features",
     "frechet_from_features",
     "images_to_pooled_angles",
+    "self_test",
 ]
 
 combra_installed = importlib.util.find_spec("combra") is not None

@@ -205,31 +205,75 @@ def subprocess_fn(rank, c, temp_dir):
 # ---------------------------------------------------------------------------
 
 
-def combra_smoke_test(ref_images, device, log_fn):
-    """Verify combra metrics actually *compute* (not just import) before training.
+def _write_run_hparams(run_dir, writer, metrics):
+    """Record this run's configuration in TensorBoard's HPARAMS tab (§7).
 
-    ``HAS_COMBRA`` only proves the package imports. The image-feature metrics
-    depend on optional backends that combra records as ``nan`` rather than
-    raising when missing, so a broken install silently produces useless ``nan``
-    metrics. Run the real pipeline once on a tiny slice and fail fast.
+    The config is read back from ``training_options.json``, already written by the
+    launcher, so nothing has to be threaded through the training-loop signature.
+    Paired with the run's final metrics this is what makes runs comparable in
+    TensorBoard: without it the curves are there but nothing says which configuration
+    produced them.
     """
-    from combra.metrics import compute_all_metrics
+    import json
+    import os
 
-    sample = ref_images[: min(4, len(ref_images))]
     try:
-        metrics = compute_all_metrics(
-            sample, sample, device=device, image_metrics=True, reference_cache={},
+        from combra.io import write_hparams
+    except ImportError:
+        return  # combra is optional; the curves are still logged
+    path = os.path.join(run_dir, 'training_options.json')
+    if not os.path.isfile(path):
+        return
+    with open(path) as fh:
+        config = json.load(fh)
+    write_hparams(writer, config, metrics)
+
+
+def build_stats_row(loss_kvs, *, kimg, tick, sec_per_tick, sec_per_kimg,
+                    total_sec, maintenance_sec, cpu_mem_gb, gpu_mem_gb,
+                    gpu_reserved_gb, lr):
+    """The per-tick scalar row for ``stats.jsonl`` (§7 namespaces).
+
+    Every value must be a plain JSON scalar: ``combra.metrics.load_fid_by_kimg``
+    reads ``Progress/kimg`` through ``int()`` and shape-filters away any record it
+    cannot, silently. Kept as a function so a test can exercise the real row
+    without running a training loop.
+    """
+    row = dict(loss_kvs)
+    row["Progress/kimg"] = kimg
+    row["Progress/tick"] = tick
+    row["Timing/sec_per_tick"] = sec_per_tick
+    row["Timing/sec_per_kimg"] = sec_per_kimg
+    row["Timing/total_sec"] = total_sec
+    row["Timing/maintenance_sec"] = maintenance_sec
+    row["Resources/cpu_mem_gb"] = cpu_mem_gb
+    row["Resources/peak_gpu_mem_gb"] = gpu_mem_gb
+    row["Resources/peak_gpu_mem_reserved_gb"] = gpu_reserved_gb
+    row["LearningRate/lr"] = lr
+    return row
+
+
+def combra_smoke_test(ref_images, device, log_fn=print):
+    """Verify the combra metrics actually *compute* before training, not just import.
+
+    Delegates to ``combra.metrics.self_test``, which since combra 0.8 takes
+    ``strict=True`` (require the image-feature metrics to be finite, rather than
+    tolerating ``nan``) and ``images=`` (score a real reference slice against itself).
+    That is what this repo's private copy used to do by hand; models-API §6 always
+    specified one shared implementation, and now there is one.
+    """
+    sample = ref_images[: min(4, len(ref_images))]
+    from combra.metrics import self_test as _combra_self_test
+
+    try:
+        metrics = _combra_self_test(
+            images=sample, device=device, image_metrics=True, strict=True
         )
-    except Exception as e:
+    except RuntimeError:
+        raise
+    except Exception as e:  # noqa: BLE001 -- surface any backend failure the same way
         raise RuntimeError(f"combra metrics smoke test failed to run: {e}") from e
-    bad = sorted(k for k, v in metrics.items() if not np.isfinite(v))
-    if bad:
-        raise RuntimeError(
-            f"combra metrics smoke test produced non-finite values for {bad} -- "
-            "a metric backend or optional dependency is missing/broken. Fix the "
-            "install or pass --combra-metrics=False."
-        )
-    log_fn(f"combra metrics smoke test passed ({len(metrics)} metrics computed).")
+    log_fn(f"combra metrics smoke test passed ({len(metrics)} metrics computed)")
 
 
 def load_reference_shard(data, ref_count, total_count, image_size, workers, rank, world_size, seed, num_classes):
@@ -472,7 +516,13 @@ def training_loop(
                 logger.log("Running combra metrics smoke test...")
                 combra_smoke_test(local_ref, device, logger.log)
                 logger.log("combra metrics enabled → DiffiT Inception metrics disabled.")
-            combra_ref = precompute_combra_reference(local_ref, device, rank, num_gpus)
+            # (reference, ok): ok is rank-uniform, so gating on it is safe -- combra_ref
+            # is None on every non-zero rank whether or not anything failed.
+            combra_ref, combra_ok = precompute_combra_reference(local_ref, device, rank, num_gpus)
+            if not combra_ok:
+                use_combra = False
+                if is_main:
+                    logger.log("WARNING: combra reference precompute failed; metrics disabled.")
             if is_main:
                 logger.log("Reference features computed.")
         elif is_main:
@@ -575,6 +625,7 @@ def training_loop(
 
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
+    maintenance_time = 0.0  # measured at the end of a tick, reported on the next
     cur_tick = 0
     best_fid = float("inf")   # running best combra FID -> Metrics/combra_fid_best
 
@@ -662,20 +713,22 @@ def training_loop(
             )
 
             # Per-tick scalar row (§7 namespaces; step = cur_nimg everywhere).
-            loss_kvs = logger.dumpkvs()
-            row = dict(loss_kvs)
-            row["Progress/kimg"] = kimg_done
-            row["Progress/tick"] = cur_tick
-            row["Timing/sec_per_tick"] = sec_per_tick
-            row["Timing/sec_per_kimg"] = sec_per_kimg
-            row["Resources/cpu_mem_gb"] = cpumem
-            row["Resources/gpu_mem_gb"] = gpumem
-            row["Resources/gpu_reserved_gb"] = reserved
-            row["LearningRate/lr"] = float(opt.param_groups[0]["lr"])
+            row = build_stats_row(
+                logger.dumpkvs(), kimg=kimg_done, tick=cur_tick,
+                sec_per_tick=sec_per_tick, sec_per_kimg=sec_per_kimg,
+                total_sec=total_elapsed, maintenance_sec=maintenance_time,
+                cpu_mem_gb=cpumem, gpu_mem_gb=gpumem, gpu_reserved_gb=reserved,
+                lr=float(opt.param_groups[0]["lr"]),
+            )
 
             cur_tick += 1
             tick_start_nimg = cur_nimg
+            prev_tick_end = tick_end_time
             tick_start_time = time.time()
+            # Non-training time in this tick (snapshot, eval, checkpoint write). Measured
+            # after the fact, so it is reported on the following tick -- same convention
+            # as san-v2 / StyleSwin / edm2.
+            maintenance_time = tick_start_time - prev_tick_end
 
             # Snapshot at every `snap` ticks and ALWAYS at the last tick (§3), so
             # the newest snapshot is always the final model.
@@ -730,7 +783,7 @@ def training_loop(
                 if stats_jsonl is not None:
                     now = time.time()
                     fields = dict(row, wall_time=now - start_time,
-                                  datetime=datetime.datetime.now().isoformat(timespec="seconds"))
+                                  datetime=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                     stats_jsonl.write(json.dumps(fields) + "\n")
                     stats_jsonl.flush()
                 if stats_tfevents is not None:
@@ -741,6 +794,9 @@ def training_loop(
 
     if stats_jsonl is not None:
         stats_jsonl.close()
+    if is_main and stats_tfevents is not None:
+        _write_run_hparams(run_dir, stats_tfevents,
+                           {'Metrics/combra_fid_best': float(best_fid)})
     if stats_tfevents is not None:
         stats_tfevents.close()
     logger.close()

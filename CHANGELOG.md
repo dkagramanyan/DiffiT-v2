@@ -6,6 +6,32 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **`stats.jsonl` rows are built by a testable function**, and a new
+  `tests/test_stats_contract.py` feeds a real row to `combra.metrics.load_fid_by_kimg`.
+  The reader was only ever tested against a synthetic flat row, so nothing checked the
+  producer.
+- **The §7 logging contract is now asserted** (`tests/test_logging_contract.py`).
+  Thirteen scalar keys had drifted across the four repos; nothing failed because
+  nothing checked. See below for this repo's share.
+
+### Changed
+- **The sharded eval harness moved into combra** (`combra.metrics.distributed`). This
+  repo kept only what is model-specific: producing a shard of generated images and the
+  float->uint8 denormalisation. The four private copies had drifted three ways --
+  `all_gather` vs `gather`, a failure flag or none, and a different
+  `precompute_reference` signature in each.
+- **The combra startup check is `self_test(image_metrics=True, strict=True, images=...)`.**
+  A missing CLIP download previously surfaced only as a whole run logging `nan`.
+- **Hyperparameters reach TensorBoard.** The resolved config is read back from
+  `training_options.json` at the end of training and written to the HPARAMS tab with
+  the run's final `Metrics/combra_fid_best`, so runs are comparable by configuration
+  and not only by curve shape. Nothing logged them before.
+- **§7 keys:** `Resources/gpu_mem_gb` / `gpu_reserved_gb` renamed to
+  `Resources/peak_gpu_mem_gb` / `peak_gpu_mem_reserved_gb` to match the other three;
+  `Timing/total_sec` and `Timing/maintenance_sec` added; the `datetime` column now uses
+  `%Y-%m-%d %H:%M:%S` rather than ISO-8601, so all four `stats.jsonl` files parse the
+  same way.
+
 - **The combra contract test fed a unimodal sample to a bimodal-fit metric.**
   `test_angle_metrics_run_on_pooled_angles` drew two near-identical normals
   (mu 120 and 126), so the second Gaussian had no mode to sit on. combra now
