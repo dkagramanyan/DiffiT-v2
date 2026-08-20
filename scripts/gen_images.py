@@ -76,6 +76,62 @@ def parse_range(s: Union[str, List, None]) -> List[int]:
     return ranges
 
 
+
+
+def _sidecar_meta(network: str) -> dict:
+    """Metadata for a checkpoint that carries none, read from its run directory.
+
+    Snapshots written before the v2 convention are bare EMA ``state_dict``s with
+    no ``n_classes`` / ``resolution`` / ``class_names`` wrapper. ``n_classes`` is
+    still recoverable from ``y_embedder``, but the resolution is not -- DiffiT's
+    axial RoPE loads at any size, so a wrong ``--image-size`` silently produces
+    noise instead of failing. ``training_options.json`` is written next to every
+    snapshot by ``train.py`` and records ``image_size``, so the answer is already
+    on disk; a missing file is not an error.
+    """
+    path = Path(network).parent / "training_options.json"
+    if not path.is_file():
+        return {}
+    try:
+        with open(path) as fh:
+            opts = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(opts, dict) or "image_size" not in opts:
+        return {}
+    return {"resolution": opts["image_size"]}
+
+
+def _load_vae(decoder: str, dev):
+    """Load the SD-VAE from the local HuggingFace cache, announcing any fetch.
+
+    `AutoencoderKL.from_pretrained` consults the Hub before it looks at the cache,
+    so on an offline compute node the first generation run *hangs* on a network
+    call instead of failing -- which is why the run skill had to set
+    HF_HUB_OFFLINE=1 by hand. Try the cache first, and if a download really is
+    needed, say so before blocking on it.
+    """
+    name = f"stabilityai/sd-vae-ft-{decoder}"
+    try:
+        vae = AutoencoderKL.from_pretrained(name, local_files_only=True)
+    except Exception:
+        cache = os.environ.get("HF_HOME") or "~/.cache/huggingface"
+        print(f"{name} is not in the local cache ({cache}); downloading. "
+              f"On an offline node this will fail -- run `diffit-download-models` "
+              f"once with network access instead.", flush=True)
+        try:
+            vae = AutoencoderKL.from_pretrained(name)
+        except Exception as err:
+            raise RuntimeError(
+                f"Could not load {name}: it is not cached in {cache} and cannot be "
+                f"downloaded. Run `diffit-download-models` on a machine with network "
+                f"access.\nUnderlying error: {type(err).__name__}: {err}"
+            ) from err
+    for prm in vae.parameters():
+        prm.requires_grad_(False)
+    return vae.to(dev).eval()
+
+
 def resolve_classes(spec: Optional[str], num_classes: int, class_names: Optional[List[str]]) -> List[int]:
     """Resolve a --classes spec to validated integer indices.
 
@@ -369,9 +425,7 @@ def worker_fn(rank, c, temp_dir):
     model.load_state_dict(extract_inference_state_dict(load_state_dict(c["network"], map_location="cpu")))
     model.to(dev).eval()
 
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{c['vae_decoder']}").to(dev).eval()
-    for prm in vae.parameters():
-        prm.requires_grad_(False)
+    vae = _load_vae(c["vae_decoder"], dev)
 
     diff_config = diffusion_defaults()
     diff_config["timestep_respacing"] = "" if c["sampler"] == "dpm++" else str(c["num_sampling_steps"])
@@ -474,9 +528,7 @@ def _run_seed_mode(c, seeds, class_idx):
     )
     model.load_state_dict(extract_inference_state_dict(load_state_dict(c["network"], map_location="cpu")))
     model.to(dev).eval()
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{c['vae_decoder']}").to(dev).eval()
-    for prm in vae.parameters():
-        prm.requires_grad_(False)
+    vae = _load_vae(c["vae_decoder"], dev)
     diff_config = diffusion_defaults()
     diff_config["timestep_respacing"] = "" if c["sampler"] == "dpm++" else str(c["num_sampling_steps"])
     diffusion = create_diffusion(**diff_config)
@@ -541,13 +593,41 @@ def generate_images(**kw):
         raise click.UsageError("Provide exactly one of --seeds (seed mode) or --samples-per-class (per-class mode).")
     per_class_mode = spc is not None
     if save_mode == "hdf5" and not per_class_mode:
-        raise click.UsageError("--save-mode=hdf5 requires per-class mode (--samples-per-class).")
+        # Seed mode can only write a directory, but --save-mode defaults to hdf5, so
+        # every first `--seeds` attempt used to fail on a flag the caller never set.
+        # Fall back silently when the default was left alone; still refuse an
+        # explicit --save-mode=hdf5, which is a real contradiction.
+        source = click.get_current_context().get_parameter_source("save_mode")
+        if source is not click.core.ParameterSource.DEFAULT:
+            raise click.UsageError("--save-mode=hdf5 requires per-class mode (--samples-per-class).")
+        save_mode = "dir"
 
     # Load checkpoint once (metadata + weights) on CPU.
     raw = load_state_dict(kw["network"], map_location="cpu")
     state = extract_inference_state_dict(raw)
     ckpt_num_classes = int(state["y_embedder.embedding_table.weight"].shape[0]) - 1
     class_names = raw.get("class_names") if isinstance(raw, dict) else None
+
+    # Pre-v2 snapshots carry no metadata wrapper; the run directory still does.
+    sidecar = _sidecar_meta(kw["network"])
+
+    image_size = kw["image_size"]
+    recorded_size = raw.get("resolution") if isinstance(raw, dict) else None
+    if recorded_size is None:
+        recorded_size = sidecar.get("resolution")
+    if recorded_size is not None:
+        recorded_size = int(recorded_size)
+        if click.get_current_context().get_parameter_source("image_size") \
+                is click.core.ParameterSource.DEFAULT:
+            image_size = recorded_size
+        elif image_size != recorded_size:
+            # RoPE happily loads at the wrong size and emits noise, so a mismatch
+            # has to be an error rather than a warning.
+            raise click.UsageError(
+                f"--image-size={image_size} conflicts with the resolution recorded "
+                f"for this checkpoint ({recorded_size})."
+            )
+
     num_classes = kw["num_classes"]
     if num_classes is None:
         num_classes = ckpt_num_classes
@@ -559,7 +639,7 @@ def generate_images(**kw):
     c = dict(
         network=kw["network"], outdir=kw["outdir"],
         model_name=kw["model_name"], decode_layer=kw["decode_layer"],
-        num_classes=num_classes, class_names=class_names, image_size=kw["image_size"],
+        num_classes=num_classes, class_names=class_names, image_size=image_size,
         cfg_scale=kw["cfg_scale"], scale_pow=kw["scale_pow"], sampler=kw["sampler"],
         num_sampling_steps=kw["num_sampling_steps"], vae_decoder=kw["vae_decoder"],
         batch_gpu=kw["batch_gpu"], gpus=max(1, kw["gpus"]), base_seed=kw["base_seed"],
