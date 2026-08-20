@@ -12,7 +12,7 @@ done
 cd "$REPO_ROOT"
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "${CONDA_ENV:-diffit}"
+conda activate "${CONDA_ENV:-diffit-v2}"
 
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1

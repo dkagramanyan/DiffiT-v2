@@ -16,7 +16,7 @@ done
 cd "$REPO_ROOT"
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "${CONDA_ENV:-diffit}"
+conda activate "${CONDA_ENV:-diffit-v2}"
 
 # Offline-cluster contract: backbones are prefetched once on a login node via
 # `diffit-download-models`; compute nodes never reach the network.

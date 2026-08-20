@@ -3,6 +3,35 @@
 All notable changes to this fork (`DiffiT-v2`) are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+- **`scipy.linalg.sqrtm(..., disp=False)` raises under SciPy >= 1.18**, which
+  removed the `disp` parameter. Fixed in `diffit/metrics.py` and `scripts/evaluator.py`. Calling `sqrtm(X)` without `disp` returns
+  the matrix alone on every SciPy version, so the fix is version-agnostic. This
+  surfaced when the environment moved to SciPy 1.18 (see below); before that the
+  call would have failed at runtime the moment anyone upgraded.
+
+- Dropped the `scipy<=1.14.1` ceiling from `pyproject.toml`. The CHANGELOG
+  recorded this cap as removed when `requirements.txt` went away, but it
+  survived in `pyproject.toml` and directly contradicted combra's `scipy>=1.18`.
+- `REQUIRED` in the contract test listed `self_test` (never called) and omitted
+  `compute_all_metrics` (imported by `combra_smoke_test`), so the guard could not
+  have caught a rename of the one symbol this repo actually depends on.
+
+### Changed
+- **The conda environment is now `diffit-v2`** (Python 3.12, torch 2.13+cu130,
+  numpy 2.5, SciPy 1.18), rebuilt alongside the previous `diffit` env rather
+  than replacing it. `requires-python` has said `>=3.12` since the v2 convention
+  landed, but the working env was still 3.11 — so `pip install -e .` could not
+  succeed, which is why the console scripts were missing and combra was absent.
+  README and `sh/` launch scripts point at the new name.
+- **CI installs combra and arms the contract test.** `tests/test_combra_contract.py`
+  is entirely `skipif(not combra_installed)`, and no CI job installed combra, so the
+  file could go green by doing nothing. CI now installs combra when a `COMBRA_TOKEN`
+  secret is present and sets `COMBRA_REQUIRED=1`; a new always-on test fails if
+  combra is missing under that flag.
+
 ## [3.1.0] — 2026-08-18
 
 Repairs the combra integration and finishes the click-CLI convergence.

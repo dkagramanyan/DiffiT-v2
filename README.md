@@ -68,8 +68,8 @@ This repo is an engineering refresh of the upstream [NVlabs/DiffiT](https://gith
 Create and activate a Python 3.12 conda env:
 
 ```bash
-conda create -n diffit python=3.12 -y
-conda activate diffit
+conda create -n diffit-v2 python=3.12 -y
+conda activate diffit-v2
 ```
 
 Install the latest **PyTorch** first, from the CUDA 13.2 wheels (H200; the wheel

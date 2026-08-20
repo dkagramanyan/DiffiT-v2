@@ -14,6 +14,7 @@ combra is genuinely absent, which is a different (and visible) condition.
 """
 
 import importlib.util
+import os
 
 import pytest
 
@@ -23,15 +24,24 @@ REQUIRED = [
     "angle_density_metrics_from_pooled",
     "cmmd_features",
     "cmmd_from_features",
+    "compute_all_metrics",
     "fd_dinov2_features",
     "fid_features",
     "frechet_from_features",
     "images_to_pooled_angles",
-    "self_test",
 ]
 
 combra_installed = importlib.util.find_spec("combra") is not None
 requires_combra = pytest.mark.skipif(not combra_installed, reason="combra is not installed")
+
+
+def test_combra_is_installed_when_required():
+    """CI sets COMBRA_REQUIRED=1 once it has installed combra; from then on an
+    absent combra is a FAILURE, not a skip. Every test below is skipif-guarded, so
+    without this one the whole file can go green by doing nothing -- which is the
+    exact failure mode it exists to prevent."""
+    if os.environ.get("COMBRA_REQUIRED") == "1":
+        assert combra_installed, "COMBRA_REQUIRED=1 but combra is not importable"
 
 
 @requires_combra

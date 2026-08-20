@@ -172,7 +172,9 @@ def compute_fid(acts1, acts2, eps=1e-6):
     sigma2 = np.cov(acts2, rowvar=False)
 
     diff = mu1 - mu2
-    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    # scipy >= 1.18 removed sqrtm's `disp` parameter. Calling it without disp
+    # returns the matrix alone on every version, so this works either side of 1.18.
+    covmean = linalg.sqrtm(sigma1.dot(sigma2))
 
     if not np.isfinite(covmean).all():
         warnings.warn("FID calculation produces singular product; adding eps to diagonal")
