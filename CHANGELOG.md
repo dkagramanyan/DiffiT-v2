@@ -181,7 +181,14 @@ using removed or renamed flags fail.
 - `scripts/sample.py` (bulk-`.npz` sampler) is retained as **legacy** — outside
   the v2 generation contract, no guarantees.
 
-## [Unreleased] — 2026-07-16
+## Pre-release development — 2026-07-16
+
+> Kept for history. This predates the 3.0.0 release below and was previously
+> mislabelled `[Unreleased]`, which put shipped work under a heading implying it
+> was pending. Much of it — `--resume`, `best_model.pkl`,
+> `--save-inference-only`, `network-snapshot-latest.pt` — was **removed** by the
+> v2 convention, so read it as a record of what changed then, not as current
+> behaviour.
 
 ### Added
 - **`--snapshot-keep-last N` training flag** (default `3`) — keeps only the `N`
@@ -221,7 +228,14 @@ using removed or renamed flags fail.
   SLURM-dependency chaining resumes from; the DiffiT example doc and README
   describe the new checkpoint layout.
 
-## [Unreleased] — 2026-06-25
+## Pre-release development — 2026-06-25
+
+> Kept for history. This predates the 3.0.0 release below and was previously
+> mislabelled `[Unreleased]`, which put shipped work under a heading implying it
+> was pending. Much of it — `--resume`, `best_model.pkl`,
+> `--save-inference-only`, `network-snapshot-latest.pt` — was **removed** by the
+> v2 convention, so read it as a record of what changed then, not as current
+> behaviour.
 
 ### Added
 - **`--combra-metrics` training flag** (default `true`) — computes the combra
