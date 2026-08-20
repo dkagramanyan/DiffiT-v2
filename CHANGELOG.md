@@ -3,6 +3,59 @@
 All notable changes to this fork (`DiffiT-v2`) are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [3.1.0] — 2026-08-18
+
+Repairs the combra integration and finishes the click-CLI convergence.
+
+### Fixed
+- **combra metrics were silently disabled.** `diffit/metrics.py` imported
+  `angle_density_metrics_from_pooled`, `fid_from_features` and
+  `fd_dinov2_from_features`, all removed in combra 0.5.0. The module-level
+  `except ImportError` set `HAS_COMBRA = False` and training then reported
+  *"the `combra` package is not installed"* — a false diagnosis that sent anyone
+  debugging it to reinstall a package that was already present. Now imports
+  `frechet_from_features` (one helper for both Fréchet metrics); combra >= 0.7.0
+  restores `angle_density_metrics_from_pooled`.
+- **The startup warning now tells the truth.** An `ImportError` from a combra that
+  *is* installed is a version incompatibility, not an absence, and it is now fatal:
+  training refuses to start rather than burning a run that will log no metrics.
+  A genuinely absent combra still warns and continues, as before.
+- **`[combra]` installed a combra with no metric backends.** The extra pulled bare
+  `combra`; since combra 0.5.0 the torch / `pytorch-fid` / `open-clip-torch` stack is
+  behind `combra[metrics]`, so FID / CMMD / FD-DINOv2 would have returned `nan` even
+  after the import fix. Now `combra[metrics] @ git+…`.
+- **Angle extraction ran single-threaded.** `images_to_pooled_angles` was called
+  without `workers`, leaving the most expensive part of an eval tick on one core.
+  It now uses `cpu_count // gpus` (capped at 32), which parallelises without
+  oversubscribing a multi-GPU node.
+
+### Changed
+- **Metric keys lost the literal `10k`.** `combra_fid10k` was emitted whatever
+  `--num-fid-samples` said, so any chart built from it was mislabelled. Keys are now
+  bare — `combra_fid`, `combra_cmmd`, `combra_fd_dinov2` — and the count is logged
+  once as `combra_num_fid_samples`.
+- **`diffit-eval` is a click command.** It was the last argparse entry point, against
+  a convention that names click the single source of truth for options and defaults.
+  Same flags, same behaviour; `--device` is now validated and missing-input errors are
+  proper usage errors.
+- **`diffit-download-models` is a click command** too, with a `--skip-cuda-check` flag
+  for CPU boxes that only need the weights cached. It previously had no parser at all.
+- `requires-python` raised to **3.12** to match combra.
+
+### Added
+- `Metrics/combra_fid_best`, the running best FID, in `stats.jsonl`.
+- `tests/test_combra_contract.py` — asserts every combra symbol this repo imports
+  actually exists. CPU-only, no GPU/dataset/network, so it runs in every CI job. The
+  previous guard (`assert isinstance(HAS_COMBRA, bool)`) passed either way, which is
+  why the breakage above survived a whole combra release.
+
+### Notes
+- **`--cond` is deliberately absent.** DiffiT is class-conditional by construction —
+  classifier-free guidance trains against a null class — so an unconditional switch
+  would be a fake flag rather than CLI alignment. This is a model-family difference,
+  documented as such in the combra docs `models_api` page.
+
+
 ## [3.0.0] — 2026-07-17
 
 Adopts the shared **v2 convention** (`wc_cv` `models_api_proposal` §12). This is

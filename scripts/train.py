@@ -24,6 +24,7 @@ import copy
 import dataclasses
 import datetime
 import glob
+import importlib.util
 import json
 import os
 import re
@@ -47,6 +48,7 @@ from diffit.dist_util import extract_inference_state_dict, load_state_dict
 from diffit.image_datasets import count_data, load_data, read_class_meta
 from diffit.inception import InceptionFeatureExtractor
 from diffit.metrics import (
+    COMBRA_IMPORT_ERROR,
     HAS_COMBRA,
     compute_activations,
     evaluate_metrics,
@@ -432,9 +434,20 @@ def training_loop(
     n_grid = gw * gh
 
     if combra_metrics and is_main and not HAS_COMBRA:
+        # Say WHICH failure this is. Reporting "not installed" for a combra that is
+        # installed but has moved a symbol sent anyone debugging it to reinstall a
+        # package already present -- that misdirection hid a real break for a whole
+        # combra release.
+        if COMBRA_IMPORT_ERROR is not None and importlib.util.find_spec("combra") is not None:
+            raise RuntimeError(
+                f"combra is installed but incompatible with this repo: {COMBRA_IMPORT_ERROR}. "
+                "Upgrade combra (>= 0.7.0) or pass --combra-metrics=False. Refusing to burn a "
+                "training run producing no metrics."
+            )
         warnings.warn(
             "--combra-metrics=True but the `combra` package is not installed -- "
-            "combra metrics will be skipped. Install it or pass --combra-metrics=False."
+            "combra metrics will be skipped. Install it (pip install -e '.[combra]') "
+            "or pass --combra-metrics=False."
         )
     use_combra = combra_metrics and HAS_COMBRA
 
@@ -563,6 +576,7 @@ def training_loop(
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
     cur_tick = 0
+    best_fid = float("inf")   # running best combra FID -> Metrics/combra_fid_best
 
     def _format_time(seconds):
         s = int(seconds)
@@ -701,6 +715,9 @@ def training_loop(
                     if is_main and stats_metrics is not None:
                         for name, value in stats_metrics.items():
                             row[f"Metrics/{name}"] = float(value)
+                        if "combra_fid" in stats_metrics:
+                            best_fid = min(best_fid, float(stats_metrics["combra_fid"]))
+                            row["Metrics/combra_fid_best"] = best_fid
 
                 if is_main:
                     row["Timing/eval_sec"] = time.time() - snap_start
