@@ -19,7 +19,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - **Generation blocked on a Hub call before consulting the cache.** `_load_vae` tries
   the local cache first, announces any download before starting it, and names the
   cache plus `diffit-download-models` if that fails.
-- **combra is pinned to a tag (`@v0.9.1`) instead of tracking `main`.** Unpinned, every
+- **combra is pinned to a tag (`@v0.10.0`) instead of tracking `main`.** Unpinned, every
   fresh env resolved whatever combra `main` was that day, so the FID / CMMD / FD-DINOv2 /
   angle numbers a run is judged on could change with no signal and no record. combra
   0.8.0 also stamps `combra/version` into this run's TensorBoard HPARAMS, so the metric

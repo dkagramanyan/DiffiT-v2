@@ -47,7 +47,7 @@ combra = [
 # Local development is unaffected -- the model envs carry an editable install of
 # combra that shadows this URL; the pin governs fresh installs (cluster, CI).
 # Bump it deliberately when you want combra's newer behaviour.
-    "combra[metrics] @ git+https://github.com/dkagramanyan/combra.git@v0.9.1",
+    "combra[metrics] @ git+https://github.com/dkagramanyan/combra.git@v0.10.0",
 ]
 
 # Console entry-points. After `pip install -e .` these are available on PATH.
