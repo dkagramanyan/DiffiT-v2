@@ -6,7 +6,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
-- **combra is pinned to a tag (`@v0.8.1`) instead of tracking `main`.** Unpinned, every
+- **`--seeds` failed under the default `--save-mode hdf5`.** Seed mode can only write
+  a directory, but the flag defaults to `hdf5`, so every first attempt errored naming a
+  flag the caller never set. It now falls back to `dir` when the default was left
+  alone, and still refuses an explicit `--save-mode hdf5`.
+- **Pre-v2 snapshots lost their resolution.** Bare EMA `state_dict`s carry no
+  `n_classes` / `resolution` / `class_names`, and DiffiT's axial RoPE loads at any
+  size, so a wrong `--image-size` produced noise rather than an error. `gen_images`
+  now reads `training_options.json` from the snapshot's own run directory -- written
+  by `train.py` all along -- uses its `image_size` when the flag was left at its
+  default, and errors on an explicit contradiction. No checkpoint was rewritten.
+- **Generation blocked on a Hub call before consulting the cache.** `_load_vae` tries
+  the local cache first, announces any download before starting it, and names the
+  cache plus `diffit-download-models` if that fails.
+- **combra is pinned to a tag (`@v0.9.1`) instead of tracking `main`.** Unpinned, every
   fresh env resolved whatever combra `main` was that day, so the FID / CMMD / FD-DINOv2 /
   angle numbers a run is judged on could change with no signal and no record. combra
   0.8.0 also stamps `combra/version` into this run's TensorBoard HPARAMS, so the metric
