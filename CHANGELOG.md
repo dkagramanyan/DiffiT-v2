@@ -6,6 +6,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **Console scripts are now covered by a packaging test** (`tests/test_entry_points.py`).
+  It launches every entry point declared in `[project.scripts]` with `--help` from a
+  temp cwd, which is the only way to see this class of bug: pytest runs with the repo
+  root on `sys.path`, so an in-repo test passes while the installed script is broken.
+  Confirmed to fail against the pre-fix packaging before being kept.
 - **`stats.jsonl` rows are built by a testable function**, and a new
   `tests/test_stats_contract.py` feeds a real row to `combra.metrics.load_fid_by_kimg`.
   The reader was only ever tested against a synthetic flat row, so nothing checked the
