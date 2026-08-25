@@ -24,6 +24,7 @@ from diffit.unipc_solver import unipc_sample
 # needs are combra's dependency, covered by combra's own tests.
 try:
     from combra.metrics.distributed import (
+        all_ranks_ok as _combra_all_ranks_ok,
         distributed_metrics as _combra_distributed_metrics_impl,
         gather_generated as _combra_gather_generated,
         precompute_reference as _combra_precompute_reference,
@@ -33,7 +34,7 @@ try:
     COMBRA_IMPORT_ERROR = None
 except ImportError as _combra_exc:
     _combra_precompute_reference = _combra_gather_generated = None
-    _combra_distributed_metrics_impl = None
+    _combra_distributed_metrics_impl = _combra_all_ranks_ok = None
     HAS_COMBRA = False
     # Keep the reason. "combra is not installed" is the wrong diagnosis when combra
     # IS installed but has moved a symbol -- that misdirection is exactly how this
@@ -307,6 +308,9 @@ def compute_precision_recall(ref_acts, sample_acts, k=3, rank=0, world_size=1, d
 # file is DiffiT-specific: the Inception suite, and generating a shard of fakes.
 
 precompute_combra_reference = _combra_precompute_reference
+# Re-exported so train.py can agree across ranks before a collective without importing
+# combra directly (it must keep working with combra absent).
+all_ranks_ok = _combra_all_ranks_ok
 
 
 

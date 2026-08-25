@@ -50,6 +50,7 @@ from diffit.inception import InceptionFeatureExtractor
 from diffit.metrics import (
     COMBRA_IMPORT_ERROR,
     HAS_COMBRA,
+    all_ranks_ok,
     compute_activations,
     evaluate_metrics,
     precompute_combra_reference,
@@ -477,7 +478,12 @@ def training_loop(
     grid_size = (gw, gh)
     n_grid = gw * gh
 
-    if combra_metrics and is_main and not HAS_COMBRA:
+    if combra_metrics and not HAS_COMBRA:
+        # Deliberately NOT gated on is_main: the condition is rank-uniform (HAS_COMBRA is
+        # decided by the install), so every rank raises together. Raising on rank 0 alone
+        # left the others to block in the reference precompute's collective until the
+        # NCCL watchdog fired, hiding this message behind a timeout.
+        #
         # Say WHICH failure this is. Reporting "not installed" for a combra that is
         # installed but has moved a symbol sent anyone debugging it to reinstall a
         # package already present -- that misdirection hid a real break for a whole
@@ -488,11 +494,12 @@ def training_loop(
                 "Upgrade combra (>= 0.7.0) or pass --combra-metrics=False. Refusing to burn a "
                 "training run producing no metrics."
             )
-        warnings.warn(
-            "--combra-metrics=True but the `combra` package is not installed -- "
-            "combra metrics will be skipped. Install it (pip install -e '.[combra]') "
-            "or pass --combra-metrics=False."
-        )
+        if is_main:
+            warnings.warn(
+                "--combra-metrics=True but the `combra` package is not installed -- "
+                "combra metrics will be skipped. Install it (pip install -e '.[combra]') "
+                "or pass --combra-metrics=False."
+            )
     use_combra = combra_metrics and HAS_COMBRA
 
     # --- Pre-load reference (combra: sharded reference; Inception: rank-0) ---
@@ -512,9 +519,24 @@ def training_loop(
             local_ref = load_reference_shard(
                 data, ref_count, total_count, image_size, workers, rank, num_gpus, seed, num_dataset_classes,
             )
+            smoke_ok = True
             if is_main:
                 logger.log("Running combra metrics smoke test...")
-                combra_smoke_test(local_ref, device, logger.log)
+                try:
+                    combra_smoke_test(local_ref, device, logger.log)
+                except Exception as e:  # noqa: BLE001 -- re-raised on every rank below
+                    smoke_ok = False
+                    logger.log(f"combra metrics smoke test failed: {e}")
+            # Agree before the next collective. The smoke test runs on rank 0 only, so
+            # letting it raise there stranded every other rank in the reference
+            # precompute's all_reduce -- the failure surfaced as an NCCL timeout rather
+            # than as the backend error that actually caused it.
+            if not all_ranks_ok(smoke_ok, device, num_gpus):
+                raise RuntimeError(
+                    "combra metrics smoke test failed on rank 0 (see its log above). "
+                    "Refusing to burn a training run producing no metrics."
+                )
+            if is_main:
                 logger.log("combra metrics enabled → DiffiT Inception metrics disabled.")
             # (reference, ok): ok is rank-uniform, so gating on it is safe -- combra_ref
             # is None on every non-zero rank whether or not anything failed.

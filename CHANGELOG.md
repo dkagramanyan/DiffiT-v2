@@ -6,6 +6,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **Rank 0 raising before a collective hung every other rank.** Two startup paths
+  aborted under `is_main`: the incompatible-combra `RuntimeError`, and the metrics
+  smoke test. Both sit immediately before `precompute_combra_reference`, whose
+  `all_reduce` the surviving ranks were already blocked in — so a misconfigured
+  install surfaced as an NCCL watchdog timeout instead of the error that caused it.
+  The incompatible-combra check no longer gates its raise on `is_main` (the condition
+  is rank-uniform, so all ranks raise together, and only the warning stays rank-0),
+  and the smoke test's failure is agreed through `all_ranks_ok` before every rank
+  raises together.
+
 - **`--no-merge` skipped the incomplete-shard check entirely.** The hard-fail on
   missing samples lived only inside the merge, so with `--no-merge` a crashed run
   left shards on disk with nonzero `missing_count` looking finished. Rank 0 now
