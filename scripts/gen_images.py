@@ -13,7 +13,8 @@ Two save modes (per-class mode):
                     merged file carry ``format="generated_images_shard"`` and
                     ``schema_version=1`` so downstream code sniffs any model's
                     output identically. The merge hard-fails on incomplete
-                    shards.
+                    shards; ``--no-merge`` runs the same completeness check
+                    on the shards it leaves behind.
   dir             — per-image PNGs under ``class_<c>/`` + a ``classes.json``.
 
 Multi-GPU is self-spawning: ``--gpus N`` launches one worker per GPU via
@@ -186,6 +187,11 @@ class RankH5Writer:
         self.samples_per_class = int(samples_per_class)
         self.compression = compression
         self.chunk_images = int(chunk_images)
+        if class_names is None:
+            raise ValueError(
+                "checkpoint carries no class_names; refusing to write an "
+                "unattributable h5 (§4)."
+            )
         self.class_names = class_names
         self.f: Optional[h5py.File] = None
         self.initialized = False
@@ -208,8 +214,7 @@ class RankH5Writer:
         self.f.attrs["image_shape_hwc"] = self.img_shape
         self.f.attrs["samples_per_class"] = int(self.samples_per_class)
         self.f.attrs["classes"] = np.array(self.classes, dtype=np.int32)
-        if self.class_names is not None:
-            self.f.attrs["class_names"] = np.array(self.class_names, dtype=h5py.string_dtype())
+        self.f.attrs["class_names"] = np.array(self.class_names, dtype=h5py.string_dtype())
 
         chunks0 = max(1, min(self.chunk_images, self.samples_per_class))
         chunks_meta = max(1, min(chunks0 * 4, self.samples_per_class))
@@ -219,7 +224,7 @@ class RankH5Writer:
             g.attrs["class_idx"] = int(c)
             g.attrs["samples_per_class"] = int(self.samples_per_class)
             g.attrs["image_shape_hwc"] = self.img_shape
-            if self.class_names is not None and c < len(self.class_names):
+            if c < len(self.class_names):
                 g.attrs["class_name"] = self.class_names[c]
 
             self.d_images[c] = g.create_dataset(
@@ -284,6 +289,11 @@ def _merge_shards_to_one_h5(merged_path, shards_dir, classes, samples_per_class,
     crashed generation run must not silently feed zero-filled black images into
     the downstream angle pipeline (§4).
     """
+    if class_names is None:
+        raise ValueError(
+            "checkpoint carries no class_names; refusing to write an "
+            "unattributable h5 (§4)."
+        )
     merged_path.parent.mkdir(parents=True, exist_ok=True)
     shard_files = [h5py.File(str(shards_dir / f"rank_{r:03d}.h5"), "r") for r in range(world_size)]
     try:
@@ -304,8 +314,7 @@ def _merge_shards_to_one_h5(merged_path, shards_dir, classes, samples_per_class,
             out.attrs["samples_per_class"] = int(samples_per_class)
             out.attrs["classes"] = np.array([int(c) for c in classes], dtype=np.int32)
             out.attrs["world_size"] = int(world_size)
-            if class_names is not None:
-                out.attrs["class_names"] = np.array(class_names, dtype=h5py.string_dtype())
+            out.attrs["class_names"] = np.array(class_names, dtype=h5py.string_dtype())
             for k, v in (extra_attrs or {}).items():
                 out.attrs[k] = v
 
@@ -318,7 +327,7 @@ def _merge_shards_to_one_h5(merged_path, shards_dir, classes, samples_per_class,
                 g.attrs["class_idx"] = c
                 g.attrs["samples_per_class"] = int(samples_per_class)
                 g.attrs["image_shape_hwc"] = (H, W, C)
-                if class_names is not None and c < len(class_names):
+                if c < len(class_names):
                     g.attrs["class_name"] = class_names[c]
 
                 dimg = g.create_dataset(
@@ -362,6 +371,37 @@ def _merge_shards_to_one_h5(merged_path, shards_dir, classes, samples_per_class,
     finally:
         for sf in shard_files:
             sf.close()
+
+
+def _validate_shards(shards_dir, classes, samples_per_class, world_size):
+    """Hard-fail on incomplete shards when the merge (and its check) is skipped.
+
+    Same contract as the merge: a crashed run must not leave shards on disk that
+    look finished (§4). Missing slots are recomputed from the ``written`` masks
+    against each rank's block from ``_split_indices_block`` — the ``missing_count``
+    attrs are not trusted, since a crashed run may never have written them.
+    """
+    bad = []
+    for r in range(world_size):
+        shard_path = shards_dir / f"rank_{r:03d}.h5"
+        mine = _split_indices_block(samples_per_class, r, world_size)
+        missing = 0
+        with h5py.File(str(shard_path), "r") as sf:
+            for c in classes:
+                grp = sf.get(f"class_{int(c)}", None)
+                if grp is None:
+                    missing += int(mine.size)
+                    continue
+                wmask = np.asarray(grp["written"][:], dtype=bool)
+                missing += int(np.count_nonzero(~wmask[mine]))
+        if missing:
+            bad.append(f"{shard_path.name}: {missing} slot(s)")
+    if bad:
+        raise RuntimeError(
+            f"Incomplete shard(s) in {shards_dir}: " + "; ".join(bad) + " were "
+            "never generated — --no-merge skips the merge, not the hard-fail on "
+            "missing samples (§4)."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +536,7 @@ def _rank0_merge(c):
             json.dump(manifest, f, indent=2)
         return
     if not c["merge"]:
+        _validate_shards(outdir_p / "shards", c["classes"], c["samples_per_class"], c["gpus"])
         return
     merged_path = outdir_p / f"{c['desc']}.h5"
     print(f'Merging {c["gpus"]} shard(s) → "{merged_path}" ...')

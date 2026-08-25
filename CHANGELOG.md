@@ -6,6 +6,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **`--no-merge` skipped the incomplete-shard check entirely.** The hard-fail on
+  missing samples lived only inside the merge, so with `--no-merge` a crashed run
+  left shards on disk with nonzero `missing_count` looking finished. Rank 0 now
+  recomputes missing slots from the `written` masks after generation even when
+  merging is skipped, and raises naming each incomplete shard and its count.
 - **`--seeds` failed under the default `--save-mode hdf5`.** Seed mode can only write
   a directory, but the flag defaults to `hdf5`, so every first attempt errored naming a
   flag the caller never set. It now falls back to `dir` when the default was left
@@ -39,6 +44,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   nothing checked. See below for this repo's share.
 
 ### Changed
+- **`class_names` is mandatory in the generated-images h5.** `RankH5Writer` and
+  the shard merge now raise when the checkpoint carries no `class_names`, instead
+  of silently writing an h5 with no class attribution.
 - **The sharded eval harness moved into combra** (`combra.metrics.distributed`). This
   repo kept only what is model-specific: producing a shard of generated images and the
   float->uint8 denormalisation. The four private copies had drifted three ways --
@@ -88,6 +96,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   file could go green by doing nothing. CI now installs combra when a `COMBRA_TOKEN`
   secret is present and sets `COMBRA_REQUIRED=1`; a new always-on test fails if
   combra is missing under that flag.
+
+### Removed
+- **The legacy writer `experiments/notebooks/generate_class_samples.py`.** It
+  stamped `format="diffit_generated_images"` with no `schema_version` /
+  `class_names` and used a per-batch seed convention incompatible with §4. Use
+  `diffit-gen-images --save-mode hdf5` instead.
 
 ## [3.1.0] — 2026-08-18
 
