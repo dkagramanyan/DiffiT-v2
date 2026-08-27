@@ -6,6 +6,24 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **Eval-tick latents came from the ambient per-rank RNG.** `torch.randn` /
+  `torch.randint` with no generator meant a specific fake batch was not reproducible
+  from `--seed`, differed with `--gpus`, and changed every tick — unlike the GAN
+  repos, which fix their eval latents at startup. Sample `i`'s noise and class now
+  come from a CPU generator seeded by `seed + i` alone (`diffit.metrics._eval_draw`,
+  threaded from the loop's `--seed`), so the eval set is identical at any world
+  size and on every tick, and any subset reproduces in isolation (§2).
+
+- **`tests/test_combra_contract.py` asserted combra symbols the training loop no
+  longer imports.** Its `REQUIRED` list still named the eight feature / angle
+  functions from before the sharded harness moved into combra, and never named
+  `combra.metrics.distributed`'s `all_ranks_ok` / `distributed_metrics` /
+  `gather_generated` / `precompute_reference` — the four symbols the loop actually
+  depends on. That is the exact blind spot the test exists to close (combra 0.5.0
+  removing three functions hid for a release the same way). It now pins
+  `(module, name)` pairs for every combra import in the repo and the unguarded
+  import block mirrors the loop's real imports.
+
 - **A zero-sample rank crashed `RankH5Writer.close()` with a `KeyError`.** When
   `--gpus` exceeds `--samples-per-class`, a rank's index block is empty, so no
   batch is ever written and `_init` never runs — but `close()` indexed the

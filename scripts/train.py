@@ -780,7 +780,7 @@ def training_loop(
                         num_fid_samples, batch_gpu, latent_size, device,
                         cfg_scale=cfg_scale,
                         sampler=eval_sampler, num_sampling_steps=eval_sampling_steps,
-                        rank=rank, world_size=num_gpus,
+                        rank=rank, world_size=num_gpus, seed=seed,
                         log_fn=logger.log,
                         class_list=list(range(num_dataset_classes)),
                         null_class_idx=num_dataset_classes,

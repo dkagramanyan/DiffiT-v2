@@ -92,12 +92,25 @@ def sample_latents(model_fn, diffusion, shape, device, *, sampler, num_steps, mo
     )
 
 
+def _eval_draw(seed, idx, latent_size, n_classes):
+    """Noise and class index of eval sample ``idx`` (the §2 seed rule).
+
+    Both come from one CPU generator seeded by ``seed + idx`` alone, so the eval
+    set is identical at any ``--gpus`` and on every tick, and any subset of it
+    reproduces in isolation.
+    """
+    g = torch.Generator("cpu").manual_seed(int(seed) + int(idx))
+    z = torch.randn(4, latent_size, latent_size, generator=g)
+    c = int(torch.randint(0, int(n_classes), (1,), generator=g))
+    return z, c
+
+
 @torch.inference_mode()
 def _generate_local_shard(
     ema_model, vae, diffusion, num_samples, batch_gpu, latent_size, device,
     *,
     cfg_scale, num_sampling_steps=25, scale_pow=4.0, sampler="dpm++",
-    rank=0, world_size=1,
+    rank=0, world_size=1, seed=0,
     class_list=None, null_class_idx=None,
 ):
     """Generate this rank's shard of the eval samples (NCHW uint8 numpy).
@@ -114,6 +127,7 @@ def _generate_local_shard(
     samples_per_rank = (num_samples + world_size - 1) // world_size
     local_target = min(samples_per_rank, num_samples - rank * samples_per_rank)
     local_target = max(local_target, 0)
+    start = rank * samples_per_rank  # this rank's block of global sample indices
 
     all_images = []
     generated = 0
@@ -121,8 +135,10 @@ def _generate_local_shard(
     pbar = tqdm(total=local_target, desc=f"Generating eval samples ({sampler}×{num_sampling_steps})", unit="img") if show_progress else None
     while generated < local_target:
         bs = min(batch_gpu, local_target - generated)
-        z = torch.randn(bs, 4, latent_size, latent_size, device=device)
-        classes = class_tensor[torch.randint(0, len(class_tensor), (bs,), device=device)]
+        draws = [_eval_draw(seed, i, latent_size, len(class_tensor))
+                 for i in range(start + generated, start + generated + bs)]
+        z = torch.stack([d[0] for d in draws]).to(device)
+        classes = class_tensor[torch.tensor([d[1] for d in draws], device=device)]
 
         z_cfg = torch.cat([z, z], 0)
         classes_null = torch.full((bs,), null_class_idx, device=device, dtype=torch.long)
@@ -322,7 +338,7 @@ def evaluate_metrics(
     *,
     cfg_scale,
     sampler="dpm++", num_sampling_steps=25,
-    rank=0, world_size=1,
+    rank=0, world_size=1, seed=0,
     log_fn=None,
     class_list=None, null_class_idx=None,
     combra_ref=None,
@@ -367,7 +383,7 @@ def evaluate_metrics(
         ema_model, vae, diffusion, num_fid_samples, batch_gpu, latent_size, device,
         cfg_scale=cfg_scale,
         num_sampling_steps=num_sampling_steps, sampler=sampler,
-        rank=rank, world_size=world_size,
+        rank=rank, world_size=world_size, seed=seed,
         class_list=class_list, null_class_idx=null_class_idx,
     )
 
