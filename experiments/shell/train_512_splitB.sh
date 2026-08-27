@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local (no-SLURM) version of sbatch/train_512_splitB.sbatch.
+# Launcher for train_512_splitB (workstation, or `sbatch --export=ALL,FOREGROUND=1 ...` on the cluster).
 # See train_256_splitA.sh for env var knobs.
 set -euo pipefail
 

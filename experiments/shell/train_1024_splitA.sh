@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local (no-SLURM) version of sbatch/train_1024_splitA.sbatch.
+# Launcher for train_1024_splitA (workstation, or `sbatch --export=ALL,FOREGROUND=1 ...` on the cluster).
 # 1024² is memory-heavy: grad-checkpointing ON by default for local runs.
 # See train_256_splitA.sh for env var knobs.
 set -euo pipefail

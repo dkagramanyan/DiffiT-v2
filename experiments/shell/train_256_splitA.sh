@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local (no-SLURM) version of sbatch/train_256_splitA.sbatch.
+# Launcher for train_256_splitA (workstation, or `sbatch --export=ALL,FOREGROUND=1 ...` on the cluster).
 #
 # Defaults are tuned for a modest local GPU. Override any of these via env vars:
 #   NPROC=2            # GPUs to use

@@ -5,6 +5,25 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+- **`sh/train_{256,512,1024}.sh` and `sh/generate_{256,512,1024}.sh` rewritten to
+  the §9 launch-script shape shared by all four model repos.** SLURM-spool-safe
+  repo-root discovery, `conda.sh` sourced before `conda activate`, the offline-hub
+  contract, and one console-command call whose every knob is an env var with a
+  default plus `"$@"` passthrough. Training now passes `--snapshot-keep-last`,
+  `--combra-metrics True`, `--num-fid-samples` and `--seed` explicitly, defaults
+  `--batch-gpu` per resolution to the README's recipe (96 / 64 / 16), and takes
+  `INIT_WEIGHTS=<previous snapshot>` for the higher-resolution warm start.
+  Generation passes `--classes`, a per-resolution `--cfg-scale` matching the
+  training preset (4.4 / 1.49 / 1.49), `--sampler`/`--steps`, `--seed 42`, and
+  names the merged file after the snapshot instead of `generated.h5`. The dataset
+  default is the shared `imagenet_9to4_1024x1024_<res>x<res>.zip` name.
+
+### Removed
+- **`experiments/sbatch/`** (the seven sample-split SLURM scripts). They hardcoded
+  a partition and account; the paired `experiments/shell/` launchers run under
+  `sbatch --export=ALL,FOREGROUND=1 …` instead (§9: no `.sbatch` files).
+
 ### Fixed
 - **A failed combra reference precompute crashed the first snapshot tick.**
   `combra_ok=False` only flipped `use_combra`, which routed every later eval into

@@ -18,15 +18,7 @@ experiments/
 ├── README.md                   # this file
 ├── train_sample_split.py       # trains ONE model on split A or B + logs Loss/test
 ├── analyze_sample_split.py     # walks checkpoint pairs → cosine distance → plot
-├── sbatch/                     # cluster launchers (SLURM)
-│   ├── train_256_splitA.sbatch
-│   ├── train_256_splitB.sbatch
-│   ├── train_512_splitA.sbatch
-│   ├── train_512_splitB.sbatch
-│   ├── train_1024_splitA.sbatch
-│   ├── train_1024_splitB.sbatch
-│   └── analyze.sbatch          # analysis job (1 GPU)
-└── shell/                      # local launchers (no SLURM; env-var-overridable)
+└── shell/                      # launchers (workstation or sbatch; env-var-overridable)
     ├── train_256_splitA.sh
     ├── train_256_splitB.sh
     ├── train_512_splitA.sh
@@ -36,7 +28,7 @@ experiments/
     └── analyze.sh
 ```
 
-The `sbatch/` and `shell/` directories are pairwise equivalents. Same training script, same defaults — `sbatch/` wraps it in SLURM directives for H200 clusters; `shell/` runs locally with smaller defaults and env-var overrides.
+There are no `.sbatch` files (spec §9): the `shell/` scripts are the launchers everywhere. On a workstation run them directly; on the cluster put the SLURM specifics on the `sbatch` line and keep the job attached with `FOREGROUND=1` (the scripts detach via `nohup` by default, which would end a SLURM job immediately), e.g. `sbatch --account=<proj> --partition=<part> --gpus=2 --export=ALL,FOREGROUND=1,NPROC=2,BATCH_GPU=96,KIMG=30000 experiments/shell/train_256_splitA.sh`.
 
 ## Dataset split
 
@@ -52,13 +44,13 @@ val, trainA, trainB are disjoint. Both A and B see the same val split, so `Loss/
 
 ## Step 1 — Train both models
 
-Run the A sbatch and the B sbatch for your resolution of interest. They can run in parallel (two independent jobs) or sequentially. They use the same data archive; only the `--split` flag differs.
+Run the A launcher and the B launcher for your resolution of interest. They can run in parallel (two independent jobs) or sequentially. They use the same data archive; only the `--split` flag differs.
 
 ### 256² (recommended for the cheap variant)
 
 ```bash
-sbatch experiments/sbatch/train_256_splitA.sbatch
-sbatch experiments/sbatch/train_256_splitB.sbatch
+sbatch --account=<proj> --partition=<part> --gpus=2 --export=ALL,FOREGROUND=1 experiments/shell/train_256_splitA.sh
+sbatch --account=<proj> --partition=<part> --gpus=2 --export=ALL,FOREGROUND=1 experiments/shell/train_256_splitB.sh
 ```
 
 **Config:** 2× H200, global batch 192, `--kimg=30000`, `--snap=10` → checkpoint + test-loss eval every 40 kimg.
@@ -67,8 +59,8 @@ sbatch experiments/sbatch/train_256_splitB.sbatch
 ### 512²
 
 ```bash
-sbatch experiments/sbatch/train_512_splitA.sbatch
-sbatch experiments/sbatch/train_512_splitB.sbatch
+sbatch --account=<proj> --partition=<part> --gpus=2 --export=ALL,FOREGROUND=1 experiments/shell/train_512_splitA.sh
+sbatch --account=<proj> --partition=<part> --gpus=2 --export=ALL,FOREGROUND=1 experiments/shell/train_512_splitB.sh
 ```
 
 Global batch 128, `--kimg=20000`. Walltime ~3–4 days per run.
@@ -76,15 +68,15 @@ Global batch 128, `--kimg=20000`. Walltime ~3–4 days per run.
 ### 1024²
 
 ```bash
-sbatch experiments/sbatch/train_1024_splitA.sbatch
-sbatch experiments/sbatch/train_1024_splitB.sbatch
+sbatch --account=<proj> --partition=<part> --gpus=2 --export=ALL,FOREGROUND=1 experiments/shell/train_1024_splitA.sh
+sbatch --account=<proj> --partition=<part> --gpus=2 --export=ALL,FOREGROUND=1 experiments/shell/train_1024_splitB.sh
 ```
 
 Global batch 32 (with `--grad-accum=2`), grad-checkpointing on, `--kimg=10000`. Walltime ~4 days per run.
 
-### Local smoke test (no SLURM) — `shell/`
+### Smoke test on a workstation — `shell/`
 
-The `shell/` scripts mirror the sbatches but with local-friendly defaults and zero SLURM directives. Use these to verify the pipeline end-to-end on your workstation before committing cluster time.
+The `shell/` scripts carry local-friendly defaults and zero SLURM directives. Use these to verify the pipeline end-to-end on your workstation before committing cluster time.
 
 **Local defaults** (much smaller than cluster defaults):
 
@@ -160,16 +152,8 @@ python experiments/analyze_sample_split.py \
     --title="Biased generalization in DiffiT (256²)"
 ```
 
-Via the cluster sbatch:
-
-```bash
-sbatch --export=ALL,RESOLUTION=256,\
-RUN_A=/path/to/splitA,\
-RUN_B=/path/to/splitB \
-    experiments/sbatch/analyze.sbatch
-```
-
-Or locally via the shell wrapper (positional args):
+Or via the shell wrapper (positional args) — on the cluster prefix it with
+`sbatch --account=<proj> --partition=<part> --gpus=1 --export=ALL,FOREGROUND=1`:
 
 ```bash
 bash experiments/shell/analyze.sh 256 \
@@ -203,13 +187,13 @@ The paper observed the blue minimum at roughly the **epoch where generated image
 
 ## Gotchas and notes
 
-- **Same `--seed`.** The training sbatches fix the RNG seed, so model A and model B start from identical weight initialization. This is important: the paper's effect is about training dynamics, not init variance.
+- **Same `--seed`.** The training launchers fix the RNG seed, so model A and model B start from identical weight initialization. This is important: the paper's effect is about training dynamics, not init variance.
 - **Deterministic split.** The split seed (42) lives inside `train_sample_split.py`. Don't change it between the A and B runs.
 - **Class-conditional.** Both models see all 1000 ImageNet classes; the split is over examples, not classes.
 - **Matched noise is critical.** `analyze_sample_split.py` calls `torch.manual_seed(k)` right before each `p_sample_loop` to make sure both models consume the same `randn_like` sequence. If you change the sampler path, preserve this invariant.
 - **No CFG during analysis.** The cosine-distance measurement uses plain sampling (no classifier-free guidance). CFG would amplify subtle differences and mask the phenomenon.
 - **EMA vs. raw.** The analysis uses EMA weights (standard for diffusion eval). The training script saves both.
-- **Memory for analysis.** `analyze_sample_split.py` loads both models onto one GPU. At DiffiT-XL scale (~561M params) that's fine on an H200; for 1024² the autocast activations during sampling dominate memory — the `analyze.sbatch` reduces `--num-samples` and `--batch-size` accordingly.
+- **Memory for analysis.** `analyze_sample_split.py` loads both models onto one GPU. At DiffiT-XL scale (~561M params) that's fine on an H200; for 1024² the autocast activations during sampling dominate memory — reduce `--num-samples` and `--batch-size` accordingly.
 - **stats.jsonl is authoritative.** The analysis script reads test loss from `stats.jsonl` first; tfevents is only the fallback. If you move runs between machines, copy the `.jsonl` too.
 - **Shrink the budget if needed.** The paper's U-turn on CelebA happens within ~1500 epochs of training. On ImageNet with DiffiT, the timescale is unclear. If 30k kimg is too long, try `--kimg=10000 --snap=5` first to see if the effect is visible earlier.
 
