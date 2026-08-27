@@ -1,0 +1,142 @@
+[
+  {
+    "kimg": 403,
+    "cosine_distance": 0.0004021618515253067,
+    "cosine_distance_sem": 5.242439948547389e-06,
+    "test_loss_a": 0.8873652815818787,
+    "test_loss_b": 0.9054667353630066
+  },
+  {
+    "kimg": 1209,
+    "cosine_distance": 0.0073324888944625854,
+    "cosine_distance_sem": 6.104395969706467e-05,
+    "test_loss_a": 0.5291483402252197,
+    "test_loss_b": 0.5324074625968933
+  },
+  {
+    "kimg": 2419,
+    "cosine_distance": 0.05237057991325855,
+    "cosine_distance_sem": 0.0008134083436864312,
+    "test_loss_a": 0.20515090227127075,
+    "test_loss_b": 0.19514332711696625
+  },
+  {
+    "kimg": 3225,
+    "cosine_distance": 0.07616850268095732,
+    "cosine_distance_sem": 0.003328337831686828,
+    "test_loss_a": 0.1518433839082718,
+    "test_loss_b": 0.1516963392496109
+  },
+  {
+    "kimg": 4435,
+    "cosine_distance": 0.19362941663712263,
+    "cosine_distance_sem": 0.03781365482853062,
+    "test_loss_a": 0.12334597110748291,
+    "test_loss_b": 0.12262410670518875
+  },
+  {
+    "kimg": 5241,
+    "cosine_distance": 0.31135152373462915,
+    "cosine_distance_sem": 0.054701683537451286,
+    "test_loss_a": 0.12010389566421509,
+    "test_loss_b": 0.12533418834209442
+  },
+  {
+    "kimg": 6451,
+    "cosine_distance": 0.3821178385987878,
+    "cosine_distance_sem": 0.056849628263607725,
+    "test_loss_a": 0.11822044849395752,
+    "test_loss_b": 0.11436823755502701
+  },
+  {
+    "kimg": 7257,
+    "cosine_distance": 0.3789607621729374,
+    "cosine_distance_sem": 0.053989588060575334,
+    "test_loss_a": 0.10518231242895126,
+    "test_loss_b": 0.10329047590494156
+  },
+  {
+    "kimg": 8064,
+    "cosine_distance": 0.3547756811603904,
+    "cosine_distance_sem": 0.04744185110676858,
+    "test_loss_a": 0.09876660257577896,
+    "test_loss_b": 0.09658703207969666
+  },
+  {
+    "kimg": 9273,
+    "cosine_distance": 0.32405070029199123,
+    "cosine_distance_sem": 0.041278554956851184,
+    "test_loss_a": 0.08159636706113815,
+    "test_loss_b": 0.08979197591543198
+  },
+  {
+    "kimg": 10080,
+    "cosine_distance": 0.3138060439378023,
+    "cosine_distance_sem": 0.03981018350797609,
+    "test_loss_a": 0.08956563472747803,
+    "test_loss_b": 0.08518647402524948
+  },
+  {
+    "kimg": 11289,
+    "cosine_distance": 0.2715039011090994,
+    "cosine_distance_sem": 0.032742748668546116,
+    "test_loss_a": 0.10347703844308853,
+    "test_loss_b": 0.1023089811205864
+  },
+  {
+    "kimg": 12096,
+    "cosine_distance": 0.2645179368555546,
+    "cosine_distance_sem": 0.03300731515573274,
+    "test_loss_a": 0.09061548858880997,
+    "test_loss_b": 0.09057503193616867
+  },
+  {
+    "kimg": 12902,
+    "cosine_distance": 0.19833361450582743,
+    "cosine_distance_sem": 0.01767031712350103,
+    "test_loss_a": 0.08708774298429489,
+    "test_loss_b": 0.09774009138345718
+  },
+  {
+    "kimg": 14112,
+    "cosine_distance": 0.16342563088983297,
+    "cosine_distance_sem": 0.012199332931742074,
+    "test_loss_a": 0.09095746278762817,
+    "test_loss_b": 0.07756412774324417
+  },
+  {
+    "kimg": 14918,
+    "cosine_distance": 0.17097783461213112,
+    "cosine_distance_sem": 0.014461992322858159,
+    "test_loss_a": 0.09685724973678589,
+    "test_loss_b": 0.09292265772819519
+  },
+  {
+    "kimg": 16128,
+    "cosine_distance": 0.1599526247009635,
+    "cosine_distance_sem": 0.013090401881733382,
+    "test_loss_a": 0.09153109043836594,
+    "test_loss_b": 0.09780358523130417
+  },
+  {
+    "kimg": 16934,
+    "cosine_distance": 0.146985599771142,
+    "cosine_distance_sem": 0.009069572365335985,
+    "test_loss_a": 0.09103625267744064,
+    "test_loss_b": 0.08952486515045166
+  },
+  {
+    "kimg": 18144,
+    "cosine_distance": 0.1497779367491603,
+    "cosine_distance_sem": 0.011123217024132173,
+    "test_loss_a": 0.08739888668060303,
+    "test_loss_b": 0.09404011815786362
+  },
+  {
+    "kimg": 18950,
+    "cosine_distance": 0.14655203558504581,
+    "cosine_distance_sem": 0.010242183248368822,
+    "test_loss_a": 0.09097393602132797,
+    "test_loss_b": 0.07756119966506958
+  }
+]
