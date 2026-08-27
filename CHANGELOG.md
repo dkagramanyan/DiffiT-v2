@@ -5,6 +5,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [3.2.0] — 2026-08-27
+
 ### Fixed
 - **Eval-tick latents came from the ambient per-rank RNG.** `torch.randn` /
   `torch.randint` with no generator meant a specific fake batch was not reproducible
