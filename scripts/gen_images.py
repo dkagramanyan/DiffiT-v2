@@ -192,6 +192,12 @@ class RankH5Writer:
                 "checkpoint carries no class_names; refusing to write an "
                 "unattributable h5 (§4)."
             )
+        short = [c for c in self.classes if c >= len(class_names)]
+        if short:
+            raise ValueError(
+                f"class_names has {len(class_names)} entries; missing a name for "
+                f"class {short[0]} (§5)."
+            )
         self.class_names = class_names
         self.f: Optional[h5py.File] = None
         self.initialized = False
@@ -224,8 +230,7 @@ class RankH5Writer:
             g.attrs["class_idx"] = int(c)
             g.attrs["samples_per_class"] = int(self.samples_per_class)
             g.attrs["image_shape_hwc"] = self.img_shape
-            if c < len(self.class_names):
-                g.attrs["class_name"] = self.class_names[c]
+            g.attrs["class_name"] = self.class_names[c]
 
             self.d_images[c] = g.create_dataset(
                 "images", shape=(self.samples_per_class, H, W, C), dtype=np.uint8,
@@ -271,6 +276,17 @@ class RankH5Writer:
     def close(self):
         if self.f is None:
             return
+        if not self.initialized:
+            # A rank whose index block is empty (world_size > samples_per_class)
+            # never writes a batch, so _init never ran: delete the attribute-less
+            # shard instead of KeyError-ing on d_written.
+            self.f.close()
+            self.f = None
+            try:
+                self.shard_path.unlink()
+            except OSError:
+                pass
+            return
         for c in self.classes:
             written = int(np.count_nonzero(self.d_written[c][:]))
             grp = self.f[f"class_{c}"]
@@ -294,8 +310,16 @@ def _merge_shards_to_one_h5(merged_path, shards_dir, classes, samples_per_class,
             "checkpoint carries no class_names; refusing to write an "
             "unattributable h5 (§4)."
         )
+    if any(int(c) >= len(class_names) for c in classes):
+        raise ValueError(
+            f"class_names has {len(class_names)} entries; missing a name for "
+            f"class {max(int(c) for c in classes)} (§5)."
+        )
     merged_path.parent.mkdir(parents=True, exist_ok=True)
-    shard_files = [h5py.File(str(shards_dir / f"rank_{r:03d}.h5"), "r") for r in range(world_size)]
+    # A zero-sample rank deletes its empty shard in close(); any real gap a missing
+    # shard leaves behind is still caught by the written-mask gate below.
+    shard_paths = [shards_dir / f"rank_{r:03d}.h5" for r in range(world_size)]
+    shard_files = [h5py.File(str(p), "r") for p in shard_paths if p.exists()]
     try:
         img_shape = None
         for sf in shard_files:
@@ -327,8 +351,7 @@ def _merge_shards_to_one_h5(merged_path, shards_dir, classes, samples_per_class,
                 g.attrs["class_idx"] = c
                 g.attrs["samples_per_class"] = int(samples_per_class)
                 g.attrs["image_shape_hwc"] = (H, W, C)
-                if c < len(class_names):
-                    g.attrs["class_name"] = class_names[c]
+                g.attrs["class_name"] = class_names[c]
 
                 dimg = g.create_dataset(
                     "images", shape=(samples_per_class, H, W, C), dtype=np.uint8,
@@ -386,14 +409,19 @@ def _validate_shards(shards_dir, classes, samples_per_class, world_size):
         shard_path = shards_dir / f"rank_{r:03d}.h5"
         mine = _split_indices_block(samples_per_class, r, world_size)
         missing = 0
-        with h5py.File(str(shard_path), "r") as sf:
-            for c in classes:
-                grp = sf.get(f"class_{int(c)}", None)
-                if grp is None:
-                    missing += int(mine.size)
-                    continue
-                wmask = np.asarray(grp["written"][:], dtype=bool)
-                missing += int(np.count_nonzero(~wmask[mine]))
+        if not shard_path.exists():
+            # A zero-sample rank legitimately deletes its empty shard in close();
+            # a missing shard for a rank that owned samples is a crashed worker.
+            missing = int(mine.size) * len(classes)
+        else:
+            with h5py.File(str(shard_path), "r") as sf:
+                for c in classes:
+                    grp = sf.get(f"class_{int(c)}", None)
+                    if grp is None:
+                        missing += int(mine.size)
+                        continue
+                    wmask = np.asarray(grp["written"][:], dtype=bool)
+                    missing += int(np.count_nonzero(~wmask[mine]))
         if missing:
             bad.append(f"{shard_path.name}: {missing} slot(s)")
     if bad:

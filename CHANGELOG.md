@@ -6,6 +6,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- **A zero-sample rank crashed `RankH5Writer.close()` with a `KeyError`.** When
+  `--gpus` exceeds `--samples-per-class`, a rank's index block is empty, so no
+  batch is ever written and `_init` never runs — but `close()` indexed the
+  per-class datasets unconditionally. Such a rank now deletes its group-less
+  shard and returns cleanly (the same fix san-v2 shipped), and both the merge
+  and the `--no-merge` validator tolerate the absent file: a missing shard for
+  a rank that owned zero samples is legitimate, while one that owned samples
+  still hard-fails as a crashed worker.
+
+- **A `class_names` list shorter than the class set silently dropped
+  `class_name` group attrs.** The writer and the merge stamped `class_name`
+  only for classes inside the list, conditionally omitting the attr §4 says is
+  always present. Both now raise up front when any selected class has no name.
+
 - **Rank 0 raising before a collective hung every other rank.** Two startup paths
   aborted under `is_main`: the incompatible-combra `RuntimeError`, and the metrics
   smoke test. Both sit immediately before `precompute_combra_reference`, whose
@@ -112,6 +126,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   stamped `format="diffit_generated_images"` with no `schema_version` /
   `class_names` and used a per-batch seed convention incompatible with §4. Use
   `diffit-gen-images --save-mode hdf5` instead.
+
+- **The legacy generation notebook** (`experiments/notebooks/generate_class_samples.ipynb`).
+  It still carried the pre-v2 writer — `format='diffit_generated_images'`, no
+  `schema_version`/`class_names`, and a different seed convention — which the
+  removal of `generate_class_samples.py` was supposed to retire; downstream
+  readers emit `UnknownFormatWarning` on its output. `diffit-gen-images
+  --save-mode hdf5` is the one generation path.
 
 ## [3.1.0] — 2026-08-18
 
