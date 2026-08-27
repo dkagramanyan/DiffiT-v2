@@ -5,6 +5,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- **A failed combra reference precompute crashed the first snapshot tick.**
+  `combra_ok=False` only flipped `use_combra`, which routed every later eval into
+  the Inception path — whose extractor and reference activations are never built
+  when combra was selected — so the run died on `None` at the first snapshot
+  instead of skipping eval. The failure now disables eval for the run
+  (`num_fid_samples = 0`), matching the logged warning.
+- `diffit.dist_util.extract_inference_state_dict`'s docstring still described the
+  pre-v2 resumable `{"model", "ema", "opt"}` checkpoints as the default artifact.
+
 ## [0.4.0] — 2026-08-27
 
 Version numbering rejoins the shared `v0.x` tag lineage of the four model repos

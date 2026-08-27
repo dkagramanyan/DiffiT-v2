@@ -542,9 +542,13 @@ def training_loop(
             # is None on every non-zero rank whether or not anything failed.
             combra_ref, combra_ok = precompute_combra_reference(local_ref, device, rank, num_gpus)
             if not combra_ok:
+                # Disable eval outright: flipping only use_combra would route the
+                # snapshot ticks into the Inception path, whose extractor and
+                # reference activations were never built on this branch.
                 use_combra = False
+                num_fid_samples = 0
                 if is_main:
-                    logger.log("WARNING: combra reference precompute failed; metrics disabled.")
+                    logger.log("WARNING: combra reference precompute failed; metrics disabled for this run.")
             if is_main:
                 logger.log("Reference features computed.")
         elif is_main:
