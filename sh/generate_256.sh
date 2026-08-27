@@ -2,7 +2,9 @@
 # DiffiT -- generate 256x256 samples per class into the merged <desc>.h5 the wc_cv angle pipeline consumes.
 #
 # Workstation:  NETWORK=<run_dir>/<snapshot>-inference.pt bash sh/generate_256.sh
-# SLURM:        sbatch --account=<proj> --partition=<part> --gpus=2 --cpus-per-task=16 --time=3-0:0 sh/generate_256.sh
+# SLURM:        sbatch --account=<proj> --partition=<part> --nodes=1 --gpus=2 --cpus-per-task=8 --time=3-0:0 sh/generate_256.sh
+#
+# Defaults target the production allocation: 2x H200 (sm_90), 8 CPUs, fixed seed 42.
 #
 # Every knob is an env var with a default; anything after the script name is appended to
 # the command (e.g. `... --kimg 200 --snap 2` for a smoke run). No user homes, --nodelist
@@ -24,6 +26,24 @@ conda activate "${CONDA_ENV:-diffit-v2}"   # env name = repo name
 # (diffit-download-models); compute nodes never reach the network.
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
+export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"      # CLIP (CMMD) weights
+export TORCH_HOME="${TORCH_HOME:-${HOME}/.cache/torch}"      # torch.hub DINOv2 + Inception weights
+
+# GPUs / CPUs: 2x H200 and 8 CPUs. SLURM sets CUDA_VISIBLE_DEVICES itself; the default
+# only applies on a workstation. 8 CPUs / 2 ranks -> 4 threads per rank, 3 loader
+# workers per rank (WORKERS) so the two main processes keep a core each.
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+
+# Determinism / logging: PYTHONHASHSEED pins Python hashing alongside --seed; NCCL
+# surfaces a dead rank as an error instead of a hang; Python output is unbuffered so
+# the SLURM log follows the run.
+export PYTHONHASHSEED=0
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+export PYTHONUNBUFFERED=1
 
 # --- One console-command call ------------------------------------------------
 diffit-gen-images \
