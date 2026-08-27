@@ -5,7 +5,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-## [3.2.0] — 2026-08-27
+## [0.4.0] — 2026-08-27
+
+Version numbering rejoins the shared `v0.x` tag lineage of the four model repos
+(san-v2, StyleSwin-v2, DiffiT-v2, EDM2-v2 were all tagged `v0.3` together and
+are all `v0.4.0` now). The 2.1.0 / 3.0.0 / 3.1.0 sections below were never
+tagged; the tag covering that period is `v0.3`.
 
 ### Fixed
 - **Eval-tick latents came from the ambient per-rank RNG.** `torch.randn` /
