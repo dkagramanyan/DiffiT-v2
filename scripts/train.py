@@ -26,6 +26,7 @@ import datetime
 import glob
 import importlib.util
 import json
+import math
 import os
 import re
 import tempfile
@@ -180,9 +181,36 @@ def prune_inference_snapshots(run_dir, keep_last):
             pass
 
 
+def print_training_options(c, log_fn=print):
+    """The resolved config dump + summary lines, one ``log_fn`` call per line."""
+    log_fn("Training options:")
+    for line in json.dumps(c, indent=2, default=str).splitlines():
+        log_fn(line)
+    log_fn(f"Output directory:    {c['run_dir']}")
+    log_fn(f"Number of GPUs:      {c['num_gpus']}")
+    log_fn(f"Batch size:          {c['batch_size']} images")
+    log_fn(f"Training duration:   {c['total_kimg']} kimg")
+    log_fn(f"Image size:          {c['image_size']}")
+    log_fn(f"Precision:           {c['precision']}")
+
+
+def startup_header(num_gpus):
+    """One ``[startup]`` line: torch / CUDA versions, device and the relevant env vars (§7)."""
+    parts = [f"torch {torch.__version__}", f"cuda {torch.version.cuda}", f"gpus {num_gpus}",
+             f"device {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'}"]
+    for var in ("CUDA_VISIBLE_DEVICES", "TORCH_CUDA_ARCH_LIST", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        if os.environ.get(var):
+            parts.append(f"{var}={os.environ[var]}")
+    return "[startup] " + " | ".join(parts)
+
+
 def subprocess_fn(rank, c, temp_dir):
     """Entry point for each DDP worker."""
     logger.configure(c["run_dir"], run_name=os.path.basename(c["run_dir"]), is_main=(rank == 0))
+    # Config dump + startup header, written first thing so the .log is self-sufficient (§7).
+    if rank == 0:
+        print_training_options(c, logger.log)
+        logger.log(startup_header(c["num_gpus"]))
 
     # Pin this process to its GPU *before* initializing the NCCL process group.
     torch.cuda.set_device(rank)
@@ -206,14 +234,15 @@ def subprocess_fn(rank, c, temp_dir):
 # ---------------------------------------------------------------------------
 
 
-def _write_run_hparams(run_dir, writer, metrics):
+def _write_run_hparams(run_dir, writer, metrics, step):
     """Record this run's configuration in TensorBoard's HPARAMS tab (§7).
 
     The config is read back from ``training_options.json``, already written by the
     launcher, so nothing has to be threaded through the training-loop signature.
     Paired with the run's final metrics this is what makes runs comparable in
     TensorBoard: without it the curves are there but nothing says which configuration
-    produced them.
+    produced them. ``step`` (= cur_nimg) puts the summary into the run's own event
+    file (combra >= 0.15.3).
     """
     import json
     import os
@@ -227,7 +256,7 @@ def _write_run_hparams(run_dir, writer, metrics):
         return
     with open(path) as fh:
         config = json.load(fh)
-    write_hparams(writer, config, metrics)
+    write_hparams(writer, config, metrics, step=step)
 
 
 def build_stats_row(loss_kvs, *, kimg, tick, sec_per_tick, sec_per_kimg,
@@ -252,6 +281,43 @@ def build_stats_row(loss_kvs, *, kimg, tick, sec_per_tick, sec_per_kimg,
     row["Resources/peak_gpu_mem_reserved_gb"] = gpu_reserved_gb
     row["LearningRate/lr"] = lr
     return row
+
+
+def stats_jsonl_line(row, *, now, start_time):
+    """One ``stats.jsonl`` line: the tick row plus the time columns (§7).
+
+    Non-finite values are written as ``null`` (``load_fid_by_kimg`` skips them); a
+    bare ``NaN`` token is not JSON.
+    """
+    fields = dict(row, timestamp=now, wall_time=now - start_time,
+                  datetime=datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"))
+    fields = {k: None if isinstance(v, float) and not math.isfinite(v) else v
+              for k, v in fields.items()}
+    return json.dumps(fields, allow_nan=False)
+
+
+def format_time(seconds):
+    """dnnlib.util.format_time: "12s", "3m 04s", "1h 02m 03s", "2d 03h 04m"."""
+    s = int(np.rint(seconds))
+    if s < 60:
+        return f"{s}s"
+    elif s < 60 * 60:
+        return f"{s // 60}m {s % 60:02d}s"
+    elif s < 24 * 60 * 60:
+        return f"{s // 3600}h {(s // 60) % 60:02d}m {s % 60:02d}s"
+    else:
+        return f"{s // 86400}d {(s // 3600) % 24:02d}h {(s // 60) % 60:02d}m"
+
+
+def tick_status_line(*, tick, kimg, total_sec, sec_per_tick, sec_per_kimg,
+                     maintenance_sec, cpu_mem_gb, gpu_mem_gb, gpu_reserved_gb):
+    """The rank-0 per-tick console line (shared format across the four repos)."""
+    return (
+        f"tick {tick:<5d} kimg {kimg:<9.1f} time {format_time(total_sec):<12s} "
+        f"sec/tick {sec_per_tick:<8.1f} sec/kimg {sec_per_kimg:<8.2f} "
+        f"maintenance {maintenance_sec:<6.1f} cpumem {cpu_mem_gb:<6.2f} "
+        f"gpumem {gpu_mem_gb:<6.2f} reserved {gpu_reserved_gb:<6.2f}"
+    )
 
 
 def combra_smoke_test(ref_images, device, log_fn=print):
@@ -353,15 +419,6 @@ def training_loop(
     torch.manual_seed(seed + rank)
     np.random.seed(seed + rank)
 
-    # Startup header, written first thing so the .log is self-sufficient (§7).
-    if is_main:
-        logger.log(f"Run: {os.path.basename(run_dir)}")
-        logger.log(f"torch {torch.__version__}, CUDA {torch.version.cuda}, "
-                   f"GPUs={num_gpus} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'})")
-        for var in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "CUDA_VISIBLE_DEVICES"):
-            if var in os.environ:
-                logger.log(f"env {var}={os.environ[var]}")
-
     # Resolve precision: fp32 = no autocast; fp16 = autocast + GradScaler;
     # bf16 = autocast, no scaler (§2). GradScaler is used only for fp16.
     if precision == "bf16" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
@@ -403,7 +460,8 @@ def training_loop(
     # load a previous stage's EMA weights into both the trainable model and the
     # EMA copy; fresh optimizer, cur_nimg resets to 0. This replaces --resume.
     if init_weights is not None:
-        logger.log(f"Warm-starting from EMA weights in {init_weights}...")
+        if is_main:
+            logger.log(f"Warm-starting from EMA weights in {init_weights}...")
         warm_sd = extract_inference_state_dict(load_state_dict(init_weights, map_location="cpu"))
         model.load_state_dict(warm_sd)
 
@@ -445,7 +503,8 @@ def training_loop(
     cur_nimg = 0
 
     # Data loader — mirror is the loader-level per-item horizontal flip (§2).
-    logger.log("Loading data...")
+    if is_main:
+        logger.log("Loading data...")
     data_iter = load_data(
         data_dir=data,
         batch_size=batch_gpu,
@@ -616,6 +675,9 @@ def training_loop(
                     grid_images.append(np.zeros((1, 3, image_size, image_size), dtype=np.uint8))
         real_np = np.concatenate(grid_images, axis=0)
         save_image_grid(real_np, os.path.join(run_dir, "reals.png"), drange=[0, 255], grid_size=grid_size)
+        if stats_tfevents is not None:
+            stats_tfevents.add_image("Reals", save_image_grid_to_array(real_np, grid_size),
+                                     global_step=0, dataformats="HWC")
         del class_images, collect_iter
 
     # Fixed latents + class-sorted classes for consistent snapshot generation.
@@ -637,6 +699,9 @@ def training_loop(
             sampler=eval_sampler, num_sampling_steps=eval_sampling_steps,
         )
         save_image_grid(fakes_init, os.path.join(run_dir, "fakes_init.png"), drange=[0, 255], grid_size=grid_size)
+        if stats_tfevents is not None:
+            stats_tfevents.add_image("Fakes", save_image_grid_to_array(fakes_init, grid_size),
+                                     global_step=0, dataformats="HWC")
 
     if num_gpus > 1:
         dist.barrier()
@@ -654,15 +719,6 @@ def training_loop(
     maintenance_time = 0.0  # measured at the end of a tick, reported on the next
     cur_tick = 0
     best_fid = float("inf")   # running best combra FID -> Metrics/combra_fid_best
-
-    def _format_time(seconds):
-        s = int(seconds)
-        if s < 60:
-            return f"{s}s"
-        elif s < 3600:
-            return f"{s // 60}m {s % 60:02d}s"
-        else:
-            return f"{s // 3600}h {(s % 3600) // 60:02d}m {s % 60:02d}s"
 
     while cur_nimg < total_kimg * 1000:
         opt.zero_grad(set_to_none=True)
@@ -731,12 +787,13 @@ def training_loop(
                 gpumem = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
                 reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
 
-            logger.log(
-                f"tick {cur_tick:<6d} kimg {kimg_done:<10.1f} "
-                f"time {_format_time(total_elapsed):<14s} "
-                f"sec/tick {sec_per_tick:<9.1f} sec/kimg {sec_per_kimg:<9.2f} "
-                f"cpumem {cpumem:<7.2f} gpumem {gpumem:<8.2f} reserved {reserved:<8.2f}"
-            )
+            if is_main:
+                logger.log(tick_status_line(
+                    tick=cur_tick, kimg=kimg_done, total_sec=total_elapsed,
+                    sec_per_tick=sec_per_tick, sec_per_kimg=sec_per_kimg,
+                    maintenance_sec=maintenance_time,
+                    cpu_mem_gb=cpumem, gpu_mem_gb=gpumem, gpu_reserved_gb=reserved,
+                ))
 
             # Per-tick scalar row (§7 namespaces; step = cur_nimg everywhere).
             row = build_stats_row(
@@ -760,25 +817,25 @@ def training_loop(
             # the newest snapshot is always the final model.
             do_snap = (cur_tick % snap == 0) or is_last_tick
             if do_snap:
-                snap_start = time.time()
-
                 if is_main:
-                    logger.log(f"Saving image snapshot (kimg={cur_nimg / 1e3:.1f})...")
                     fakes = generate_snapshot_images(
                         ema_model, vae, eval_diffusion, grid_z, grid_classes,
                         batch_gpu=batch_gpu, device=device,
                         cfg_scale=cfg_scale, null_class_idx=num_dataset_classes,
                         sampler=eval_sampler, num_sampling_steps=eval_sampling_steps,
                     )
+                    fakes_name = f"fakes{cur_nimg // 1000:06d}.png"
                     save_image_grid(
-                        fakes, os.path.join(run_dir, f"fakes{cur_nimg // 1000:06d}.png"),
+                        fakes, os.path.join(run_dir, fakes_name),
                         drange=[0, 255], grid_size=grid_size,
                     )
+                    logger.log(f"Saved {fakes_name}")
                     if stats_tfevents is not None:
                         grid_u8 = save_image_grid_to_array(fakes, grid_size)
                         stats_tfevents.add_image("Fakes", grid_u8, global_step=cur_nimg, dataformats="HWC")
 
                 if num_fid_samples > 0:
+                    eval_start = time.time()
                     stats_metrics = evaluate_metrics(
                         ema_model, vae, eval_diffusion, ref_acts, inception_extractor,
                         num_fid_samples, batch_gpu, latent_size, device,
@@ -797,36 +854,39 @@ def training_loop(
                         if "combra_fid" in stats_metrics:
                             best_fid = min(best_fid, float(stats_metrics["combra_fid"]))
                             row["Metrics/combra_fid_best"] = best_fid
+                        logged = {k[len("Metrics/"):]: v for k, v in row.items() if k.startswith("Metrics/")}
+                        if logged:
+                            logger.log("Metrics: " + "  ".join(f"{k} {v:.4f}" for k, v in logged.items()))
+                    if is_main:
+                        # Only on ticks that ran an eval (§7).
+                        row["Timing/eval_sec"] = time.time() - eval_start
 
                 if is_main:
-                    row["Timing/eval_sec"] = time.time() - snap_start
                     path = save_inference_snapshot(ema_model, run_dir, cur_nimg, ckpt_meta)
                     prune_inference_snapshots(run_dir, snapshot_keep_last)
-                    logger.log(f"Snapshot saved: {os.path.basename(path)}")
+                    logger.log(f"Saved {os.path.basename(path)}")
 
             # Write the one scalar row for this tick (§7).
             if is_main:
                 if stats_jsonl is not None:
-                    now = time.time()
-                    fields = dict(row, wall_time=now - start_time,
-                                  datetime=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-                    stats_jsonl.write(json.dumps(fields) + "\n")
+                    stats_jsonl.write(stats_jsonl_line(row, now=time.time(), start_time=start_time) + "\n")
                     stats_jsonl.flush()
                 if stats_tfevents is not None:
                     for name, value in row.items():
-                        if isinstance(value, (int, float)):
+                        if isinstance(value, (int, float)) and math.isfinite(value):
                             stats_tfevents.add_scalar(name, value, global_step=cur_nimg)
                     stats_tfevents.flush()
 
-    if stats_jsonl is not None:
-        stats_jsonl.close()
     if is_main and stats_tfevents is not None:
         _write_run_hparams(run_dir, stats_tfevents,
-                           {'Metrics/combra_fid_best': float(best_fid)})
+                           {'Metrics/combra_fid_best': float(best_fid)}, step=cur_nimg)
     if stats_tfevents is not None:
         stats_tfevents.close()
+    if stats_jsonl is not None:
+        stats_jsonl.close()
+    if is_main:
+        logger.log("Training complete.")
     logger.close()
-    logger.log("Training complete.")
 
 
 def save_image_grid_to_array(img, grid_size):
@@ -855,19 +915,9 @@ def launch_training(c, desc, outdir, dry_run):
     cur_run_id = max(prev_run_ids, default=-1) + 1
     c["run_dir"] = os.path.join(outdir, f"{cur_run_id:05d}-{desc}")
 
-    print()
-    print("Training options:")
-    print(json.dumps(c, indent=2, default=str))
-    print()
-    print(f"Output directory:    {c['run_dir']}")
-    print(f"Number of GPUs:      {c['num_gpus']}")
-    print(f"Batch size:          {c['batch_size']} images")
-    print(f"Training duration:   {c['total_kimg']} kimg")
-    print(f"Image size:          {c['image_size']}")
-    print(f"Precision:           {c['precision']}")
-    print()
-
+    # A real run prints the options from rank 0 once its .log exists (subprocess_fn).
     if dry_run:
+        print_training_options(c)
         print("Dry run; exiting.")
         return
 

@@ -6,6 +6,24 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Changed
+- **Training log follows the unified four-repo style (§7); combra pin `v0.15.1` →
+  `v0.15.3`.** No change to training, eval, sampling or checkpoints.
+  - `.log`: the resolved config dump moved from the launcher into the rank-0 `.log`
+    (printed once; `--dry-run` still prints it), followed by one
+    `[startup] torch … | cuda … | gpus … | device … | K=V …` line.
+  - Only rank 0 prints progress: the tick line, warm-start, data-loading and
+    dataset RAM-caching lines no longer repeat per rank.
+  - Tick line gains `maintenance`, uses the shared column widths and
+    dnnlib-style `format_time` (days past 24 h).
+  - Eval prints `Evaluating combra metrics (N samples, G GPUs)...` and one
+    `Metrics: k v  k v …` line (incl. `combra_fid_best`) instead of one line per
+    metric; snapshots print `Saved <file>` for the fakes png and the `.pt`.
+  - `Training complete.` is now written before the log closes (it was lost).
+  - `stats.jsonl`: `timestamp` column; non-finite values written as `null`
+    (`allow_nan=False`); `Timing/eval_sec` only on ticks that ran an eval.
+  - TensorBoard: non-finite scalars skipped; `Reals` and `Fakes` (fakes_init)
+    images at step 0; hparams written at `step=cur_nimg` into the run's own event
+    file (needs combra 0.15.3), before the writer closes.
 - **combra pin `v0.13.0` → `v0.15.1`.** The code and tests already expected the
   0.14.0 metric key `pi` (in place of `share1`/`share2`), but a fresh
   `pip install -e '.[combra]'` still resolved 0.13.0 and logged the old keys. 0.15.x

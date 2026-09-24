@@ -60,7 +60,12 @@ def test_sample_grid_reaches_tensorboard(source):
     # §7 lists `Fakes` as an image every snapshot tick. san-v2 wrote the grid to disk
     # only, so the repo the proposal calls the reference implementation was the one
     # place the grid never reached TensorBoard.
-    assert "add_image" in source and "Fakes" in source
+    assert "add_image" in source and "Fakes" in source and "Reals" in source
+
+
+def test_non_finite_scalars_are_skipped(source):
+    # A NaN/inf scalar poisons TensorBoard's axis range; stats.jsonl writes it as null.
+    assert "math.isfinite" in source and "allow_nan=False" in source
 
 
 def test_event_file_is_self_identifying(source):

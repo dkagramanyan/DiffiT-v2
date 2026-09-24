@@ -559,6 +559,7 @@ def main(**opts):
                         null_class_idx=num_dataset_classes,
                     )
                     if is_main() and stats_metrics is not None:
+                        log("Metrics: " + "  ".join(f"{k} {v:.4f}" for k, v in stats_metrics.items()))
                         _write_scalars(
                             {f"Metrics/{k}": v for k, v in stats_metrics.items()},
                             step=kimg,

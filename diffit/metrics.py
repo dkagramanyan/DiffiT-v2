@@ -372,12 +372,15 @@ def evaluate_metrics(
     if log_fn is None:
         log_fn = lambda *a, **k: None
 
+    # combra metrics are sharded across ranks. The signal must be uniform across
+    # ranks (combra_ref is rank-0 only), so key off inception_metrics, which train.py
+    # sets collectively. Every rank extracts the image features and the pooled angles
+    # from its own generated shard and the rows are gathered to rank 0.
+    combra_active = (not inception_metrics) and HAS_COMBRA
     if rank == 0:
-        n_cls = len(class_list) if class_list is not None else NUM_CLASSES
         log_fn(
-            f"Evaluating metrics ({num_fid_samples} samples across "
-            f"{world_size} GPU(s), sampler={sampler}×{num_sampling_steps}, "
-            f"cfg_scale={cfg_scale}, classes={n_cls})..."
+            f"Evaluating {'combra ' if combra_active else ''}metrics "
+            f"({num_fid_samples} samples, {world_size} GPUs)..."
         )
     local_fakes = _generate_local_shard(
         ema_model, vae, diffusion, num_fid_samples, batch_gpu, latent_size, device,
@@ -387,11 +390,6 @@ def evaluate_metrics(
         class_list=class_list, null_class_idx=null_class_idx,
     )
 
-    # combra metrics are sharded across ranks. The signal must be uniform across
-    # ranks (combra_ref is rank-0 only), so key off inception_metrics, which train.py
-    # sets collectively. Every rank extracts the image features and the pooled angles
-    # from its own generated shard and the rows are gathered to rank 0.
-    combra_active = (not inception_metrics) and HAS_COMBRA
     gen_feats, gen_angles = (
         _combra_gather_generated(local_fakes, device, rank, world_size)
         if combra_active else (None, None)
@@ -439,8 +437,7 @@ def evaluate_metrics(
                     metrics[f"combra_{k}"] = float(v)
                 metrics["combra_num_fid_samples"] = float(num_fid_samples)
             except Exception as e:  # combra failure must not abort the eval tick
-                log_fn(f"  combra metrics failed: {e}")
-        for k, v in metrics.items():
-            log_fn(f"  {k}: {v:.4f}")
+                log_fn(f"combra metrics failed: {e}")
+        # The caller logs the one "Metrics: ..." line (it adds combra_fid_best).
         return metrics
     return None

@@ -18,8 +18,17 @@ import random
 import zipfile
 
 import numpy as np
+import torch.distributed as dist
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
+
+from diffit import logger
+
+
+def _log0(msg):
+    """Progress line through the run logger, rank 0 only (§7)."""
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        logger.log(msg)
 
 
 def read_class_meta(data_dir):
@@ -231,14 +240,14 @@ class ImageDataset(Dataset):
         self._cache = None
 
         if cache_in_ram:
-            print(f"Caching {len(image_paths)} images in RAM...")
+            _log0(f"Caching {len(image_paths)} images in RAM...")
             self._cache = []
             for i, path in enumerate(image_paths):
                 with open(path, "rb") as f:
                     self._cache.append(f.read())
                 if (i + 1) % 10000 == 0:
-                    print(f"  cached {i + 1}/{len(image_paths)} images")
-            print(f"All {len(image_paths)} images cached in RAM.")
+                    _log0(f"  cached {i + 1}/{len(image_paths)} images")
+            _log0(f"All {len(image_paths)} images cached in RAM.")
 
     def __len__(self):
         return len(self.image_paths)
@@ -303,14 +312,14 @@ class ZipImageDataset(Dataset):
                     }
 
             if cache_in_ram:
-                print(f"Caching {len(self._image_fnames)} images in RAM from {zip_path}...")
+                _log0(f"Caching {len(self._image_fnames)} images in RAM from {zip_path}...")
                 self._cache = {}
                 for i, fname in enumerate(self._image_fnames):
                     with zf.open(fname) as f:
                         self._cache[fname] = f.read()
                     if (i + 1) % 10000 == 0:
-                        print(f"  cached {i + 1}/{len(self._image_fnames)} images")
-                print(f"All {len(self._image_fnames)} images cached in RAM.")
+                        _log0(f"  cached {i + 1}/{len(self._image_fnames)} images")
+                _log0(f"All {len(self._image_fnames)} images cached in RAM.")
 
     def _open_zip(self):
         if self._zipfile is None:
