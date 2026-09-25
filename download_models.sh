@@ -6,24 +6,27 @@
 # need no network.
 #
 # Two cache families are populated:
-#   * torch.hub / clip caches  -- via plain wget/curl/git (combra backbones +
+#   * torch.hub cache          -- via plain wget/curl/git (combra backbones +
 #     the torchvision InceptionV3 used for inline FID/IS).
-#   * HuggingFace cache        -- the two SD-VAE decoders, via huggingface-cli
+#   * HuggingFace cache        -- the combra CLIP weights (laid out by hand) and
+#     the two SD-VAE decoders, via huggingface-cli
 #     (falls back to `python scripts/download_models.py` if the CLI is absent).
 #
 # URLs and on-disk filenames are pinned to what the installed libraries expect
-# (pytorch-fid, open_clip 'openai', torch.hub dinov2, torchvision inception).
+# (pytorch-fid, open_clip 'openai' via the HuggingFace hub, torch.hub dinov2, torchvision inception).
 #
 # Usage:
 #   bash download_models.sh                      # caches under $HOME/.cache (defaults)
 #   MODEL_CACHE=/shared/team/caches bash download_models.sh
+# With MODEL_CACHE set, point the jobs at it:
+#   export TORCH_HOME=$MODEL_CACHE/torch HF_HOME=$MODEL_CACHE/huggingface
 set -u
 
 MODEL_CACHE="${MODEL_CACHE:-$HOME/.cache}"
 HUB_CKPT="${MODEL_CACHE}/torch/hub/checkpoints"   # torchvision + pytorch-fid + dinov2 weights
 HUB_DIR="${MODEL_CACHE}/torch/hub"                # torch.hub repo code (dinov2)
-CLIP_DIR="${MODEL_CACHE}/clip"                    # open_clip 'openai' weights
-mkdir -p "$HUB_CKPT" "$HUB_DIR" "$CLIP_DIR"
+HF_HUB="${MODEL_CACHE}/huggingface/hub"           # HuggingFace hub cache (open_clip weights)
+mkdir -p "$HUB_CKPT" "$HUB_DIR" "$HF_HUB"
 
 if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
     echo "ERROR: need wget or curl on PATH." >&2
@@ -53,8 +56,17 @@ fetch "https://download.pytorch.org/models/inception_v3_google-0cc3c7bd.pth" "$H
 echo; echo "[2/4] InceptionV3 FID weights (combra fid) -> $HUB_CKPT"
 fetch "https://github.com/mseitzer/pytorch-fid/releases/download/fid_weights/pt_inception-2015-12-05-6726825d.pth" "$HUB_CKPT/pt_inception-2015-12-05-6726825d.pth"
 
-echo; echo "[3/4] CLIP ViT-L-14-336 'openai' (combra cmmd) -> $CLIP_DIR"
-fetch "https://openaipublic.azureedge.net/clip/models/3035c92b350959924f9f00213499208652fc7ea050643e8b385c2dac08641f02/ViT-L-14-336px.pt" "$CLIP_DIR/ViT-L-14-336px.pt"
+echo; echo "[3/4] CLIP ViT-L-14-336 'openai' (combra cmmd) -> $HF_HUB"
+# open_clip loads the 'openai' tag from the HF repo timm/vit_large_patch14_clip_336.openai
+# (huggingface_hub is one of its dependencies), so lay the file out as the HF hub cache
+# does: blobs/<sha256>, snapshots/<rev>/<file> -> blob, refs/main = <rev>.
+CLIP_REV="81e38efc4637de5023b10e75a7f9bd1c6fa6b010"
+CLIP_SHA="fbc415c3d0d7b79faed8f5ccfb740c32b7c4f5ffe7283b851f89c6231c01a8e0"
+CLIP_REPO_DIR="$HF_HUB/models--timm--vit_large_patch14_clip_336.openai"
+mkdir -p "$CLIP_REPO_DIR/blobs" "$CLIP_REPO_DIR/refs" "$CLIP_REPO_DIR/snapshots/$CLIP_REV"
+fetch "https://huggingface.co/timm/vit_large_patch14_clip_336.openai/resolve/$CLIP_REV/open_clip_model.safetensors" "$CLIP_REPO_DIR/blobs/$CLIP_SHA" \
+    && ln -sfn "../../blobs/$CLIP_SHA" "$CLIP_REPO_DIR/snapshots/$CLIP_REV/open_clip_model.safetensors" \
+    && printf '%s' "$CLIP_REV" > "$CLIP_REPO_DIR/refs/main"
 
 echo; echo "[4/4] DINOv2 dinov2_vitl14 (combra fd_dinov2) -> $HUB_CKPT"
 fetch "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth" "$HUB_CKPT/dinov2_vitl14_pretrain.pth"
@@ -74,7 +86,7 @@ fi
 # available; otherwise fall back to the Python downloader which uses the
 # diffusers/HF hub client directly. Newer huggingface_hub ships `hf` and turns
 # `huggingface-cli` into a deprecation stub that exits non-zero, so prefer `hf`.
-echo; echo "[VAE] stabilityai/sd-vae-ft-ema + sd-vae-ft-mse -> HuggingFace cache"
+echo; echo "[VAE] stabilityai/sd-vae-ft-ema + sd-vae-ft-mse -> $HF_HUB"
 if command -v hf >/dev/null 2>&1; then
     hf_cmd="hf"
 elif command -v huggingface-cli >/dev/null 2>&1; then
@@ -85,7 +97,7 @@ fi
 if [[ -n "$hf_cmd" ]]; then
     for repo in stabilityai/sd-vae-ft-ema stabilityai/sd-vae-ft-mse; do
         echo "  downloading: $repo"
-        "$hf_cmd" download "$repo" >/dev/null \
+        "$hf_cmd" download "$repo" --cache-dir "$HF_HUB" >/dev/null \
             || { echo "  FAILED: $repo"; status=1; }
     done
 else
@@ -95,7 +107,7 @@ fi
 
 echo
 if [[ $status -eq 0 ]]; then
-    echo "Done. All weights cached under $MODEL_CACHE (+ HuggingFace cache for the VAEs)."
+    echo "Done. All weights cached under $MODEL_CACHE."
 else
     echo "Some downloads failed (see above)."
 fi
