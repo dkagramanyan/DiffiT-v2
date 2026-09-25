@@ -209,140 +209,99 @@ can still override any preset value.
 | `diffit-512` | 512 | DiffiT-XL/2 | 1e-4 | bf16 | 400000 | 1.49 (constant) | off |
 | `diffit-1024` | 1024 | DiffiT-XL/2 | 1e-4 | bf16 | 400000 | 1.49 (constant) | on |
 
-Paper's recipe (Appendix I.2, p.22): LR 3e-4 / batch 256 (ImageNet-256), LR 1e-4 / batch 512 (ImageNet-512), EMA 0.9999, DDPM sampler 250 steps, ADM diffusion hyperparameters. The paper names no optimizer, weight decay or warmup for the latent models, so those follow DiT (`facebookresearch/DiT` `train.py`): AdamW, weight decay 0, constant LR, no warmup. `diffit-1024` (no paper recipe) reuses the 512 LR and keeps a 1000-kimg linear LR warmup, since it is normally a warm-started stage; the 256/512 presets use none, but `sh/train_512.sh` adds a 1000-kimg warmup (`LR_WARMUP`) when `INIT_WEIGHTS` warm-starts it. `sh/generate_*.sh` default to the paper's DDPM sampler with 250 steps.
+Paper's recipe (Appendix I.2, p.22): LR 3e-4 / batch 256 (ImageNet-256), LR 1e-4 / batch 512 (ImageNet-512), EMA 0.9999, DDPM sampler 250 steps, ADM diffusion hyperparameters. The paper names no optimizer, weight decay or warmup for the latent models, so those follow DiT (`facebookresearch/DiT` `train.py`): AdamW, weight decay 0, constant LR, no warmup. `diffit-1024` (no paper recipe) reuses the 512 LR and keeps a 1000-kimg linear LR warmup, since it is normally a warm-started stage; the 256/512 presets use none, but `sh/train_512.sh` adds a 1000-kimg warmup (`LR_WARMUP`) when `INIT_WEIGHTS` warm-starts it. `sh/generate_*.sh` default to the paper's DDPM sampler with 250 steps. The CFG scales are the official repo's `sample.py` commands (4.4 at 256 with the power-cosine schedule, 1.49 at 512); the paper's §5.8 text gives 4.6 at 256.
 
-### Training strategies
+### Training stages: 256² → 512² → 1024²
 
-You have two viable approaches. **We strongly recommend the progressive-finetune path** (B) — it is 3–5× cheaper and historically reaches better final FID than independent from-scratch runs at higher resolutions.
+`sh/train_256.sh`, `sh/train_512.sh` and `sh/train_1024.sh` run three stages, each on
+its preset with no LR override. The 512² and 1024² stages normally warm-start from the
+previous stage with `INIT_WEIGHTS`:
 
----
+| Stage | Preset | LR | LR warmup | Global batch (2× H200) | Start |
+|---|---|---|---|---|---|
+| 256² | `diffit-256` | 3e-4 (paper) | none | 256 = 128 × 2 (paper) | from scratch |
+| 512² | `diffit-512` | 1e-4 (paper) | 1000 kimg when `INIT_WEIGHTS` is set (`LR_WARMUP`), else none | 128 = 64 × 2 (paper: 512) | 256² snapshot, or from scratch |
+| 1024² | `diffit-1024` | 1e-4 (no paper value) | 1000 kimg (preset) | 64 = 16 × 2 × 2 accum | 512² snapshot |
 
-### Strategy A: From scratch at each resolution
+What the paper (arXiv 2312.02139 App. I.2) fixes: *"We employ learning rates of
+3×10⁻⁴ and 1×10⁻⁴ and batch sizes of 256 and 512 for ImageNet-256 and ImageNet-512
+experiments, respectively. We also use the exponential moving average (EMA) of weights
+using a decay of 0.9999 for both experiments."* It trains the two resolutions separately
+(§4.1: *"We have trained the latent DiffiT model on ImageNet-512 and ImageNet-256 dataset
+respectively"*) and gives no training length, optimizer, warmup or fine-tuning recipe;
+[NVlabs/DiffiT](https://github.com/NVlabs/DiffiT) releases sampling code and weights
+only, no training configs. So the fine-tune stages keep the paper LRs, and the
+1000-kimg warmup of a warm-started stage (fresh AdamW on trained weights) is this fork's
+choice. 1024² has no paper recipe. Every stage runs the preset's `total_kimg` (400000)
+unless `--kimg` is passed; there is no resume, so size it to the walltime (below).
 
-Use this if you need apples-to-apples per-resolution baselines for a paper.
-
-**Cost warning:** on 2× H200 with the default `total_kimg=400000`, each run takes roughly:
-
-| Resolution | Est. walltime (2× H200, bf16) |
-|---|---|
-| 256² | ~10–20 days |
-| 512² | ~25–45 days |
-| 1024² | ~50–100 days |
-
-Total sequential: 3–5 months. Shrink `--kimg` to something reachable (e.g. `--kimg=100000`) or plan for multi-job resume chains.
-
-#### 256² from scratch
-
-```bash
-diffit-train --outdir=./training-runs \
-    --cfg=diffit-256 \
-    --data=./datasets/imagenet_256x256.zip \
-    --gpus 2 \
-    --batch-gpu 128
-```
-Global batch = 256, the paper's (Section I.2), with LR 3e-4 and EMA 0.9999; no gradient accumulation.
-
-#### 512² from scratch
+The same stages called directly (the scripts add `--augment True`, combra metrics,
+`--seed 42`, `--snapshot-keep-last 1` and the dataset paths below):
 
 ```bash
-diffit-train --outdir=./training-runs \
-    --cfg=diffit-512 \
-    --data=./datasets/imagenet_512x512.zip \
-    --gpus 2 \
-    --batch-gpu 64 \
-    --lr-warmup 1000
-```
-Global batch = 128. LR warmup is recommended for from-scratch high-res runs.
+# 256² from scratch
+diffit-train --outdir=./training-runs --cfg=diffit-256 \
+    --data=./datasets/imagenet_9to4_1024x1024_256x256.zip --gpus 2 --batch-gpu 128
 
-#### 1024² from scratch
-
-```bash
-diffit-train --outdir=./training-runs \
-    --cfg=diffit-1024 \
-    --data=./datasets/imagenet_1024x1024.zip \
-    --gpus 2 \
-    --batch-gpu 16 \
-    --grad-accum 4
-```
-Global effective batch = 16 × 2 × 4 = 128. With RoPE+FlashAttention you may be able to drop `--grad-accum` and/or disable checkpointing (`--grad-ckpt False`) — start conservative and raise `--batch-gpu` once you confirm it fits.
-
----
-
-### Strategy B: Progressive finetuning (recommended)
-
-RoPE-2D lets you re-use a 256² checkpoint at higher resolutions — something the original learned-bias DiffiT could not do. This cuts total compute by ~3–5× and typically yields better final FID.
-
-**Step 1. Train 256² from scratch** (same as Strategy A):
-
-```bash
-diffit-train --outdir=./training-runs \
-    --cfg=diffit-256 \
-    --data=./datasets/imagenet_256x256.zip \
-    --gpus 2 \
-    --batch-gpu 128
-```
-Let it run until FID plateaus on the inline eval (check TensorBoard). For a strong base, aim for 100k–200k kimg.
-
-**Step 2. Finetune 256² → 512²**:
-
-```bash
-diffit-train --outdir=./training-runs \
-    --cfg=diffit-512 \
-    --data=./datasets/imagenet_512x512.zip \
-    --gpus 2 \
-    --batch-gpu 64 \
+# 512², warm-started from the 256² run
+diffit-train --outdir=./training-runs --cfg=diffit-512 \
+    --data=./datasets/imagenet_9to4_1024x1024_512x512.zip --gpus 2 --batch-gpu 64 \
     --init-weights ./training-runs/00000-diffit-256-*/diffit-snapshot-<kimg>-inference.pt \
-    --lr 5e-5 \
-    --lr-warmup 500 \
-    --kimg 100000
+    --lr-warmup 1000
+
+# 1024², warm-started from the 512² run (the preset has the warmup, accum 2 and checkpointing)
+diffit-train --outdir=./training-runs --cfg=diffit-1024 \
+    --data=./datasets/imagenet_9to4_1024x1024_1024x1024.zip --gpus 2 --batch-gpu 16 \
+    --init-weights ./training-runs/00001-diffit-512-*/diffit-snapshot-<kimg>-inference.pt
 ```
+
+A 512² run from scratch is the same command without `--init-weights` and `--lr-warmup`
+(`sh/train_512.sh` with `INIT_WEIGHTS` unset): the paper's constant LR 1e-4.
+
 `--init-weights` is a weights-only warm start (loads the previous stage's EMA
 weights, fresh optimizer) — not a resume. Use the previous stage's
 **best-by-`combra_fid` snapshot**: the file its `.log`'s last `Best snapshots:` line
 names for `combra_fid` (the newest snapshot if that run had no eval). The same file
-goes into `INIT_WEIGHTS` for `sh/train_*.sh`. Lower LR (5e-5 ≈ half of the
-`diffit-512` default) for finetuning, short warmup, and a smaller total-kimg
-budget — finetuning converges faster than from-scratch.
+goes into `INIT_WEIGHTS` for `sh/train_*.sh`.
 
-**Step 3. Finetune 512² → 1024²**:
-
-```bash
-diffit-train --outdir=./training-runs \
-    --cfg=diffit-1024 \
-    --data=./datasets/imagenet_1024x1024.zip \
-    --gpus 2 \
-    --batch-gpu 16 \
-    --init-weights ./training-runs/00001-diffit-512-*/diffit-snapshot-<kimg>-inference.pt \
-    --lr 2e-5 \
-    --lr-warmup 500 \
-    --kimg 50000
-```
-
-**Why this works:** RoPE encodes positions via rotation, not learned weights. The frequency table is regenerated at the target grid size at load time (non-persistent buffer), so the saved state dict transplants cleanly. The rest of the network (QKV, QK-norm scales, SwiGLU, final linear) sees the same per-token distribution at any resolution — it just processes more tokens per image.
+**Why the weights transfer:** RoPE encodes positions via rotation, not learned weights. The frequency table is regenerated at the target grid size at load time (non-persistent buffer), so the saved state dict transplants cleanly. The rest of the network (QKV, QK-norm scales, SwiGLU, final linear) sees the same per-token distribution at any resolution — it just processes more tokens per image.
 
 ---
 
 ### Cluster launch (`sh/` scripts)
 
 Cluster launches are plain shell scripts under `sh/` — no `.sbatch` files in the
-repo. Each self-locates the repo root, activates the conda env (`CONDA_ENV`,
-default `diffit-v2`), sets the offline-cluster contract (`HF_HUB_OFFLINE=1`,
-`TRANSFORMERS_OFFLINE=1`), and makes one `diffit-*` console call. SLURM specifics
-are supplied at submission time — never hardcoded:
+repo. Each `train_*.sh` lists every knob in a **run-settings block** at the top
+(`NAME="${NAME:-default}"`: `DATA`, `OUTDIR`, `GPUS`, `BATCH_GPU`, `INIT_WEIGHTS`,
+`SEED`, `CONDA_ENV`, …); set any of them in the environment to override it, and extra
+`diffit-train` flags pass through after the script name. The script self-locates the
+repo root, activates the conda env (default `diffit-v2`), sets the offline-cluster
+contract (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`) and makes one `diffit-train`
+call. SLURM specifics are supplied at submission time — never hardcoded:
 
 ```bash
-# workstation
-DATA=./datasets/imagenet_256x256.zip bash sh/train_256.sh
+# workstation: detaches, prints the log path and pid, and returns
+DATA=./datasets/imagenet_9to4_1024x1024_256x256.zip bash sh/train_256.sh
+tail -f logs/diffit-train_256-<date>.log         # follow
+kill -- -"$(cat logs/diffit-train_256-<date>.pid)"   # stop the whole run (process group)
 
-# cluster (account / partition / gpus at submit time)
-DATA=./datasets/imagenet_256x256.zip \
-  sbatch --account=<proj> --partition=<part> --gpus=2 sh/train_256.sh
+# workstation, attached to the terminal (output still copied to logs/)
+FOREGROUND=1 bash sh/train_256.sh
+
+# cluster (account / partition / gpus at submit time); never detaches
+sbatch --account=<proj> --partition=<part> --nodes=1 --gpus=2 --cpus-per-task=8 --time=3-0:0 sh/train_256.sh
 ```
 
-Override `OUTDIR` / `GPUS` / `BATCH_GPU` (and, for generation, `NETWORK` /
-`SAMPLES_PER_CLASS`) via env vars; extra `diffit-train` flags pass through after
-the script name. Prefetch backbones once on a login node with
-`diffit-download-models` before an offline run.
+On a workstation the script re-launches itself with `setsid nohup`, so the run survives
+closing the terminal; everything it prints goes to `logs/<name>-<date>.log` (git-ignored)
+with the run's pid in a `.pid` file beside it. Under SLURM the output goes to both the
+slurm `.out` and that log. Each log starts with a `Run settings:` block: every variable,
+the git commit (`-dirty` if the tree has changes), host, date, `CUDA_VISIBLE_DEVICES`
+and the full `diffit-train` command line. `LOG_DIR` moves the logs.
+
+`sh/generate_*.sh` take `NETWORK` / `SAMPLES_PER_CLASS` / … the same way (no detach).
+Prefetch backbones once on a login node with `diffit-download-models` before an
+offline run.
 
 ### No resume — size runs to the walltime
 

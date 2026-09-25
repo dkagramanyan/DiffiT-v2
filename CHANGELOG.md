@@ -5,6 +5,39 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.7.4] — 2026-09-25
+
+### Changed
+- **`sh/train_*.sh` run detached and log everything.** Every knob the scripts use is
+  now one line in a run-settings block at the top (`NAME="${NAME:-default}"`: `DATA`,
+  `OUTDIR`, `CFG`, `GPUS`, `BATCH_GPU`, `KEEP_LAST`, `AUGMENT`, `NUM_FID_SAMPLES`,
+  `SEED`, `WORKERS`, `INIT_WEIGHTS`, `LR_WARMUP` (512), `CONDA_ENV`,
+  `CUDA_VISIBLE_DEVICES`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `NCCL_DEBUG`,
+  `HF_HOME`, `TORCH_HOME`); the environment still overrides each one, and the
+  resulting `diffit-train` command and exported environment are identical to 0.7.3's.
+  On a workstation `bash sh/train_<r>.sh` re-launches itself with `setsid nohup` in its
+  own session and returns, printing the log, `tail -f` and `kill -- -<pid>` lines; the
+  output goes to `logs/diffit-train_<r>-<date>.log` with a `.pid` file beside it.
+  `FOREGROUND=1` stays attached and tees into the same log; under SLURM the script never
+  detaches and tees into both the slurm `.out` and the log. Each log starts with a
+  `Run settings:` block: every variable, the git commit (`-dirty` if the tree has
+  changes), host, date and the full command line. `LOG_DIR` moves the logs.
+
+### Fixed
+- **README training advice matches the presets, the scripts and the paper.** The
+  "Strategy B" fine-tune recipe (written before the presets were settled) recommended
+  `--lr 5e-5 --lr-warmup 500 --kimg 100000` at 512² and `--lr 2e-5 --lr-warmup 500
+  --kimg 50000` at 1024², and the "512² from scratch" example passed `--lr-warmup 1000`
+  as "recommended"; none of that is what `sh/train_*.sh` run or what the paper uses.
+  The section is replaced by one stage table (preset, LR, warmup, global batch, start)
+  with the paper's App. I.2 wording quoted: LR 3e-4 / 1e-4 at every stage (the paper
+  gives no fine-tune LR, training length, optimizer or warmup, and NVlabs/DiffiT ships
+  no training configs), the 1000-kimg warmup only for warm-started stages (this fork's
+  choice), from-scratch 512² without warmup. The unsourced "3–5× cheaper" claim, the
+  walltime guesses and the 1024² `--grad-accum 4` example (the preset uses 2) are gone.
+  The README also notes the CFG provenance (official `sample.py`: 4.4 / 1.49; the
+  paper text: 4.6 at 256). No preset or script hyperparameter changes.
+
 ## [0.7.3] — 2026-09-25
 
 ### Fixed
