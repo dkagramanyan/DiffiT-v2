@@ -5,6 +5,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.7.3] — 2026-09-25
+
 ### Fixed
 - **A warm-started 512 stage gets an LR warmup.** `INIT_WEIGHTS=... bash sh/train_512.sh`
   started a fresh AdamW at the full 1e-4 on the 256 weights (the `diffit-512` preset
