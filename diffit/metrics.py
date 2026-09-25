@@ -450,7 +450,12 @@ def evaluate_metrics(
             metrics["Recall"] = rec
 
     if rank == 0:
-        if combra_active and combra_ref is not None:
+        if combra_active and combra_ref is not None and gen_angles is None:
+            # gather_generated returns (None, None) when any rank's feature/angle
+            # extraction failed; passing that on fails with a bare NoneType error.
+            log_fn("combra metrics failed: generated-image feature/angle extraction "
+                   "failed on a rank; skipping combra metrics this tick.")
+        elif combra_active and combra_ref is not None:
             try:
                 # device= so the CMMD reduction runs where the features were
                 # extracted; left unset it resolves independently.

@@ -5,6 +5,30 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- **A warm-started 512 stage gets an LR warmup.** `INIT_WEIGHTS=... bash sh/train_512.sh`
+  started a fresh AdamW at the full 1e-4 on the 256 weights (the `diffit-512` preset
+  has no warmup), against the warmup-for-warm-started-stages decision the 1024 preset
+  already follows. The script now adds `--lr-warmup ${LR_WARMUP:-1000}` when
+  `INIT_WEIGHTS` is set; the preset is unchanged, so a from-scratch 512 run keeps the
+  paper recipe. Learning rates are unchanged.
+- **Generation decodes the way training scores.** `gen_images` now tiles the VAE at
+  >= 1024 px, the same condition `train.py` uses, so the 1024 images (and the wc_cv
+  h5) are decoded as the snapshots were selected on.
+- **Generation slices the VAE decode** (`vae.enable_slicing()`, as in training).
+  `sh/generate_1024.sh` decodes `BATCH_GPU=32` fp32 images; whole-batch, the last
+  decoder stages held 32×256×1024² tensors (~34 GB, over INT_MAX elements).
+- **Log contract (spec §7).** A failed `gather_generated` (returns `(None, None)`)
+  now logs `combra metrics failed: generated-image feature/angle extraction failed on
+  a rank; ...` instead of a bare `'NoneType'` error from `distributed_metrics`;
+  `reals.png` and `fakes_init.png` get a `Saved <file>` line; the startup
+  `combra metrics: ... scored against` line names the ×8 dihedral reference
+  expansion when `--augment` is on.
+- README: the `sh/` scripts' default `CONDA_ENV` is `diffit-v2`, not `diffit`.
+
+### Changed
+- **combra pin `v0.19.0` → `v0.19.1`.**
+
 ## [0.7.2] — 2026-09-25
 
 ### Fixed

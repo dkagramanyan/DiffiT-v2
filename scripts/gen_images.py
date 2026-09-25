@@ -103,8 +103,12 @@ def _sidecar_meta(network: str) -> dict:
     return {"resolution": opts["image_size"]}
 
 
-def _load_vae(decoder: str, dev):
+def _load_vae(decoder: str, dev, image_size: int):
     """Load the SD-VAE from the local HuggingFace cache, announcing any fetch.
+
+    Decodes are sliced (one image at a time), and tiled at >= 1024 px exactly as
+    in training (`train.py`), so the generated images are decoded the way the
+    model was scored during training.
 
     `AutoencoderKL.from_pretrained` consults the Hub before it looks at the cache,
     so on an offline compute node the first generation run *hangs* on a network
@@ -130,6 +134,9 @@ def _load_vae(decoder: str, dev):
             ) from err
     for prm in vae.parameters():
         prm.requires_grad_(False)
+    vae.enable_slicing()
+    if image_size >= 1024:
+        vae.enable_tiling()
     return vae.to(dev).eval()
 
 
@@ -493,7 +500,7 @@ def worker_fn(rank, c, temp_dir):
     model.load_state_dict(extract_inference_state_dict(load_state_dict(c["network"], map_location="cpu")))
     model.to(dev).eval()
 
-    vae = _load_vae(c["vae_decoder"], dev)
+    vae = _load_vae(c["vae_decoder"], dev, c["image_size"])
 
     diff_config = diffusion_defaults()
     diff_config["timestep_respacing"] = "" if c["sampler"] in ("dpm++", "unipc") else str(c["num_sampling_steps"])
@@ -597,7 +604,7 @@ def _run_seed_mode(c, seeds, class_idx):
     )
     model.load_state_dict(extract_inference_state_dict(load_state_dict(c["network"], map_location="cpu")))
     model.to(dev).eval()
-    vae = _load_vae(c["vae_decoder"], dev)
+    vae = _load_vae(c["vae_decoder"], dev, c["image_size"])
     diff_config = diffusion_defaults()
     diff_config["timestep_respacing"] = "" if c["sampler"] in ("dpm++", "unipc") else str(c["num_sampling_steps"])
     diffusion = create_diffusion(**diff_config)

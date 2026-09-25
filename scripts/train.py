@@ -609,6 +609,7 @@ def training_loop(
                     f"combra metrics: {num_fid_samples} fakes scored against "
                     f"{ref_count}/{total_count} reals"
                     + (" (seeded random subset)" if ref_count < total_count else " (whole dataset)")
+                    + (f", x8 dihedral = {ref_count * 8} reference images" if augment else "")
                 )
             local_ref = load_reference_shard(
                 data, ref_count, total_count, image_size, workers, rank, num_gpus, seed, num_dataset_classes,
@@ -718,6 +719,7 @@ def training_loop(
                     grid_images.append(np.zeros((1, 3, image_size, image_size), dtype=np.uint8))
         real_np = np.concatenate(grid_images, axis=0)
         save_image_grid(real_np, os.path.join(run_dir, "reals.png"), drange=[0, 255], grid_size=grid_size)
+        logger.log("Saved reals.png")
         if stats_tfevents is not None:
             stats_tfevents.add_image("Reals", save_image_grid_to_array(real_np, grid_size),
                                      global_step=0, dataformats="HWC")
@@ -743,6 +745,7 @@ def training_loop(
             amp_dtype=eval_amp_dtype,
         )
         save_image_grid(fakes_init, os.path.join(run_dir, "fakes_init.png"), drange=[0, 255], grid_size=grid_size)
+        logger.log("Saved fakes_init.png")
         if stats_tfevents is not None:
             stats_tfevents.add_image("Fakes", save_image_grid_to_array(fakes_init, grid_size),
                                      global_step=0, dataformats="HWC")

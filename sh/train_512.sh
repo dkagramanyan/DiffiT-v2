@@ -53,10 +53,12 @@ export PYTHONUNBUFFERED=1
 # combra_fd_dinov2 / combra_cmmd (KEEP_LAST=0 keeps every one). Higher-resolution stages: set
 # INIT_WEIGHTS to the previous stage's best-by-combra_fid snapshot -- the file the last
 # "Best snapshots:" line of its .log names for combra_fid (the last snapshot if that
-# run had no eval) -- for a weights-only warm start (fresh optimizer).
+# run had no eval) -- for a weights-only warm start (fresh optimizer). A warm start also
+# gets a LR_WARMUP-kimg linear LR warmup (default 1000, as the diffit-1024 preset); the
+# diffit-512 preset itself has none, so a from-scratch 512 run keeps the paper recipe.
 INIT_ARGS=()
 if [[ -n "${INIT_WEIGHTS:-}" ]]; then
-    INIT_ARGS=(--init-weights "$INIT_WEIGHTS")
+    INIT_ARGS=(--init-weights "$INIT_WEIGHTS" --lr-warmup "${LR_WARMUP:-1000}")
 fi
 
 diffit-train \

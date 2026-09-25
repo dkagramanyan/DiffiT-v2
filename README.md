@@ -51,7 +51,7 @@ hardware or evaluation.
 | Area | Paper | This fork | Kind |
 |---|---|---|---|
 | Resolutions | 256² and 512², each trained separately; no 1024² | **Progressive 256² → 512² → 1024²**, each stage warm-started from the previous stage's EMA weights with `--init-weights` / `INIT_WEIGHTS` (weights only, fresh optimizer) | improvement |
-| LR warmup | none (DiT recipe) | none at 256/512; **1000 kimg** linear warmup at 1024² (a warm-started stage with no paper recipe) | improvement |
+| LR warmup | none (DiT recipe) | none at 256 and from-scratch 512; **1000 kimg** linear warmup at 1024² (a warm-started stage with no paper recipe) and for a warm-started 512 run via `sh/train_512.sh` (`INIT_WEIGHTS` set; `LR_WARMUP` overrides) | improvement |
 | Global batch | 256 @ 256², 512 @ 512² | **256 / 128 / 64** at 256² / 512² / 1024² on 2× H200 (128×2; 64×2; 16×2×2 accum + checkpointing) | adaptation |
 | LR, EMA, optimizer | 3e-4 (256) / 1e-4 (512), EMA 0.9999; AdamW, wd 0, constant LR (DiT) | same; 1024² reuses 1e-4 | identical |
 | Precision | — (upstream sampling: optional fp16) | **bf16** autocast for the model and the VAE encode (`--precision`; GradScaler only for fp16) | adaptation |
@@ -209,7 +209,7 @@ can still override any preset value.
 | `diffit-512` | 512 | DiffiT-XL/2 | 1e-4 | bf16 | 400000 | 1.49 (constant) | off |
 | `diffit-1024` | 1024 | DiffiT-XL/2 | 1e-4 | bf16 | 400000 | 1.49 (constant) | on |
 
-Paper's recipe (Appendix I.2, p.22): LR 3e-4 / batch 256 (ImageNet-256), LR 1e-4 / batch 512 (ImageNet-512), EMA 0.9999, DDPM sampler 250 steps, ADM diffusion hyperparameters. The paper names no optimizer, weight decay or warmup for the latent models, so those follow DiT (`facebookresearch/DiT` `train.py`): AdamW, weight decay 0, constant LR, no warmup. `diffit-1024` (no paper recipe) reuses the 512 LR and keeps a 1000-kimg linear LR warmup, since it is normally a warm-started stage; the 256/512 presets use none. `sh/generate_*.sh` default to the paper's DDPM sampler with 250 steps.
+Paper's recipe (Appendix I.2, p.22): LR 3e-4 / batch 256 (ImageNet-256), LR 1e-4 / batch 512 (ImageNet-512), EMA 0.9999, DDPM sampler 250 steps, ADM diffusion hyperparameters. The paper names no optimizer, weight decay or warmup for the latent models, so those follow DiT (`facebookresearch/DiT` `train.py`): AdamW, weight decay 0, constant LR, no warmup. `diffit-1024` (no paper recipe) reuses the 512 LR and keeps a 1000-kimg linear LR warmup, since it is normally a warm-started stage; the 256/512 presets use none, but `sh/train_512.sh` adds a 1000-kimg warmup (`LR_WARMUP`) when `INIT_WEIGHTS` warm-starts it. `sh/generate_*.sh` default to the paper's DDPM sampler with 250 steps.
 
 ### Training strategies
 
@@ -326,7 +326,7 @@ diffit-train --outdir=./training-runs \
 
 Cluster launches are plain shell scripts under `sh/` — no `.sbatch` files in the
 repo. Each self-locates the repo root, activates the conda env (`CONDA_ENV`,
-default `diffit`), sets the offline-cluster contract (`HF_HUB_OFFLINE=1`,
+default `diffit-v2`), sets the offline-cluster contract (`HF_HUB_OFFLINE=1`,
 `TRANSFORMERS_OFFLINE=1`), and makes one `diffit-*` console call. SLURM specifics
 are supplied at submission time — never hardcoded:
 
