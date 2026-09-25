@@ -11,8 +11,8 @@ separately-trained DiffiT models, this script:
        the two decoded images.
     4. Reads the already-logged ``Loss/test`` scalar from each run's
        TensorBoard events, if available.
-    5. Writes combined curves to a new TensorBoard dir and saves a
-       dual-axis matplotlib plot (Figure 1(a) style).
+    5. Writes combined curves to a new TensorBoard dir and saves the
+       per-kimg values to ``results.json``.
 
 Usage:
     python experiments/analyze_sample_split.py \
@@ -22,7 +22,7 @@ Usage:
         --num-samples=256 --num-steps=50
 
 Run on a single GPU. Both models are loaded into the same device; the
-EMA weights are what the plot is measured on.
+EMA weights are what the distance is measured on.
 """
 
 from __future__ import annotations
@@ -240,59 +240,6 @@ def read_test_loss(run_dir: str) -> Dict[int, float]:
 
 
 # ---------------------------------------------------------------------------
-# Plotting
-# ---------------------------------------------------------------------------
-
-def plot_figure1a(results: List[dict], outdir: str, title: str = ""):
-    """Dual-axis plot mirroring Figure 1(a) from Garnier-Brun et al. 2026."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    os.makedirs(outdir, exist_ok=True)
-    kimgs   = np.array([r["kimg"] for r in results])
-    cos     = np.array([r["cosine_distance"] for r in results])
-    cos_err = np.array([r["cosine_distance_sem"] for r in results])
-    tl_a    = np.array([r.get("test_loss_a", np.nan) for r in results], dtype=float)
-    tl_b    = np.array([r.get("test_loss_b", np.nan) for r in results], dtype=float)
-
-    fig, ax1 = plt.subplots(figsize=(6, 4.5))
-    ax1.errorbar(kimgs, cos, yerr=cos_err, color="tab:blue", marker="o",
-                 linewidth=2, label="Sample-split cosine distance")
-    ax1.set_xlabel("kimg")
-    ax1.set_ylabel("Sample-split cosine distance", color="tab:blue")
-    ax1.tick_params(axis="y", labelcolor="tab:blue")
-
-    ax2 = ax1.twinx()
-    if not np.all(np.isnan(tl_a)):
-        ax2.plot(kimgs, tl_a, color="tab:red", linestyle="--", marker="x",
-                 alpha=0.7, label="Test loss (A)")
-    if not np.all(np.isnan(tl_b)):
-        ax2.plot(kimgs, tl_b, color="tab:orange", linestyle="--", marker="x",
-                 alpha=0.7, label="Test loss (B)")
-    ax2.set_ylabel("DSM test loss", color="tab:red")
-    ax2.tick_params(axis="y", labelcolor="tab:red")
-
-    # Indicate minima
-    if len(cos) > 1:
-        kmin_cos = kimgs[np.nanargmin(cos)]
-        ax1.axvline(kmin_cos, color="tab:blue", linestyle=":", alpha=0.5)
-    tl_mean = np.nanmean(np.stack([tl_a, tl_b]), axis=0)
-    if not np.all(np.isnan(tl_mean)):
-        kmin_tl = kimgs[np.nanargmin(tl_mean)]
-        ax2.axvline(kmin_tl, color="tab:red", linestyle=":", alpha=0.5)
-
-    fig.suptitle(title or "Biased generalization in DiffiT")
-    fig.legend(loc="upper right", bbox_to_anchor=(0.98, 0.95))
-    fig.tight_layout()
-
-    png_path = os.path.join(outdir, "figure1a.png")
-    fig.savefig(png_path, dpi=150)
-    plt.close(fig)
-    return png_path
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -300,13 +247,12 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--run-a",       required=True, type=str, help="Run dir for model A")
     p.add_argument("--run-b",       required=True, type=str, help="Run dir for model B")
-    p.add_argument("--outdir",      required=True, type=str, help="Directory for plot + new TB logs")
+    p.add_argument("--outdir",      required=True, type=str, help="Directory for results.json + new TB logs")
     p.add_argument("--num-samples", default=256,   type=int, help="Images per checkpoint for cosine distance")
     p.add_argument("--batch-size",  default=16,    type=int)
     p.add_argument("--num-steps",   default=50,    type=int, help="Sampling steps (DDPM respaced)")
     p.add_argument("--base-seed",   default=0,     type=int)
     p.add_argument("--model",       default="Diffit", type=str)
-    p.add_argument("--title",       default="",    type=str)
     p.add_argument("--only-kimgs",  default=None,  type=str,
                    help="Comma-separated list of kimgs to analyze (default: all common)")
     return p.parse_args()
@@ -393,12 +339,11 @@ def main():
     writer.close()
 
     # Save raw results
-    with open(os.path.join(args.outdir, "results.json"), "w") as f:
+    json_path = os.path.join(args.outdir, "results.json")
+    with open(json_path, "w") as f:
         json.dump(results, f, indent=2)
 
-    # Plot
-    png = plot_figure1a(results, args.outdir, title=args.title)
-    print(f"\nPlot saved: {png}")
+    print(f"\nResults saved: {json_path}")
     print(f"TensorBoard logs: {args.outdir}")
 
 

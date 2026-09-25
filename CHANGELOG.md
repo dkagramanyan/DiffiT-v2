@@ -5,13 +5,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-25
+
 ### Changed
 - **combra pin `v0.15.3` → `v0.17.1`.** No change to training, eval, sampling or
   checkpoints: every combra call this repo makes keeps its signature and values
   (the test suite passes against 0.17.1). combra's plots no longer display
-  themselves, so `compare_samplers` only writes its PNG. combra 0.17 stopped
-  installing matplotlib; `experiments/analyze_sample_split.py` imports it, so it is
-  declared in the `dev` extra.
+  themselves.
+- **No matplotlib.** `experiments/analyze_sample_split.py` no longer draws
+  `figure1a.png` and drops `--title`; it writes only `results.json` (plus the
+  TensorBoard curves), and the notebook still plots it. `diffit-compare-samplers`
+  writes `sampler_comparison.json` (one record per sampler and k) in place of
+  `sampler_comparison.parquet` + `sampler_comparison.png`.
 
 - **Training log follows the unified four-repo style (§7); combra pin `v0.15.1` →
   `v0.15.3`.** No change to training, eval, sampling or checkpoints.

@@ -75,7 +75,6 @@ CMD=(
     --num-samples="$NUM_SAMPLES"
     --num-steps="$NUM_STEPS"
     --batch-size="$BATCH_SIZE"
-    --title="Biased generalization in DiffiT (${RESOLUTION}²)"
 )
 
 if [[ "$FOREGROUND" == "1" ]]; then

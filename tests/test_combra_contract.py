@@ -31,7 +31,6 @@ REQUIRED = [
     ("combra.io", "write_hparams"),
     # scripts/compare_samplers.py / scripts/download_models.py
     ("combra.metrics", "compare_samplers"),
-    ("combra.metrics", "plot_sampler_comparison"),
     ("combra.metrics", "compute_cmmd"),
     ("combra.metrics", "compute_fd_dinov2"),
     ("combra.metrics", "compute_fid"),

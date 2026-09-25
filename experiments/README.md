@@ -17,7 +17,7 @@ The paper's signature is: the blue curve bottoms out *before* the red curve does
 experiments/
 ├── README.md                   # this file
 ├── train_sample_split.py       # trains ONE model on split A or B + logs Loss/test
-├── analyze_sample_split.py     # walks checkpoint pairs → cosine distance → plot
+├── analyze_sample_split.py     # walks checkpoint pairs → cosine distance → JSON
 └── shell/                      # launchers (workstation or sbatch; env-var-overridable)
     ├── train_256_splitA.sh
     ├── train_256_splitB.sh
@@ -148,8 +148,7 @@ python experiments/analyze_sample_split.py \
     --outdir=./experiments/analysis/256 \
     --num-samples=256 \
     --num-steps=50 \
-    --batch-size=16 \
-    --title="Biased generalization in DiffiT (256²)"
+    --batch-size=16
 ```
 
 Or via the shell wrapper (positional args) — on the cluster prefix it with
@@ -167,12 +166,11 @@ bash experiments/shell/analyze.sh 256 \
 4. Computes mean cosine distance between decoded images.
 5. Reads `Loss/test` for each model from `stats.jsonl` (logged during training).
 6. Writes a combined TensorBoard log to `--outdir` (`BiasedGen/cosine_distance`, `BiasedGen/test_loss_A`, `BiasedGen/test_loss_B`).
-7. Saves `figure1a.png` (dual-axis plot) and `results.json` (raw data).
+7. Saves `results.json` (per-kimg cosine distance, its SEM and both test losses). The plot is drawn in `experiments/notebooks/analyze_sample_split.ipynb`.
 
 **Outputs:**
 ```
 experiments/analysis/256/
-├── figure1a.png
 ├── results.json
 └── events.out.tfevents.*
 ```

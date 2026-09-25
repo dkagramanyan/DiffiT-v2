@@ -6,10 +6,10 @@ need to generate good-quality images?* For every sampler and every ``k``, this
 generates a batch of samples from a trained DiffiT checkpoint, then scores the
 batch against a fixed batch of real reference images with combra's
 ``compare_samplers`` (FID / CMMD / FD-DINOv2 + angle-Wasserstein / Gaussian-fit
-metrics). The result is a tidy table plus a metric-vs-k plot.
+metrics). The result is a tidy table saved as JSON.
 
 This is the DiffiT-side wiring for :func:`combra.metrics.compare_samplers`; the
-generic sweep/plot lives in combra so it stays sampler- and codebase-agnostic.
+generic sweep lives in combra so it stays sampler- and codebase-agnostic.
 
 Usage (see also sbatch/h200_compare_samplers_256x256.sbatch):
 
@@ -37,7 +37,7 @@ from diffit.image_datasets import load_data
 from diffit.metrics import sample_latents
 
 try:
-    from combra.metrics import compare_samplers, plot_sampler_comparison
+    from combra.metrics import compare_samplers
 
     HAS_COMBRA = True
 except ImportError:
@@ -117,7 +117,7 @@ def _generate_batch(model, vae, dev, latent_size, num_classes, num_samples,
 @click.option("--num-classes", type=int, default=None, help="Override num_classes (default: auto-detect from checkpoint)")
 @click.option("--decode-layer", type=int, default=None, help="Decode layer override")
 @click.option("--seed", type=int, default=0, show_default=True)
-@click.option("--outdir", required=True, type=str, help="Output directory for the table + plot")
+@click.option("--outdir", required=True, type=str, help="Output directory for the JSON table")
 def main(model_path, data, image_size, cfg_scale, scale_pow, num_samples, batch_size,
          samplers, k_values, vae_decoder, model_name, num_classes, decode_layer, seed, outdir):
     """Compare samplers by combra metrics as a function of sampling steps."""
@@ -178,11 +178,9 @@ def main(model_path, data, image_size, cfg_scale, scale_pow, num_samples, batch_
 
     outdir_p = Path(outdir)
     outdir_p.mkdir(parents=True, exist_ok=True)
-    table_path = outdir_p / "sampler_comparison.parquet"
-    plot_path = outdir_p / "sampler_comparison.png"
-    df.to_parquet(table_path)
-    plot_sampler_comparison(df, save_path=str(plot_path))
-    print(f"Wrote {table_path}\nWrote {plot_path}")
+    table_path = outdir_p / "sampler_comparison.json"
+    df.to_json(table_path, orient="records", indent=2)
+    print(f"Wrote {table_path}")
 
 
 if __name__ == "__main__":

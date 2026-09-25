@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "diffit"
-version = "0.4.0"
+version = "0.5.0"
 description = "DiffiT: Diffusion Vision Transformers for Image Generation (v2 performance refresh)"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -30,8 +30,6 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
     "ruff>=0.4.0",
-    # Analysis/toy scripts plot with it; combra no longer installs it (0.17).
-    "matplotlib>=3.7",
 ]
 # Optional: enables the combra metrics during training-time eval. Training runs
 # unchanged without it (the import is guarded). combra is pulled from its private
