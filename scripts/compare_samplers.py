@@ -31,10 +31,10 @@ from diffusers.models import AutoencoderKL
 
 import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults
-from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
+from diffit.constants import VAE_SCALE_FACTOR
 from diffit.dist_util import extract_inference_state_dict, load_state_dict
 from diffit.image_datasets import load_data
-from diffit.metrics import sample_latents
+from diffit.metrics import sample_latents, to_uint8
 
 try:
     from combra.metrics import compare_samplers
@@ -96,7 +96,7 @@ def _generate_batch(model, vae, dev, latent_size, num_classes, num_samples,
         )
         sample, _ = sample.chunk(2, dim=0)
         sample = vae.decode(sample / VAE_SCALE_FACTOR).sample
-        sample = ((sample + 1) * PIXEL_NORM_HALF).clamp(0, UINT8_MAX).to(torch.uint8)
+        sample = to_uint8(sample)
         out.append(sample.permute(0, 2, 3, 1).cpu().numpy())
         remaining -= bs
     return np.concatenate(out, axis=0)

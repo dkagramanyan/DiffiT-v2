@@ -5,6 +5,39 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- **EMA identical on every rank.** The model was built under the per-rank seed and
+  the EMA was copied from it before DDP broadcast rank 0's weights, so each rank's
+  EMA kept its own random init (from-scratch multi-GPU runs; eval drew half its
+  fakes from rank 1's EMA). Weights are now initialised from `--seed` alone; the
+  per-rank seed is set right after the model is built.
+- **`--sampler unipc` in `diffit-gen-images` / `diffit-sample`** built UniPC from a
+  respaced (`--steps`-long) schedule, so the model saw timesteps 19..1 while the
+  noise was at 999..50. UniPC now gets the full 1000-step schedule, as in training
+  eval and `diffit-compare-samplers`.
+- **LR warmup** sets the warmup LR before the optimizer step; the first step used
+  to run at the full LR.
+- **Timing columns.** The tick clock was restarted before the snapshot / eval /
+  checkpoint work, so `Timing/maintenance_sec` was ~0 and eval time was billed to
+  the next tick's `sec_per_tick` / `sec_per_kimg`. It is now restarted after that
+  work, as in san-v2 / StyleSwin.
+- **Label contract (§3/§5).** `diffit-train` refuses a dataset whose
+  `dataset.json` records no `class_names` (it used to store `class_names=None` in
+  every snapshot). Rebuild such zips with `diffit-prepare-data`.
+- **Fakes rounded to uint8, not truncated** (training eval, snapshot grids,
+  `diffit-gen-images`, `diffit-sample`, `diffit-compare-samplers`), via one helper
+  `diffit.metrics.to_uint8`; this shifted every image by -0.5 LSB on average.
+- **Eval generation failure no longer hangs the other ranks**: the ranks agree on
+  generation (combra `all_ranks_ok`) before any gather; a failed tick logs and
+  records no metrics.
+- **Legacy Inception reference** (`--combra-metrics False`) is a seeded random
+  subset without duplicates, as on the combra path; it used to take the first N
+  images of the class-sorted zip, wrapping around with duplicates when N exceeded
+  the dataset.
+- **`experiments/shell/*.sh`** default to the `diffit-v2` conda env (was `diffit`,
+  which the README never creates), and `CONDA_ENV=` (empty) now skips activation as
+  documented.
+
 ## [0.5.0] — 2026-09-25
 
 ### Changed

@@ -28,7 +28,7 @@ from diffusers.models import AutoencoderKL
 
 import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults
-from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
+from diffit.constants import VAE_SCALE_FACTOR
 from diffit.dist_util import (
     dev,
     extract_inference_state_dict,
@@ -37,7 +37,7 @@ from diffit.dist_util import (
     load_state_dict,
     setup_dist,
 )
-from diffit.metrics import sample_latents
+from diffit.metrics import sample_latents, to_uint8
 
 
 @click.command()
@@ -96,10 +96,10 @@ def generate_samples(
     )
     print(f"Model loaded: {msg}")
 
-    # Create diffusion. DPM-Solver++ subsamples the full 1000-step schedule itself;
+    # Create diffusion. DPM-Solver++ and UniPC subsample the full 1000-step schedule itself;
     # DDIM/DDPM use a spaced schedule whose num_timesteps == num_sampling_steps.
     diff_config = diffusion_defaults()
-    diff_config["timestep_respacing"] = "" if sampler == "dpm++" else str(num_sampling_steps)
+    diff_config["timestep_respacing"] = "" if sampler in ("dpm++", "unipc") else str(num_sampling_steps)
     diffusion = create_diffusion(**diff_config)
 
     model.to(dev())
@@ -155,7 +155,7 @@ def generate_samples(
 
             # Decode latent → image
             sample = vae.decode(sample / VAE_SCALE_FACTOR).sample
-            sample = ((sample + 1) * PIXEL_NORM_HALF).clamp(0, UINT8_MAX).to(torch.uint8)
+            sample = to_uint8(sample)
             sample = sample.permute(0, 2, 3, 1).contiguous()
 
             # Gather across GPUs

@@ -56,6 +56,7 @@ from diffit.metrics import (
     evaluate_metrics,
     precompute_combra_reference,
     sample_latents,
+    to_uint8,
 )
 from diffit.nn import update_ema
 from diffit.timestep_sampler import create_named_schedule_sampler
@@ -125,7 +126,7 @@ def generate_snapshot_images(
             )
             sample, _ = sample.chunk(2, dim=0)
             decoded = vae.decode(sample.float() / VAE_SCALE_FACTOR).sample
-        decoded = ((decoded + 1) * PIXEL_NORM_HALF).clamp(0, UINT8_MAX).to(torch.uint8)
+        decoded = to_uint8(decoded)
         all_samples.append(decoded.permute(0, 2, 3, 1).cpu().numpy())
 
     # Return as NCHW uint8 for save_image_grid
@@ -415,8 +416,11 @@ def training_loop(
     is_main = rank == 0
 
     # Seeding — data shuffling (incl. the DistributedSampler), weight init and
-    # eval/grid latent draws all derive from --seed (§2).
-    torch.manual_seed(seed + rank)
+    # eval/grid latent draws all derive from --seed (§2). Weight init uses --seed
+    # alone so every rank builds the same model: DDP broadcasts rank 0's weights
+    # into `model` but not into the EMA copy made from it below. The per-rank seed
+    # is set right after the model is built.
+    torch.manual_seed(seed)
     np.random.seed(seed + rank)
 
     # Resolve precision: fp32 = no autocast; fp16 = autocast + GradScaler;
@@ -450,6 +454,7 @@ def training_loop(
         input_size=latent_size, num_classes=num_dataset_classes,
     )
     model.to(device)
+    torch.manual_seed(seed + rank)  # per-rank from here on (timestep / VAE noise draws)
 
     if gradient_checkpointing:
         model.gradient_checkpointing = True
@@ -611,21 +616,14 @@ def training_loop(
             if is_main:
                 logger.log("Reference features computed.")
         elif is_main:
-            ref_count = num_fid_samples
-            logger.log(f"Pre-loading {ref_count} reference images (Inception path)...")
-            ref_iter = load_data(
-                data_dir=data, batch_size=min(ref_count, 64), image_size=image_size,
-                num_classes=num_dataset_classes, class_cond=True, mirror=False,
-                num_workers=workers, distributed=False, deterministic=True, drop_last=False,
+            # Seeded random subset without duplicates, as on the combra path (never the
+            # first N of a class-sorted zip, §6).
+            total_count = count_data(data)
+            ref_count = min(num_fid_samples, total_count)
+            logger.log(f"Pre-loading {ref_count}/{total_count} reference images (Inception path)...")
+            ref_images = load_reference_shard(
+                data, ref_count, total_count, image_size, workers, 0, 1, seed, num_dataset_classes,
             )
-            ref_images = []
-            n_collected = 0
-            while n_collected < ref_count:
-                batch_ref, _ = next(ref_iter)
-                batch_np = batch_ref.numpy()  # uint8 NCHW
-                ref_images.append(batch_np)
-                n_collected += batch_np.shape[0]
-            ref_images = np.concatenate(ref_images, axis=0)[:ref_count]
 
             logger.log("Loading InceptionV3 for metric evaluation...")
             from torchvision.models import Inception_V3_Weights, inception_v3
@@ -753,13 +751,14 @@ def training_loop(
             if "vb" in losses:
                 logger.logkv_mean("Loss/vb", losses["vb"].mean().item())
 
-        scaler.step(opt)
-        scaler.update()
-
+        # Set the warmup LR before the step, so the first step is not taken at full LR.
         if lr_warmup_kimg > 0:
             warmup_frac = min(1.0, cur_nimg / (lr_warmup_kimg * 1000))
             for pg in opt.param_groups:
                 pg["lr"] = lr * warmup_frac
+
+        scaler.step(opt)
+        scaler.update()
 
         update_ema(ema_model.parameters(), model.parameters(), rate=ema_rate)
         if "mse" in losses:
@@ -806,12 +805,6 @@ def training_loop(
 
             cur_tick += 1
             tick_start_nimg = cur_nimg
-            prev_tick_end = tick_end_time
-            tick_start_time = time.time()
-            # Non-training time in this tick (snapshot, eval, checkpoint write). Measured
-            # after the fact, so it is reported on the following tick -- same convention
-            # as san-v2 / StyleSwin / edm2.
-            maintenance_time = tick_start_time - prev_tick_end
 
             # Snapshot at every `snap` ticks and ALWAYS at the last tick (§3), so
             # the newest snapshot is always the final model.
@@ -876,6 +869,12 @@ def training_loop(
                         if isinstance(value, (int, float)) and math.isfinite(value):
                             stats_tfevents.add_scalar(name, value, global_step=cur_nimg)
                     stats_tfevents.flush()
+
+            # Non-training time in this tick (snapshot, eval, checkpoint write). Measured
+            # after the fact, so it is reported on the following tick -- same convention
+            # as san-v2 / StyleSwin / edm2.
+            tick_start_time = time.time()
+            maintenance_time = tick_start_time - tick_end_time
 
     if is_main and stats_tfevents is not None:
         _write_run_hparams(run_dir, stats_tfevents,
@@ -1057,6 +1056,13 @@ def launch_from_opts(opts):
         overrides["lr_warmup_kimg"] = opts["lr_warmup"]
 
     cfg = dataclasses.replace(BASE_CONFIGS[opts["cfg"]], **overrides)
+
+    # Label contract (§3/§5): training is class-conditional, so the zip must record its
+    # class names, or every snapshot would carry class_names=None.
+    if read_class_meta(opts["data"])[0] is None:
+        raise click.ClickException(
+            "--data records no class_names in dataset.json; rebuild it with diffit-prepare-data"
+        )
 
     c = dict(
         data=opts["data"],

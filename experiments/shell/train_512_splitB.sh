@@ -12,7 +12,7 @@ PROJECT_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
 : "${SNAP:=5}"
 : "${DATASET:=${PROJECT_DIR}/datasets/imagenet_9to4_1024x1024_512x512.zip}"
 : "${OUTDIR:=${PROJECT_DIR}/experiments/runs/512}"
-: "${CONDA_ENV:=diffit}"
+: "${CONDA_ENV=diffit-v2}"  # no colon: CONDA_ENV= (empty) skips activation
 : "${FOREGROUND:=0}"
 : "${LOG_DIR:=${PROJECT_DIR}/experiments/logs}"
 SCRIPT_NAME=$(basename "${BASH_SOURCE[0]}" .sh)

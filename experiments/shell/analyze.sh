@@ -32,7 +32,7 @@ if [[ -z "$RESOLUTION" || -z "$RUN_A" || -z "$RUN_B" ]]; then
 fi
 
 : "${OUTDIR:=${PROJECT_DIR}/experiments/analysis/${RESOLUTION}}"
-: "${CONDA_ENV:=diffit}"
+: "${CONDA_ENV=diffit-v2}"  # no colon: CONDA_ENV= (empty) skips activation
 : "${FOREGROUND:=0}"
 : "${LOG_DIR:=${PROJECT_DIR}/experiments/logs}"
 SCRIPT_NAME=$(basename "${BASH_SOURCE[0]}" .sh)

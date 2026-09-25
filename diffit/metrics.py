@@ -92,6 +92,11 @@ def sample_latents(model_fn, diffusion, shape, device, *, sampler, num_steps, mo
     )
 
 
+def to_uint8(images):
+    """Decoded ``[-1, 1]`` images → ``uint8``, rounded (as ``save_image_grid``'s ``rint``), not truncated."""
+    return ((images.float() + 1) * PIXEL_NORM_HALF).round().clamp(0, UINT8_MAX).to(torch.uint8)
+
+
 def _eval_draw(seed, idx, latent_size, n_classes):
     """Noise and class index of eval sample ``idx`` (the §2 seed rule).
 
@@ -161,7 +166,7 @@ def _generate_local_shard(
             )
             sample, _ = sample.chunk(2, dim=0)
             decoded = vae.decode(sample.float() / VAE_SCALE_FACTOR).sample
-        decoded = ((decoded + 1) * PIXEL_NORM_HALF).clamp(0, UINT8_MAX).to(torch.uint8)
+        decoded = to_uint8(decoded)
         all_images.append(decoded.cpu().numpy())
         generated += bs
         if pbar is not None:
@@ -382,13 +387,27 @@ def evaluate_metrics(
             f"Evaluating {'combra ' if combra_active else ''}metrics "
             f"({num_fid_samples} samples, {world_size} GPUs)..."
         )
-    local_fakes = _generate_local_shard(
-        ema_model, vae, diffusion, num_fid_samples, batch_gpu, latent_size, device,
-        cfg_scale=cfg_scale,
-        num_sampling_steps=num_sampling_steps, sampler=sampler,
-        rank=rank, world_size=world_size, seed=seed,
-        class_list=class_list, null_class_idx=null_class_idx,
-    )
+    # Agree on generation before any collective, so one rank failing to generate
+    # skips this eval on every rank instead of stranding the others in a gather.
+    gen_error = None
+    try:
+        local_fakes = _generate_local_shard(
+            ema_model, vae, diffusion, num_fid_samples, batch_gpu, latent_size, device,
+            cfg_scale=cfg_scale,
+            num_sampling_steps=num_sampling_steps, sampler=sampler,
+            rank=rank, world_size=world_size, seed=seed,
+            class_list=class_list, null_class_idx=null_class_idx,
+        )
+    except Exception as e:  # noqa: BLE001 -- agreed on across ranks below
+        gen_error = e
+        log_fn(f"rank {rank}: eval sample generation failed: {e}")
+    if HAS_COMBRA:
+        if not _combra_all_ranks_ok(gen_error is None, device, world_size):
+            if rank == 0:
+                log_fn("Eval sample generation failed on a rank; skipping metrics this tick.")
+            return {} if rank == 0 else None
+    elif gen_error is not None:
+        raise gen_error
 
     gen_feats, gen_angles = (
         _combra_gather_generated(local_fakes, device, rank, world_size)

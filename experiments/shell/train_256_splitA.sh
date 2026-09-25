@@ -8,7 +8,7 @@
 #   SNAP=5             # ticks between test-loss evals / checkpoints
 #   DATASET=...        # path to dataset zip / folder
 #   OUTDIR=...         # where to write runs
-#   CONDA_ENV=diffit   # conda env to activate (set to '' to skip)
+#   CONDA_ENV=diffit-v2  # conda env to activate (set to '' to skip)
 #   FOREGROUND=1       # keep attached (tee to terminal + log). Default: detach via nohup.
 #   LOG_FILE=...       # override log path
 set -euo pipefail
@@ -22,7 +22,7 @@ PROJECT_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
 : "${SNAP:=1}"
 : "${DATASET:=${PROJECT_DIR}/datasets/imagenet_9to4_1024x1024_256x256.zip}"
 : "${OUTDIR:=${PROJECT_DIR}/experiments/runs/256}"
-: "${CONDA_ENV:=diffit}"
+: "${CONDA_ENV=diffit-v2}"  # no colon: CONDA_ENV= (empty) skips activation
 : "${FOREGROUND:=0}"
 : "${LOG_DIR:=${PROJECT_DIR}/experiments/logs}"
 SCRIPT_NAME=$(basename "${BASH_SOURCE[0]}" .sh)

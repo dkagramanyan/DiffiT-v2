@@ -51,9 +51,9 @@ from diffusers.models import AutoencoderKL
 
 import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults
-from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
+from diffit.constants import VAE_SCALE_FACTOR
 from diffit.dist_util import extract_inference_state_dict, load_state_dict
-from diffit.metrics import sample_latents
+from diffit.metrics import sample_latents, to_uint8
 
 # Unified h5 signature shared by all four v2 repos (§4).
 H5_FORMAT = "generated_images_shard"
@@ -454,7 +454,7 @@ def _run_sampling(model, vae, diffusion, dev, num_classes, z, class_labels,
     )
     sample, _ = sample.chunk(2, dim=0)
     sample = vae.decode(sample / VAE_SCALE_FACTOR).sample
-    sample = ((sample + 1) * PIXEL_NORM_HALF).clamp(0, UINT8_MAX).to(torch.uint8)
+    sample = to_uint8(sample)
     return sample.permute(0, 2, 3, 1).cpu().numpy()
 
 
@@ -496,7 +496,7 @@ def worker_fn(rank, c, temp_dir):
     vae = _load_vae(c["vae_decoder"], dev)
 
     diff_config = diffusion_defaults()
-    diff_config["timestep_respacing"] = "" if c["sampler"] == "dpm++" else str(c["num_sampling_steps"])
+    diff_config["timestep_respacing"] = "" if c["sampler"] in ("dpm++", "unipc") else str(c["num_sampling_steps"])
     diffusion = create_diffusion(**diff_config)
     diffusion_steps = diff_config["diffusion_steps"]
 
@@ -599,7 +599,7 @@ def _run_seed_mode(c, seeds, class_idx):
     model.to(dev).eval()
     vae = _load_vae(c["vae_decoder"], dev)
     diff_config = diffusion_defaults()
-    diff_config["timestep_respacing"] = "" if c["sampler"] == "dpm++" else str(c["num_sampling_steps"])
+    diff_config["timestep_respacing"] = "" if c["sampler"] in ("dpm++", "unipc") else str(c["num_sampling_steps"])
     diffusion = create_diffusion(**diff_config)
     diffusion_steps = diff_config["diffusion_steps"]
     outdir_p = Path(c["outdir"])

@@ -14,7 +14,7 @@ PROJECT_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
 : "${SNAP:=5}"
 : "${DATASET:=${PROJECT_DIR}/datasets/imagenet_9to4_1024x1024_1024x1024.zip}"
 : "${OUTDIR:=${PROJECT_DIR}/experiments/runs/1024}"
-: "${CONDA_ENV:=diffit}"
+: "${CONDA_ENV=diffit-v2}"  # no colon: CONDA_ENV= (empty) skips activation
 : "${GRAD_CKPT:=1}"  # set to 0 to disable
 : "${FOREGROUND:=0}"
 : "${LOG_DIR:=${PROJECT_DIR}/experiments/logs}"
