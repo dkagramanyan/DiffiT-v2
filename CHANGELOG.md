@@ -5,6 +5,37 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-25
+
+### Added
+- **`--augment` (default `True`): random dihedral augmentation of training images.**
+  Each training item gets one of the 8 symmetries of the square, uniformly — `rot90`
+  by k ∈ {0,1,2,3} and a horizontal flip with p = 0.5 — applied to the uint8 CHW
+  image in the training loader, before VAE encoding (`diffit.image_datasets.
+  dihedral_transform` / `random_dihedral`, `load_data(augment=...)`). Draws come from
+  torch's RNG, which the DataLoader seeds per worker from the `--seed`-seeded main
+  generator. It runs after `--cache-in-ram` (the cache holds encoded files), so every
+  epoch draws afresh. The combra reference, the reals grid and eval never augment.
+  Square images only. `sh/train_*.sh` pass `--augment "${AUGMENT:-True}"`. This
+  re-introduces an augmentation option after v0.6.0 removed `--mirror`; DiT and the
+  official code use a random horizontal flip only, the dihedral group is this
+  project's adaptation to isotropic WC-Co microstructures.
+- **The metric reference matches the augmented distribution.** With `--augment`, the
+  combra reference is precomputed with `precompute_reference(..., dihedral=True)`
+  (all 8 transforms of each real); the legacy Inception reference (combra off) is
+  expanded the same way in this repo (activations over the 8 transforms, 8× the
+  reference rows). `--augment False` keeps the reference as stored.
+
+### Changed
+- **Training data: 1080 originals instead of 8640 pre-augmented images.**
+  `sh/train_<r>.sh` default `DATA` is now `./datasets/imagenet_9to4_orig_<r>x<r>.zip`
+  (360 crops per class, `class_names` `['Ultra_Co25', 'Ultra_Co11', 'Ultra_Co6_2']`);
+  the old zips stored each crop in all 8 dihedral orientations, which `--augment` now
+  produces on the fly. An epoch is 1080 images; at global batch 256 (256²) the
+  loader drops each rank's incomplete last batch, so an epoch trains on 1024 images,
+  a different 56 left out each epoch.
+- **combra pin `v0.18.0` → `v0.19.0`** (adds `precompute_reference(..., dihedral=)`).
+
 ## [0.6.0] — 2026-09-25
 
 ### Changed

@@ -85,6 +85,16 @@ def test_write_hparams_accepts_step():
 
 
 @requires_combra
+def test_precompute_reference_accepts_dihedral():
+    # train.py passes dihedral=<--augment> (combra >= 0.19.0).
+    import inspect
+
+    from combra.metrics.distributed import precompute_reference
+
+    assert "dihedral" in inspect.signature(precompute_reference).parameters
+
+
+@requires_combra
 def test_angle_metrics_run_on_pooled_angles():
     # Not just importable -- callable, and returning the keys the loop logs.
     import numpy as np

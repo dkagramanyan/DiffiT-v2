@@ -18,6 +18,7 @@ import random
 import zipfile
 
 import numpy as np
+import torch
 import torch.distributed as dist
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
@@ -80,6 +81,7 @@ def load_data(
     cache_in_ram=False,
     drop_last=True,
     seed=0,
+    augment=False,
 ):
     """
     Create a generator over (images, kwargs) pairs.
@@ -99,6 +101,8 @@ def load_data(
     :param num_workers: number of DataLoader workers.
     :param distributed: if True, use DistributedSampler for multi-GPU.
     :param seed: base seed for the DistributedSampler shuffle (§2).
+    :param augment: if True, apply a uniformly random dihedral transform
+        (:func:`random_dihedral`) to every item. Training loader only.
     """
     if not data_dir:
         raise ValueError("unspecified data directory")
@@ -111,6 +115,7 @@ def load_data(
             class_cond=class_cond,
             random_crop=random_crop,
             cache_in_ram=cache_in_ram,
+            augment=augment,
         )
     else:
         all_files = _list_image_files_recursively(data_dir)
@@ -128,6 +133,7 @@ def load_data(
             classes=classes,
             random_crop=random_crop,
             cache_in_ram=cache_in_ram,
+            augment=augment,
         )
 
     sampler = None
@@ -206,6 +212,29 @@ def _prepare_arr(pil_image, resolution, random_crop):
     return np.ascontiguousarray(np.transpose(arr, [2, 0, 1])).astype(np.uint8)
 
 
+def dihedral_transform(arr, k, flip):
+    """Element ``(k, flip)`` of the dihedral group D4 applied to a square CHW array.
+
+    ``rot90`` by ``k`` quarter turns over the spatial axes, then a horizontal flip
+    when ``flip``. The 4 x 2 combinations are the 8 distinct symmetries of a square.
+    """
+    assert arr.shape[1] == arr.shape[2], f"dihedral transform needs a square image, got {arr.shape}"
+    out = np.rot90(arr, k, axes=(1, 2))
+    if flip:
+        out = out[:, :, ::-1]
+    return np.ascontiguousarray(out)
+
+
+def random_dihedral(arr):
+    """A uniformly random one of the 8 dihedral transforms of a square CHW array.
+
+    Drawn from torch's RNG, which the DataLoader seeds per worker from the main
+    process's (``--seed``-seeded) generator, so the draws follow the run seed.
+    """
+    d = int(torch.randint(8, ()))
+    return dihedral_transform(arr, d % 4, d >= 4)
+
+
 def _onehot(idx, num_classes):
     v = np.zeros(num_classes, dtype=np.float32)
     v[int(idx)] = 1.0
@@ -221,10 +250,12 @@ class ImageDataset(Dataset):
         classes=None,
         random_crop=False,
         cache_in_ram=False,
+        augment=False,
     ):
         super().__init__()
         self.resolution = resolution
         self.image_paths = image_paths
+        self.augment = augment
         self.num_classes = num_classes
         self.classes = classes
         self.random_crop = random_crop
@@ -254,6 +285,8 @@ class ImageDataset(Dataset):
                 pil_image.load()
 
         img = _prepare_arr(pil_image, self.resolution, self.random_crop)
+        if self.augment:  # after the (encoded-bytes) cache, so every epoch draws afresh
+            img = random_dihedral(img)
 
         out_dict = {}
         if self.classes is not None:
@@ -272,9 +305,11 @@ class ZipImageDataset(Dataset):
         class_cond=False,
         random_crop=False,
         cache_in_ram=False,
+        augment=False,
     ):
         super().__init__()
         self.zip_path = zip_path
+        self.augment = augment
         self.resolution = resolution
         self.num_classes = num_classes
         self.class_cond = class_cond
@@ -330,6 +365,8 @@ class ZipImageDataset(Dataset):
                 pil_image.load()
 
         img = _prepare_arr(pil_image, self.resolution, self.random_crop)
+        if self.augment:  # after the (encoded-bytes) cache, so every epoch draws afresh
+            img = random_dihedral(img)
 
         out_dict = {}
         if self.class_cond and fname in self._labels:

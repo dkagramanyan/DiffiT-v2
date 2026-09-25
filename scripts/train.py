@@ -46,7 +46,7 @@ import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults, logger
 from diffit.constants import PIXEL_NORM_HALF, UINT8_MAX, VAE_SCALE_FACTOR
 from diffit.dist_util import extract_inference_state_dict, load_state_dict
-from diffit.image_datasets import count_data, load_data, read_class_meta
+from diffit.image_datasets import count_data, dihedral_transform, load_data, read_class_meta
 from diffit.inception import InceptionFeatureExtractor
 from diffit.metrics import (
     COMBRA_IMPORT_ERROR,
@@ -429,6 +429,7 @@ def training_loop(
     lr_warmup_kimg=0,
     workers=3,
     cache_in_ram=False,
+    augment=True,
     num_fid_samples=10000,
     combra_ref_count=0,
     eval_sampler="ddim",
@@ -535,9 +536,10 @@ def training_loop(
 
     cur_nimg = 0
 
-    # Data loader (no augmentation).
+    # Data loader. --augment applies a random dihedral transform (rot90 x hflip) to each
+    # uint8 item before VAE encoding; this is the only loader that augments.
     if is_main:
-        logger.log("Loading data...")
+        logger.log(f"Loading data (dihedral augmentation {'on' if augment else 'off'})...")
     data_iter = load_data(
         data_dir=data,
         batch_size=batch_gpu,
@@ -548,6 +550,7 @@ def training_loop(
         distributed=(num_gpus > 1),
         cache_in_ram=cache_in_ram,
         seed=seed,
+        augment=augment,
     )
 
     # --- Logs: stats.jsonl (scalar rows only, §7) + TensorBoard ---
@@ -631,7 +634,11 @@ def training_loop(
                 logger.log("combra metrics enabled → DiffiT Inception metrics disabled.")
             # (reference, ok): ok is rank-uniform, so gating on it is safe -- combra_ref
             # is None on every non-zero rank whether or not anything failed.
-            combra_ref, combra_ok = precompute_combra_reference(local_ref, device, rank, num_gpus)
+            # The reference covers the distribution training sees: with --augment, combra
+            # expands it to all 8 dihedral transforms of each real.
+            combra_ref, combra_ok = precompute_combra_reference(
+                local_ref, device, rank, num_gpus, dihedral=augment,
+            )
             if not combra_ok:
                 # Disable eval outright: flipping only use_combra would route the
                 # snapshot ticks into the Inception path, whose extractor and
@@ -656,9 +663,20 @@ def training_loop(
             from torchvision.models import Inception_V3_Weights, inception_v3
             inception_model = inception_v3(weights=Inception_V3_Weights.DEFAULT).eval().to(device)
             inception_extractor = InceptionFeatureExtractor(inception_model)
-            logger.log(f"Pre-computing reference Inception features ({ref_count} images)...")
-            ref_acts = compute_activations(ref_images, inception_extractor, batch_size=64, device=device)
-            del ref_images
+            # With --augment the reference is every real in all 8 dihedral transforms
+            # (the distribution training sees), as on the combra path.
+            transforms = [(k, f) for f in (False, True) for k in range(4)] if augment else [(0, False)]
+            logger.log(f"Pre-computing reference Inception features "
+                       f"({ref_count} images x {len(transforms)} dihedral transforms)...")
+            parts = [
+                compute_activations(
+                    np.stack([dihedral_transform(im, k, f) for im in ref_images]),
+                    inception_extractor, batch_size=64, device=device,
+                )
+                for k, f in transforms
+            ]
+            ref_acts = {key: np.concatenate([p[key] for p in parts]) for key in parts[0]}
+            del ref_images, parts
             logger.log("Reference features computed.")
 
     # Class-sorted grid: each row cycles through classes 0..K-1.
@@ -1052,6 +1070,7 @@ BASE_CONFIGS = {
 @click.option("--bench",       help="Enable cuDNN autotune (benchmark)", metavar="BOOL", type=bool, default=True, show_default=True)
 @click.option("--workers",     help="DataLoader worker processes", metavar="INT", type=click.IntRange(min=1), default=3, show_default=True)
 @click.option("--cache-in-ram", help="Cache the entire dataset in RAM", metavar="BOOL", type=bool, default=True, show_default=True)
+@click.option("--augment",     help="Random dihedral augmentation (rot90 x hflip, 8 transforms) of training images; the metric reference is expanded to match", metavar="BOOL", type=bool, default=True, show_default=True)
 # Misc.
 @click.option("--desc",        help="String to include in result dir name", metavar="STR", type=str, default=None)
 @click.option("--combra-metrics", help="Compute combra generative-quality metrics each snapshot tick", metavar="BOOL", type=bool, default=True, show_default=True)
@@ -1130,6 +1149,7 @@ def launch_from_opts(opts):
         bench=opts["bench"],
         workers=opts["workers"],
         cache_in_ram=opts["cache_in_ram"],
+        augment=opts["augment"],
         num_fid_samples=cfg.num_fid_samples,
         combra_ref_count=opts["combra_ref_count"],
         cfg_scale=cfg.cfg_scale,

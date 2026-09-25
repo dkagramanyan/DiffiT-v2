@@ -46,6 +46,9 @@ export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export PYTHONUNBUFFERED=1
 
 # --- One console-command call ------------------------------------------------
+# AUGMENT=True (default): each training image gets a random dihedral transform
+# (rot90 x hflip); the zip holds the 1080 originals, one per crop, so an epoch is
+# 1080 images. AUGMENT=False trains on the originals as stored.
 # A run keeps the KEEP_LAST newest snapshots plus the best by combra_fid /
 # combra_fd_dinov2 / combra_cmmd (KEEP_LAST=0 keeps every one). Higher-resolution stages: set
 # INIT_WEIGHTS to the previous stage's best-by-combra_fid snapshot -- the file the last
@@ -59,10 +62,11 @@ fi
 diffit-train \
     --outdir "${OUTDIR:-./training-runs}" \
     --cfg "${CFG:-diffit-1024}" \
-    --data "${DATA:-./datasets/imagenet_9to4_1024x1024_1024x1024.zip}" \
+    --data "${DATA:-./datasets/imagenet_9to4_orig_1024x1024.zip}" \
     --gpus "${GPUS:-2}" \
     --batch-gpu "${BATCH_GPU:-16}" \
     --snapshot-keep-last "${KEEP_LAST:-1}" \
+    --augment "${AUGMENT:-True}" \
     --combra-metrics True --num-fid-samples "${NUM_FID_SAMPLES:-10000}" \
     --seed "${SEED:-42}" --workers "${WORKERS:-3}" \
     ${INIT_ARGS[@]+"${INIT_ARGS[@]}"} \
