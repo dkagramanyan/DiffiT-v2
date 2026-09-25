@@ -5,7 +5,55 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-25
+
+### Changed
+- **Training follows the paper recipe** (arXiv 2312.02139 App. I.2; DiT `train.py`
+  where the paper is silent: AdamW, weight decay 0, constant LR, no warmup). No
+  preset value changes: 3e-4 (256) and 1e-4 (512) are the paper's LRs; 1024 has no
+  paper recipe, reuses 1e-4 and keeps its 1000-kimg LR warmup (a warm-started
+  stage). Classifier-free guidance stays on all four latent eps channels (the
+  fork's deliberate change from upstream's `:3`); architecture unchanged.
+- **`sh/generate_*.sh` default to the DDPM sampler** (250 steps), the paper's and
+  the official `sample.py`'s sampler; was DDIM. `SAMPLER=ddim` restores it.
+- **Global batch 256 at 256² (paper App. I.2).** `sh/train_256.sh` defaults to
+  `BATCH_GPU=128` (was 96, global 192) on 2 GPUs, no gradient accumulation; LR stays
+  3e-4. Memory estimate: ~11.5 GB weights + grads + AdamW + EMA + VAE and ~0.55 GB of
+  activations per image (from 15.6 GB peak at batch 8, bf16) gives ~82 GB per GPU
+  at 128, well inside an H200's 141 GB. 512² / 1024² stay at 128 / 64.
+- **Snapshot retention keeps the best snapshots.** `--snapshot-keep-last N` (default
+  now `1`, was `3`; `KEEP_LAST` in `sh/train_*.sh`, default `1`) keeps the `N` newest
+  `diffit-snapshot-<kimg>-inference.pt` **plus** the best by each of `combra_fid`,
+  `combra_fd_dinov2` and `combra_cmmd` (lower is better; nan / missing skipped; ties
+  keep the earlier snapshot; one file may be best for several metrics). Best
+  snapshots are never pruned, so a default run holds at most 4 files; `0` still keeps
+  all. Pruning runs after the tick's eval has scored the newest snapshot (the eval and
+  the save use the same EMA at the same `cur_nimg`). Each snapshot tick logs
+  `Best snapshots: combra_fid <v> <file>  combra_fd_dinov2 <v> <file>  combra_cmmd <v> <file>`.
+  For the next stage's `INIT_WEIGHTS` / `--init-weights`, use the best-by-`combra_fid`
+  snapshot named on the last such line.
+- **combra pin `v0.17.1` → `v0.18.0`.** combra 0.18.0 computes FD-DINOv2 with
+  `dinov2_vitl14`; `download_models.sh` now prefetches
+  `dinov2_vitl14_pretrain.pth` (was `dinov2_vitb14`) and its echo names the right
+  directory (`$HUB_CKPT`). FD-DINOv2 values are not comparable with earlier runs.
+- **README "Differences from the original NVlabs/DiffiT" rewritten** after an audit
+  against upstream: every model / training / sampling difference, each marked as an
+  improvement, a v2 contract or an adaptation, plus what is identical. Corrected: the
+  freed `relative_position_index` memory at 1024² is ~3.76 GB (was "~2 GB"); the
+  parameter count is 560.7M at 1000 classes vs upstream's 561.0M (was "matches
+  561M"); training-time eval uses DDIM 100 (was "DPM-Solver++").
+
+### Removed
+- **Horizontal-flip augmentation** (`--mirror` in `diffit-train`, the `mirror`
+  argument of `diffit.image_datasets.load_data` / `ImageDataset` /
+  `ZipImageDataset`, `--mirror False` in `sh/train_*.sh`). Training data is never
+  flipped. `diffit-compare-samplers` no longer passes the nonexistent `random_flip`
+  argument to `load_data`.
+
 ### Fixed
+- **Eval / snapshot sampling and VAE decode follow `--precision`.** They ran under
+  fp16 autocast whatever the training precision; they now use the training
+  autocast dtype (bf16 by default; fp32 runs without autocast).
 - **EMA identical on every rank.** The model was built under the per-rank seed and
   the EMA was copied from it before DDP broadcast rank 0's weights, so each rank's
   EMA kept its own random init (from-scratch multi-GPU runs; eval drew half its

@@ -100,8 +100,12 @@ def generate_snapshot_images(
     ema_model, vae, diffusion, grid_z, grid_classes, batch_gpu, device,
     *,
     cfg_scale, null_class_idx, num_sampling_steps=25, scale_pow=4.0, sampler="dpm++",
+    amp_dtype=torch.float16,
 ):
-    """Generate a batch of images from the EMA model for snapshot grids."""
+    """Generate a batch of images from the EMA model for snapshot grids.
+
+    ``amp_dtype``: autocast dtype for sampling + VAE decode (None = fp32).
+    """
     all_samples = []
     for z_chunk, c_chunk in zip(grid_z.split(batch_gpu), grid_classes.split(batch_gpu)):
         bs = z_chunk.shape[0]
@@ -113,7 +117,7 @@ def generate_snapshot_images(
             "diffusion_steps": 1000,
             "scale_pow": scale_pow,
         }
-        with torch.amp.autocast("cuda", dtype=torch.float16):
+        with torch.amp.autocast("cuda", dtype=amp_dtype or torch.float16, enabled=amp_dtype is not None):
             sample = sample_latents(
                 ema_model.forward_with_cfg,
                 diffusion,
@@ -160,10 +164,30 @@ def save_inference_snapshot(ema_model, run_dir, cur_nimg, meta):
     return path
 
 
-def prune_inference_snapshots(run_dir, keep_last):
-    """Delete all but the ``keep_last`` newest inference snapshots.
+# Snapshot retention: besides the --snapshot-keep-last newest snapshots, the best
+# one by each of these metrics is kept (lower is better for all three).
+BEST_SNAPSHOT_METRICS = ("combra_fid", "combra_fd_dinov2", "combra_cmmd")
 
-    ``keep_last <= 0`` keeps everything. Matches only
+
+def update_best_snapshots(best, metrics, path):
+    """Record ``path`` in ``best`` (``{metric: (value, path)}``) for every metric it improves.
+
+    Lower is better; missing or non-finite values are ignored; a tie keeps the
+    earlier snapshot.
+    """
+    for key in BEST_SNAPSHOT_METRICS:
+        value = (metrics or {}).get(key)
+        if value is None or not math.isfinite(value):
+            continue
+        if key not in best or value < best[key][0]:
+            best[key] = (float(value), path)
+
+
+def prune_inference_snapshots(run_dir, keep_last, best=None):
+    """Delete all but the ``keep_last`` newest inference snapshots and the ``best`` ones.
+
+    ``best`` is the ``{metric: (value, path)}`` dict of :func:`update_best_snapshots`;
+    those files are never deleted. ``keep_last <= 0`` keeps everything. Matches only
     ``diffit-snapshot-<kimg>-inference.pt``.
     """
     if keep_last <= 0:
@@ -175,7 +199,10 @@ def prune_inference_snapshots(run_dir, keep_last):
         return int(m.group(1)) if m else -1
 
     snaps.sort(key=_kimg)
+    keep = {os.path.abspath(p) for _, p in (best or {}).values()}
     for old in snaps[:-keep_last]:
+        if os.path.abspath(old) in keep:
+            continue
         try:
             os.remove(old)
         except OSError:
@@ -361,7 +388,7 @@ def load_reference_shard(data, ref_count, total_count, image_size, workers, rank
 
     ref_iter = load_data(
         data_dir=data, batch_size=64, image_size=image_size, num_classes=num_classes,
-        class_cond=True, mirror=False, num_workers=workers,
+        class_cond=True, num_workers=workers,
         distributed=False, deterministic=True, drop_last=False,
     )
     shard = []
@@ -397,7 +424,6 @@ def training_loop(
     model_name,
     schedule_sampler_name,
     cfg_scale,
-    mirror=False,
     grad_accum_steps=1,
     gradient_checkpointing=False,
     lr_warmup_kimg=0,
@@ -408,7 +434,7 @@ def training_loop(
     eval_sampler="ddim",
     eval_sampling_steps=100,
     combra_metrics=True,
-    snapshot_keep_last=3,
+    snapshot_keep_last=1,
     **_extra,
 ):
     """Main training loop for DiffiT."""
@@ -432,6 +458,8 @@ def training_loop(
     amp_enabled = precision in ("fp16", "bf16")
     amp_dtype_torch = torch.bfloat16 if precision == "bf16" else torch.float16
     use_grad_scaler = precision == "fp16"
+    # Eval / snapshot sampling and VAE decode follow --precision (None = fp32).
+    eval_amp_dtype = amp_dtype_torch if amp_enabled else None
     if is_main:
         logger.log(f"Precision: {precision} (amp={amp_enabled}, grad_scaler={use_grad_scaler})")
 
@@ -507,7 +535,7 @@ def training_loop(
 
     cur_nimg = 0
 
-    # Data loader — mirror is the loader-level per-item horizontal flip (§2).
+    # Data loader (no augmentation).
     if is_main:
         logger.log("Loading data...")
     data_iter = load_data(
@@ -516,7 +544,6 @@ def training_loop(
         image_size=image_size,
         num_classes=num_dataset_classes,
         class_cond=True,
-        mirror=mirror,
         num_workers=workers,
         distributed=(num_gpus > 1),
         cache_in_ram=cache_in_ram,
@@ -643,7 +670,7 @@ def training_loop(
         class_images = {c: [] for c in range(num_dataset_classes)}
         collect_iter = load_data(
             data_dir=data, batch_size=64, image_size=image_size,
-            num_classes=num_dataset_classes, class_cond=True, mirror=False,
+            num_classes=num_dataset_classes, class_cond=True,
             num_workers=2, distributed=False,
         )
         class_count_needed = {}
@@ -695,6 +722,7 @@ def training_loop(
             batch_gpu=batch_gpu, device=device,
             cfg_scale=cfg_scale, null_class_idx=num_dataset_classes,
             sampler=eval_sampler, num_sampling_steps=eval_sampling_steps,
+            amp_dtype=eval_amp_dtype,
         )
         save_image_grid(fakes_init, os.path.join(run_dir, "fakes_init.png"), drange=[0, 255], grid_size=grid_size)
         if stats_tfevents is not None:
@@ -717,6 +745,7 @@ def training_loop(
     maintenance_time = 0.0  # measured at the end of a tick, reported on the next
     cur_tick = 0
     best_fid = float("inf")   # running best combra FID -> Metrics/combra_fid_best
+    best_snaps = {}           # {metric: (value, snapshot path)}, rank 0; see update_best_snapshots
 
     while cur_nimg < total_kimg * 1000:
         opt.zero_grad(set_to_none=True)
@@ -816,6 +845,7 @@ def training_loop(
                         batch_gpu=batch_gpu, device=device,
                         cfg_scale=cfg_scale, null_class_idx=num_dataset_classes,
                         sampler=eval_sampler, num_sampling_steps=eval_sampling_steps,
+                        amp_dtype=eval_amp_dtype,
                     )
                     fakes_name = f"fakes{cur_nimg // 1000:06d}.png"
                     save_image_grid(
@@ -827,6 +857,7 @@ def training_loop(
                         grid_u8 = save_image_grid_to_array(fakes, grid_size)
                         stats_tfevents.add_image("Fakes", grid_u8, global_step=cur_nimg, dataformats="HWC")
 
+                stats_metrics = None
                 if num_fid_samples > 0:
                     eval_start = time.time()
                     stats_metrics = evaluate_metrics(
@@ -840,6 +871,7 @@ def training_loop(
                         null_class_idx=num_dataset_classes,
                         combra_ref=combra_ref,
                         inception_metrics=not use_combra,
+                        amp_dtype=eval_amp_dtype,
                     )
                     if is_main and stats_metrics is not None:
                         for name, value in stats_metrics.items():
@@ -855,9 +887,18 @@ def training_loop(
                         row["Timing/eval_sec"] = time.time() - eval_start
 
                 if is_main:
+                    # The eval above scored this same EMA at this same cur_nimg, so
+                    # its metrics belong to the snapshot saved here.
                     path = save_inference_snapshot(ema_model, run_dir, cur_nimg, ckpt_meta)
-                    prune_inference_snapshots(run_dir, snapshot_keep_last)
                     logger.log(f"Saved {os.path.basename(path)}")
+                    update_best_snapshots(best_snaps, stats_metrics, path)
+                    if best_snaps:
+                        logger.log("Best snapshots: " + "  ".join(
+                            f"{k} {best_snaps[k][0]:.4f} {os.path.basename(best_snaps[k][1])}"
+                            for k in BEST_SNAPSHOT_METRICS if k in best_snaps))
+                    # After this tick's eval has scored the newest snapshot: the N
+                    # newest plus the best per metric; best ones are never pruned.
+                    prune_inference_snapshots(run_dir, snapshot_keep_last, best_snaps)
 
             # Write the one scalar row for this tick (§7).
             if is_main:
@@ -960,6 +1001,12 @@ class TrainConfig:
     lr_warmup_kimg: int = 0
 
 
+# Paper recipe (arXiv 2312.02139, App. I.2): lr 3e-4 @ ImageNet-256, 1e-4 @ ImageNet-512,
+# EMA 0.9999, ADM diffusion settings. Where the paper is silent the DiT recipe applies
+# (facebookresearch/DiT train.py): AdamW, weight decay 0, constant LR, no warmup. CFG
+# scales are the official NVlabs/DiffiT sampling values (256: 4.4 with the power-cosine
+# schedule, 512: 1.49). There is no 1024 recipe; it reuses the 512 values and keeps a
+# 1000-kimg warmup because it is normally a warm-started stage.
 BASE_CONFIGS = {
     "diffit-256": TrainConfig(image_size=256, lr=3e-4, cfg_scale=4.4),
     "diffit-512": TrainConfig(image_size=512, lr=1e-4, cfg_scale=1.49),
@@ -1003,13 +1050,12 @@ BASE_CONFIGS = {
 @click.option("--lr-warmup",   help="Linear LR warmup duration in kimg (0 = disabled) [default: from cfg]", metavar="KIMG", type=click.IntRange(min=0), default=None)
 @click.option("--tf32",        "allow_tf32", help="Enable TF32 for matmul/conv", metavar="BOOL", type=bool, default=True, show_default=True)
 @click.option("--bench",       help="Enable cuDNN autotune (benchmark)", metavar="BOOL", type=bool, default=True, show_default=True)
-@click.option("--mirror",      help="Stochastic per-item horizontal flip in the training loader", metavar="BOOL", type=bool, default=False, show_default=True)
 @click.option("--workers",     help="DataLoader worker processes", metavar="INT", type=click.IntRange(min=1), default=3, show_default=True)
 @click.option("--cache-in-ram", help="Cache the entire dataset in RAM", metavar="BOOL", type=bool, default=True, show_default=True)
 # Misc.
 @click.option("--desc",        help="String to include in result dir name", metavar="STR", type=str, default=None)
 @click.option("--combra-metrics", help="Compute combra generative-quality metrics each snapshot tick", metavar="BOOL", type=bool, default=True, show_default=True)
-@click.option("--snapshot-keep-last", help="Keep only the N newest inference snapshots (0 = keep all)", metavar="INT", type=click.IntRange(min=0), default=3, show_default=True)
+@click.option("--snapshot-keep-last", help="Keep the N newest inference snapshots plus the best by combra_fid / combra_fd_dinov2 / combra_cmmd (0 = keep all)", metavar="INT", type=click.IntRange(min=0), default=1, show_default=True)
 @click.option("-n", "--dry-run", help="Print training options and exit", is_flag=True)
 def main(**kwargs):
     """Train DiffiT on class-conditional data."""
@@ -1082,7 +1128,6 @@ def launch_from_opts(opts):
         schedule_sampler_name=cfg.schedule_sampler_name,
         allow_tf32=opts["allow_tf32"],
         bench=opts["bench"],
-        mirror=opts["mirror"],
         workers=opts["workers"],
         cache_in_ram=opts["cache_in_ram"],
         num_fid_samples=cfg.num_fid_samples,

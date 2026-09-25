@@ -75,7 +75,6 @@ def load_data(
     class_cond=False,
     deterministic=False,
     random_crop=False,
-    mirror=False,
     num_workers=4,
     distributed=False,
     cache_in_ram=False,
@@ -97,8 +96,6 @@ def load_data(
     :param class_cond: if True, include a "y" key for class labels.
     :param deterministic: if True, yield results in a deterministic order.
     :param random_crop: if True, randomly crop the images for augmentation.
-    :param mirror: if True, apply a stochastic per-item horizontal flip
-        (the §2 loader-level augmentation). Eval/reference loaders pass False.
     :param num_workers: number of DataLoader workers.
     :param distributed: if True, use DistributedSampler for multi-GPU.
     :param seed: base seed for the DistributedSampler shuffle (§2).
@@ -113,7 +110,6 @@ def load_data(
             num_classes=num_classes,
             class_cond=class_cond,
             random_crop=random_crop,
-            mirror=mirror,
             cache_in_ram=cache_in_ram,
         )
     else:
@@ -131,7 +127,6 @@ def load_data(
             num_classes=num_classes,
             classes=classes,
             random_crop=random_crop,
-            mirror=mirror,
             cache_in_ram=cache_in_ram,
         )
 
@@ -189,7 +184,7 @@ def count_data(data_dir):
     return len(_list_image_files_recursively(data_dir))
 
 
-def _prepare_arr(pil_image, resolution, random_crop, mirror):
+def _prepare_arr(pil_image, resolution, random_crop):
     """Decode a PIL image to a ``uint8`` CHW array at ``resolution``.
 
     Asserts 3-channel RGB rather than silently converting: the pipeline is
@@ -206,8 +201,6 @@ def _prepare_arr(pil_image, resolution, random_crop, mirror):
         arr = random_crop_arr(pil_image, resolution)
     else:
         arr = center_crop_arr(pil_image, resolution)
-    if mirror and random.random() < 0.5:
-        arr = arr[:, ::-1]
     assert arr.ndim == 3 and arr.shape[2] == 3, f"expected HWC RGB, got {arr.shape}"
     # uint8 CHW; normalization is done in the training loop.
     return np.ascontiguousarray(np.transpose(arr, [2, 0, 1])).astype(np.uint8)
@@ -227,7 +220,6 @@ class ImageDataset(Dataset):
         num_classes,
         classes=None,
         random_crop=False,
-        mirror=False,
         cache_in_ram=False,
     ):
         super().__init__()
@@ -236,7 +228,6 @@ class ImageDataset(Dataset):
         self.num_classes = num_classes
         self.classes = classes
         self.random_crop = random_crop
-        self.mirror = mirror
         self._cache = None
 
         if cache_in_ram:
@@ -262,7 +253,7 @@ class ImageDataset(Dataset):
                 pil_image = Image.open(f)
                 pil_image.load()
 
-        img = _prepare_arr(pil_image, self.resolution, self.random_crop, self.mirror)
+        img = _prepare_arr(pil_image, self.resolution, self.random_crop)
 
         out_dict = {}
         if self.classes is not None:
@@ -280,7 +271,6 @@ class ZipImageDataset(Dataset):
         num_classes,
         class_cond=False,
         random_crop=False,
-        mirror=False,
         cache_in_ram=False,
     ):
         super().__init__()
@@ -289,7 +279,6 @@ class ZipImageDataset(Dataset):
         self.num_classes = num_classes
         self.class_cond = class_cond
         self.random_crop = random_crop
-        self.mirror = mirror
 
         self._zipfile = None
         self._image_fnames = []
@@ -340,7 +329,7 @@ class ZipImageDataset(Dataset):
                 pil_image = Image.open(f)
                 pil_image.load()
 
-        img = _prepare_arr(pil_image, self.resolution, self.random_crop, self.mirror)
+        img = _prepare_arr(pil_image, self.resolution, self.random_crop)
 
         out_dict = {}
         if self.class_cond and fname in self._labels:

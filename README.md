@@ -24,28 +24,60 @@ For business inquiries, please visit our website and submit the form: [NVIDIA Re
 
 ## Differences from the original NVlabs/DiffiT
 
-This repo is an engineering refresh of the upstream [NVlabs/DiffiT](https://github.com/NVlabs/DiffiT). The model's core contribution — **Time-dependent Multihead Self-Attention (TMSA)** — is preserved exactly as in the paper (Eqs 3–5, Fig 7b), and the parameter count stays at **561M** (matches Table 9). The changes are to the *engineering* around it: the attention internals, the training/sampling infrastructure, and the latent pipeline.
+Audited against the upstream [NVlabs/DiffiT](https://github.com/NVlabs/DiffiT) code
+(this repo's first commit) and the paper (arXiv 2312.02139) on 2026-09-25. Upstream
+ships the model, the diffusion code and a sampling script only; the training recipe
+comes from the paper. **Kind:** *improvement* = deliberate model/training change;
+*contract* = the shared v2 convention of the four WC-Co model repos (san-v2 /
+StyleSwin-v2 / EDM2-v2 / DiffiT-v2); *adaptation* = fitted to this project's data,
+hardware or evaluation.
 
-**Architecture (per-block attention internals):**
+**Model:**
 
-| Change | What it does | Why |
-|---|---|---|
-| **RoPE-2D** replaces learned relative-position bias | Axial rotary embeddings on Q, K | Unlocks FlashAttention-2 (attn_mask is no longer needed) and enables progressive-resolution finetuning across 256/512/1024. Frees ~2 GB `relative_position_index` buffer at 1024². |
-| **QK-norm** (RMSNorm on Q, K) | Stateful per-head RMSNorm before RoPE | Prevents bf16/fp16 attention-logit blow-up at depth-28, hidden-1152 scale. |
-| **RMSNorm** replaces LayerNorm | Stateless RMS normalization | ~1–2% faster, no quality regression. |
-| **SwiGLU** MLP | Matched-param `hidden × 8/3` inner width, rounded to 64 | Modern FFN; small consistent quality gain. |
-| **TMSA preserved** | Additive time-token QKV projection | Paper's core contribution (Eqs 3–5, Fig 7b). Parameter count stays at **561M** — matches Table 9 of the paper. |
-| **CFG split fix** | Split at `self.in_channels` (=4 for SD-VAE) | Original code hardcoded `:3` which was wrong for 4-channel latents. |
+| Area | Upstream / paper | This fork | Kind |
+|---|---|---|---|
+| Position encoding | Fixed 2-D sin-cos `pos_embed` added to the patch tokens, plus a learned Swin-style relative-position bias table per block, indexed by an `int64` `relative_position_index` buffer (one per block) | Axial **RoPE-2D** on Q and K, tables rebuilt for the grid at load time (non-persistent buffers); no `pos_embed`, no bias table | improvement |
+| └ why | The bias table and index are sized to one grid, so weights do not transfer across resolutions; the additive bias forces an explicit attention matrix | Weights transfer across 256/512/1024 (progressive training); no `attn_mask`, so SDPA can dispatch to FlashAttention; frees the index buffers, **~3.76 GB** at 1024² (28 blocks × 4096² × 8 B) | |
+| QK normalisation | none | **QK RMSNorm** per head (affine weight) on Q and K before RoPE, for bf16 logit stability | improvement |
+| Block / final norm | `LayerNorm(elementwise_affine=False, eps=1e-6)` | **RMSNorm**, no affine, eps 1e-6 | improvement |
+| MLP | timm `Mlp`, GELU (tanh), hidden 4608 (ratio 4) | **SwiGLU** (`gate` / `up` / `down`), hidden 3072 (4 × 2/3, rounded to 64): same parameter budget | improvement |
+| Classifier-free guidance | Guides eps channels `:3` | Guides **all 4 latent eps channels** (`:in_channels`); the learned-variance channels pass through | improvement |
+| Gradient checkpointing | none | Optional per-block checkpointing (`--grad-ckpt`; on in `diffit-1024`) | adaptation |
+| Parameter count (DiffiT-XL/2, 256², 1000 classes) | 561.0M trainable (+0.29M frozen `pos_embed`) | **560.7M** (the relative-position tables go, QK-norm and SwiGLU biases add a little); 559.5M with this project's 3 classes | — |
+| Number of classes | 1000 (ImageNet) | Read from the dataset's `dataset.json` (`class_names`); 3 WC-Co grain classes here | adaptation |
 
-**Pipeline, training & sampling infrastructure:**
+**Training** (upstream has no training script; "paper" is App. I.2):
 
-- **Latent diffusion** — operates in the Stable-Diffusion VAE latent space (`stabilityai/sd-vae-ft-ema`, scaled by `0.18215`), so the transformer denoises 4-channel latents rather than pixels.
-- **Self-spawning `torch.multiprocessing` + `torch.compile`** — `--gpus N` launches one worker per GPU for both training and generation (no `torchrun`, replaces MPI); `max-autotune` mode (with CUDA graphs, or `no-cudagraphs` when gradient checkpointing is on). Fused AdamW, DDP with `no_sync()` gradient accumulation.
-- **kimg/tick training loop** with inline, **distributed** quality metrics computed every `snap` ticks during training — no separate eval job needed. **combra** generative-quality metrics (FID / CMMD / FD-DINOv2 + angle-density) are the default; DiffiT's own Inception suite (IS / FID / sFID / Precision / Recall) is the fallback when combra is off.
-- **DPM-Solver++** for fast training-time sample snapshots; DDPM/DDIM/UniPC available for full sampling.
-- **CFG schedule** — power-cosine CFG schedule at 256² (`input_size ≤ 32`), constant CFG scale at 512²/1024².
+| Area | Paper | This fork | Kind |
+|---|---|---|---|
+| Resolutions | 256² and 512², each trained separately; no 1024² | **Progressive 256² → 512² → 1024²**, each stage warm-started from the previous stage's EMA weights with `--init-weights` / `INIT_WEIGHTS` (weights only, fresh optimizer) | improvement |
+| LR warmup | none (DiT recipe) | none at 256/512; **1000 kimg** linear warmup at 1024² (a warm-started stage with no paper recipe) | improvement |
+| Global batch | 256 @ 256², 512 @ 512² | **256 / 128 / 64** at 256² / 512² / 1024² on 2× H200 (128×2; 64×2; 16×2×2 accum + checkpointing) | adaptation |
+| LR, EMA, optimizer | 3e-4 (256) / 1e-4 (512), EMA 0.9999; AdamW, wd 0, constant LR (DiT) | same; 1024² reuses 1e-4 | identical |
+| Precision | — (upstream sampling: optional fp16) | **bf16** autocast for the model and the VAE encode (`--precision`; GradScaler only for fp16) | adaptation |
+| Eval / snapshot sampling precision | — | Sampling and VAE decode follow `--precision` (bf16 by default; fp32 without autocast) | contract |
+| Data augmentation | — (DiT uses random horizontal flips) | **None**: the horizontal-flip option (`--mirror`) was removed | adaptation |
+| Training-time eval | none (offline FID-50K) | Every `snap` ticks on the EMA: **combra** FID / CMMD / FD-DINOv2 + angle-density metrics (DiffiT's Inception suite when combra is off), sampler **DDIM 100** steps for cost | contract / adaptation |
+| Checkpoints | — | EMA-only `diffit-snapshot-<kimg>-inference.pt` with `n_classes` / `resolution` / `class_names` / `cur_nimg`, atomic writes, no resume; keeps the `--snapshot-keep-last` newest (default 1) plus the best by `combra_fid` / `combra_fd_dinov2` / `combra_cmmd` | contract |
+| Logging | — | Rank-0 `.log`, scalar-only `stats.jsonl`, one TensorBoard event file (spec §7) | contract |
+| Launch | — | Self-spawning `torch.multiprocessing` (`--gpus N`), DDP with `no_sync()` accumulation, `torch.compile`, fused AdamW, `click` CLI, `sh/` scripts | contract |
 
-**Expected performance** (vs. original DiffiT): ~1.1–1.3× at 256², ~1.8–2.5× at 512², **~3–5× at 1024²** — dominated by FlashAttention at high resolution. Quality impact: ±0.1–0.3 FID, directionally positive.
+**Sampling:**
+
+| Area | Upstream / paper | This fork | Kind |
+|---|---|---|---|
+| Final generation sampler | DDPM, 250 steps | same (`sh/generate_*.sh` default); DDIM / DPM-Solver++ / UniPC also available | identical |
+| CFG schedule | Power-cosine at 256² (latent ≤ 32), constant scale above; scales 4.4 (256) / 1.49 (512) | same; 1024² uses the constant 1.49 | identical |
+| Output | `.npz` for the ADM evaluator | Also a unified per-run HDF5 with per-image seeds (`diffit-gen-images`) | contract |
+
+**Identical to upstream:** TMSA (additive time-token QKV projection, Eqs 3–5, Fig 7b);
+the timestep / label embedders and the null-class token for CFG dropout (0.1);
+`PatchEmbed`; the final layer (norm → SiLU → linear, apart from RMSNorm); weight
+initialisation (xavier, embedder `std=0.02`, zero-init final layer); the DiffiT-XL/2
+shape (depth 28, hidden 1152, patch 2, 16 heads; only the class's unused default depth
+changed 30 → 28); the diffusion code (`gaussian_diffusion`, `respace`,
+`timestep_sampler`, linear schedule, 1000 steps, learned sigma); the latent pipeline
+(`stabilityai/sd-vae-ft-ema`, scale 0.18215).
 
 > **⚠️ Checkpoints from the original DiffiT are not compatible with v2** — parameter names and shapes changed (learned position bias removed, RoPE/QK-norm/SwiGLU added).
 
@@ -165,7 +197,7 @@ can still override any preset value.
 | `diffit-512` | 512 | DiffiT-XL/2 | 1e-4 | bf16 | 400000 | 1.49 (constant) | off |
 | `diffit-1024` | 1024 | DiffiT-XL/2 | 1e-4 | bf16 | 400000 | 1.49 (constant) | on |
 
-Paper's recipe (Appendix I.2, p.22): AdamW, EMA 0.9999, DDPM sampler 250 steps, ADM diffusion hyperparameters.
+Paper's recipe (Appendix I.2, p.22): LR 3e-4 / batch 256 (ImageNet-256), LR 1e-4 / batch 512 (ImageNet-512), EMA 0.9999, DDPM sampler 250 steps, ADM diffusion hyperparameters. The paper names no optimizer, weight decay or warmup for the latent models, so those follow DiT (`facebookresearch/DiT` `train.py`): AdamW, weight decay 0, constant LR, no warmup. `diffit-1024` (no paper recipe) reuses the 512 LR and keeps a 1000-kimg linear LR warmup, since it is normally a warm-started stage; the 256/512 presets use none. `sh/generate_*.sh` default to the paper's DDPM sampler with 250 steps.
 
 ### Training strategies
 
@@ -194,9 +226,9 @@ diffit-train --outdir=./training-runs \
     --cfg=diffit-256 \
     --data=./datasets/imagenet_256x256.zip \
     --gpus 2 \
-    --batch-gpu 96
+    --batch-gpu 128
 ```
-Global batch = 192. Per paper (Section I.2): LR 3e-4, batch 256, EMA 0.9999.
+Global batch = 256, the paper's (Section I.2), with LR 3e-4 and EMA 0.9999; no gradient accumulation.
 
 #### 512² from scratch
 
@@ -235,7 +267,7 @@ diffit-train --outdir=./training-runs \
     --cfg=diffit-256 \
     --data=./datasets/imagenet_256x256.zip \
     --gpus 2 \
-    --batch-gpu 96
+    --batch-gpu 128
 ```
 Let it run until FID plateaus on the inline eval (check TensorBoard). For a strong base, aim for 100k–200k kimg.
 
@@ -247,13 +279,16 @@ diffit-train --outdir=./training-runs \
     --data=./datasets/imagenet_512x512.zip \
     --gpus 2 \
     --batch-gpu 64 \
-    --init-weights ./training-runs/00000-diffit-256-*/diffit-snapshot-*-inference.pt \
+    --init-weights ./training-runs/00000-diffit-256-*/diffit-snapshot-<kimg>-inference.pt \
     --lr 5e-5 \
     --lr-warmup 500 \
     --kimg 100000
 ```
 `--init-weights` is a weights-only warm start (loads the previous stage's EMA
-weights, fresh optimizer) — not a resume. Lower LR (5e-5 ≈ half of the
+weights, fresh optimizer) — not a resume. Use the previous stage's
+**best-by-`combra_fid` snapshot**: the file its `.log`'s last `Best snapshots:` line
+names for `combra_fid` (the newest snapshot if that run had no eval). The same file
+goes into `INIT_WEIGHTS` for `sh/train_*.sh`. Lower LR (5e-5 ≈ half of the
 `diffit-512` default) for finetuning, short warmup, and a smaller total-kimg
 budget — finetuning converges faster than from-scratch.
 
@@ -265,7 +300,7 @@ diffit-train --outdir=./training-runs \
     --data=./datasets/imagenet_1024x1024.zip \
     --gpus 2 \
     --batch-gpu 16 \
-    --init-weights ./training-runs/00001-diffit-512-*/diffit-snapshot-*-inference.pt \
+    --init-weights ./training-runs/00001-diffit-512-*/diffit-snapshot-<kimg>-inference.pt \
     --lr 2e-5 \
     --lr-warmup 500 \
     --kimg 50000
@@ -303,10 +338,14 @@ Runs go start-to-finish: **there is no `--resume`, no auto-restart, and no
 rolling/best/final full checkpoint.** A crash or walltime kill cannot be
 continued, so size `--kimg` (or split into progressive `--init-weights` stages)
 to fit the job's time limit. Every snapshot is written atomically and the last
-tick always snapshots, so a completed run always ends in a usable model. Pick the
-best checkpoint post-hoc from `stats.jsonl` against the kept
-`diffit-snapshot-<kimg>-inference.pt` history (raise `--snapshot-keep-last` to
-keep more, `0` for all).
+tick always snapshots, so a completed run always ends in a usable model. The
+`--snapshot-keep-last` newest `diffit-snapshot-<kimg>-inference.pt` (default 1)
+are kept **plus** the best snapshot by each of `combra_fid`, `combra_fd_dinov2` and
+`combra_cmmd` (lower is better; nan skipped; ties keep the earlier one; one file can
+be best for several metrics), so a default run holds at most 4 snapshots and best
+ones are never pruned. Each snapshot tick logs
+`Best snapshots: combra_fid <v> <file>  combra_fd_dinov2 <v> <file>  combra_cmmd <v> <file>`.
+`--snapshot-keep-last 0` keeps every snapshot.
 
 ### Training options
 
@@ -332,13 +371,12 @@ keep more, `0` for all).
 | `--num-fid-samples` | from cfg (10000) | Fakes for eval / combra each tick (0=disable) |
 | `--combra-ref-count` | 0 | Cap the combra reference to a seeded random subset of N reals (0 = whole dataset) |
 | `--combra-metrics` | True | Compute combra generative-quality metrics each snapshot tick; warns if requested but combra is not installed |
-| `--snapshot-keep-last` | 3 | Keep only the N newest `diffit-snapshot-<kimg>-inference.pt` snapshots (0 = keep all) |
+| `--snapshot-keep-last` | 1 | Keep the N newest `diffit-snapshot-<kimg>-inference.pt` snapshots plus the best by `combra_fid` / `combra_fd_dinov2` / `combra_cmmd` (0 = keep all) |
 | `--grad-accum` | from cfg | Gradient accumulation steps (effective batch = batch-gpu × gpus × accum) |
 | `--grad-ckpt` | from cfg | Gradient checkpointing (`True`/`False`) |
 | `--lr-warmup` | from cfg | Linear LR warmup duration in kimg (0 = disabled) |
 | `--tf32` | True | Enable TF32 for matmul/conv (`True`/`False`) |
 | `--bench` | True | Enable cuDNN autotune / benchmark (`True`/`False`) |
-| `--mirror` | False | Stochastic per-item horizontal flip in the training loader (`True`/`False`) |
 | `--workers` | 3 | DataLoader worker processes |
 | `--cache-in-ram` | True | Cache entire dataset in RAM (`True`/`False`) |
 | `-n, --dry-run` | off | Print resolved training options and exit |
@@ -358,7 +396,7 @@ training-runs/00000-diffit-256-gpus4-batch256/
 ├── fakes000200.png                        # Generated images at 200 kimg
 ├── fakes000400.png                        # Generated images at 400 kimg
 ├── ...
-├── diffit-snapshot-000998-inference.pt    # EMA-only snapshot + metadata (newest --snapshot-keep-last kept)
+├── diffit-snapshot-000998-inference.pt    # EMA-only snapshot + metadata (newest --snapshot-keep-last + best per metric kept)
 ├── diffit-snapshot-000999-inference.pt
 └── diffit-snapshot-001000-inference.pt    # Last tick always snapshots → this IS the final model
 ```
@@ -367,7 +405,8 @@ There is exactly one checkpoint kind: `diffit-snapshot-<kimg>-inference.pt` — 
 weights only, plus self-describing metadata (`n_classes`, `resolution`,
 `class_names`, `cur_nimg`). It is written every `--snap` ticks **and always at the
 last tick**, atomically (temp file + `os.replace`), and pruned to the newest
-`--snapshot-keep-last`. No optimizer state, discriminators, or raw (non-EMA)
+`--snapshot-keep-last` plus the best by each of `combra_fid` / `combra_fd_dinov2` /
+`combra_cmmd`. No optimizer state, discriminators, or raw (non-EMA)
 weights ever touch disk; there is no resume, best-model, rolling `latest`, or
 final full checkpoint. The inference loaders (`gen_images.py`, `sample.py`)
 extract the EMA weights from any of these (or an older bare EMA `state_dict`).

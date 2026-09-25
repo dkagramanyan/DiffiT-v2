@@ -52,6 +52,27 @@ def test_forward_output_shape_no_sigma():
     assert out.shape == (2, 4, 8, 8)
 
 
+def test_cfg_guides_all_latent_eps_channels():
+    # Fork change: guidance on all 4 latent eps channels (upstream's `:3` is wrong
+    # for 4-channel latents); the learned-variance channels pass through.
+    model = _tiny_model(input_size=64).eval()  # > 32: constant-scale branch
+    torch.manual_seed(1)
+    with torch.no_grad():  # zero-init layers would make cond == uncond
+        for prm in model.parameters():
+            prm.add_(0.1 * torch.randn_like(prm))
+    x = torch.randn(2, 4, 64, 64)
+    x = torch.cat([x, x], 0)
+    t = torch.full((4,), 500)
+    y = torch.tensor([1, 2, 10, 10])  # [cond, null]
+    with torch.no_grad():
+        out = model.forward_with_cfg(x, t, y, cfg_scale=3.0)
+        raw = model(x, t, y)
+    cond, uncond = raw[:2], raw[2:]
+    guided = uncond[:, :4] + 3.0 * (cond[:, :4] - uncond[:, :4])
+    torch.testing.assert_close(out[:2, :4], guided)
+    torch.testing.assert_close(out[:2, 4:], cond[:, 4:])
+
+
 def test_unpatchify_roundtrip_shape():
     model = _tiny_model().eval()
     n_tokens = (8 // 2) ** 2  # grid 4x4 = 16 tokens

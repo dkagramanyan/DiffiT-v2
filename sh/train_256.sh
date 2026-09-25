@@ -46,8 +46,13 @@ export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export PYTHONUNBUFFERED=1
 
 # --- One console-command call ------------------------------------------------
-# Higher-resolution stages: set INIT_WEIGHTS to the previous resolution's newest
-# diffit-snapshot-<kimg>-inference.pt for a weights-only warm start (fresh optimizer).
+# BATCH_GPU 128 x 2 GPUs = global batch 256, the paper's (App. I.2); no grad accumulation
+# (est. ~82 GB peak per H200 in bf16).
+# A run keeps the KEEP_LAST newest snapshots plus the best by combra_fid /
+# combra_fd_dinov2 / combra_cmmd (KEEP_LAST=0 keeps every one). Higher-resolution stages: set
+# INIT_WEIGHTS to the previous stage's best-by-combra_fid snapshot -- the file the last
+# "Best snapshots:" line of its .log names for combra_fid (the last snapshot if that
+# run had no eval) -- for a weights-only warm start (fresh optimizer).
 INIT_ARGS=()
 if [[ -n "${INIT_WEIGHTS:-}" ]]; then
     INIT_ARGS=(--init-weights "$INIT_WEIGHTS")
@@ -58,8 +63,7 @@ diffit-train \
     --cfg "${CFG:-diffit-256}" \
     --data "${DATA:-./datasets/imagenet_9to4_1024x1024_256x256.zip}" \
     --gpus "${GPUS:-2}" \
-    --batch-gpu "${BATCH_GPU:-96}" \
-    --mirror False \
+    --batch-gpu "${BATCH_GPU:-128}" \
     --snapshot-keep-last "${KEEP_LAST:-1}" \
     --combra-metrics True --num-fid-samples "${NUM_FID_SAMPLES:-10000}" \
     --seed "${SEED:-42}" --workers "${WORKERS:-3}" \

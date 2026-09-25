@@ -52,7 +52,7 @@ def _load_reference_images(data, image_size, num_samples):
     """Pull ``num_samples`` real reference images as an NCHW float batch in [-1, 1]."""
     loader = load_data(
         data_dir=data, batch_size=min(num_samples, 64), image_size=image_size,
-        class_cond=False, deterministic=True, random_flip=False, num_workers=2,
+        class_cond=False, deterministic=True, num_workers=2,
         drop_last=False,
     )
     imgs = []

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "diffit"
-version = "0.5.0"
+version = "0.6.0"
 description = "DiffiT: Diffusion Vision Transformers for Image Generation (v2 performance refresh)"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -47,7 +47,7 @@ combra = [
 # Local development is unaffected -- the model envs carry an editable install of
 # combra that shadows this URL; the pin governs fresh installs (cluster, CI).
 # Bump it deliberately when you want combra's newer behaviour.
-    "combra[metrics] @ git+https://github.com/dkagramanyan/combra.git@v0.17.1",
+    "combra[metrics] @ git+https://github.com/dkagramanyan/combra.git@v0.18.0",
 ]
 
 # Console entry-points. After `pip install -e .` these are available on PATH.

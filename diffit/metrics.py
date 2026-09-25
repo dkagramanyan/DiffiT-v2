@@ -117,6 +117,7 @@ def _generate_local_shard(
     cfg_scale, num_sampling_steps=25, scale_pow=4.0, sampler="dpm++",
     rank=0, world_size=1, seed=0,
     class_list=None, null_class_idx=None,
+    amp_dtype=torch.float16,
 ):
     """Generate this rank's shard of the eval samples (NCHW uint8 numpy).
 
@@ -153,7 +154,9 @@ def _generate_local_shard(
             "diffusion_steps": 1000,
             "scale_pow": scale_pow,
         }
-        with torch.amp.autocast("cuda", dtype=torch.float16):
+        # Autocast dtype for sampling + VAE decode; None runs in fp32. train.py
+        # passes its --precision dtype so eval matches training.
+        with torch.amp.autocast("cuda", dtype=amp_dtype or torch.float16, enabled=amp_dtype is not None):
             sample = sample_latents(
                 ema_model.forward_with_cfg,
                 diffusion,
@@ -348,6 +351,7 @@ def evaluate_metrics(
     class_list=None, null_class_idx=None,
     combra_ref=None,
     inception_metrics=True,
+    amp_dtype=torch.float16,
 ):
     """Generate samples across all ranks, compute metrics on rank 0.
 
@@ -397,6 +401,7 @@ def evaluate_metrics(
             num_sampling_steps=num_sampling_steps, sampler=sampler,
             rank=rank, world_size=world_size, seed=seed,
             class_list=class_list, null_class_idx=null_class_idx,
+            amp_dtype=amp_dtype,
         )
     except Exception as e:  # noqa: BLE001 -- agreed on across ranks below
         gen_error = e

@@ -56,5 +56,5 @@ diffit-gen-images \
     --gpus "${GPUS:-2}" --batch-gpu "${BATCH_GPU:-32}" \
     --seed "${SEED:-42}" \
     --save-mode hdf5 \
-    --sampler "${SAMPLER:-ddim}" --steps "${STEPS:-250}" --cfg-scale "${CFG_SCALE:-4.4}" \
+    --sampler "${SAMPLER:-ddpm}" --steps "${STEPS:-250}" --cfg-scale "${CFG_SCALE:-4.4}" \
     "$@"
