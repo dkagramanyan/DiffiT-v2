@@ -57,7 +57,7 @@ hardware or evaluation.
 | Precision | — (upstream sampling: optional fp16) | **bf16** autocast for the model and the VAE encode (`--precision`; GradScaler only for fp16) | adaptation |
 | Eval / snapshot sampling precision | — | Sampling and VAE decode follow `--precision` (bf16 by default; fp32 without autocast) | contract |
 | Data augmentation | — (DiT and the official code: random horizontal flip only) | **Random dihedral transform** (`--augment`, default on): per training item one of the 8 symmetries of the square — `rot90` by k ∈ {0,1,2,3} and a horizontal flip with p = 0.5, uniform — applied on the fly to the uint8 image before VAE encoding. WC-Co microstructures are isotropic, so every rotation / reflection of a crop is an equally valid sample; the metric reference is expanded to the same 8 transforms. Replaces the v0.6.0 "no augmentation" (the `--mirror` hflip option stays removed) | adaptation |
-| Training data | ImageNet (1.28M images) | **1080 unique WC-Co crops** (360 per class, `imagenet_9to4_orig_<r>x<r>.zip`), stored once each; an epoch is 1080 images. Earlier zips stored each crop in all 8 dihedral orientations (8640 images); the orientations now come from `--augment` | adaptation |
+| Training data | ImageNet (1.28M images) | **1080 unique WC-Co crops** (360 per class, `imagenet_9to4_1024x1024_<r>x<r>.zip`), stored once each; an epoch is 1080 images. Earlier zips stored each crop in all 8 dihedral orientations (8640 images); the orientations now come from `--augment` | adaptation |
 | Training-time eval | none (offline FID-50K) | Every `snap` ticks on the EMA: **combra** FID / CMMD / FD-DINOv2 + angle-density metrics (DiffiT's Inception suite when combra is off), sampler **DDIM 100** steps for cost | contract / adaptation |
 | Checkpoints | — | EMA-only `diffit-snapshot-<kimg>-inference.pt` with `n_classes` / `resolution` / `class_names` / `cur_nimg`, atomic writes, no resume; keeps the `--snapshot-keep-last` newest (default 1) plus the best by `combra_fid` / `combra_fd_dinov2` / `combra_cmmd` | contract |
 | Logging | — | Rank-0 `.log`, scalar-only `stats.jsonl`, one TensorBoard event file (spec §7) | contract |
@@ -184,10 +184,10 @@ diffit-prepare-data convert \
 For custom datasets, point `--source` at a directory with the ImageNet folder structure (`train/<class_id>/image.JPEG`). The tool will create a ZIP with resized images and a JSON with class labels.
 
 **WC-Co training data.** `sh/train_<r>.sh` default to
-`./datasets/imagenet_9to4_orig_<r>x<r>.zip` (r = 256 / 512 / 1024): 1080 unique crops,
+`./datasets/imagenet_9to4_1024x1024_<r>x<r>.zip` (r = 256 / 512 / 1024): 1080 unique crops,
 360 per class, `class_names` `['Ultra_Co25', 'Ultra_Co11', 'Ultra_Co6_2']`, built in
 `wc_cv`. Each crop is stored once; its rotations and reflections come from
-`--augment` at training time (the older `imagenet_9to4_1024x1024_<r>x<r>.zip` stored all
+`--augment` at training time (before v0.7.0 the zips of the same name stored all
 8 orientations, 8640 images). One epoch is 1080 images. With the default global batch
 of 256 at 256² (2 × 128), each rank gets 540 images per epoch from the
 `DistributedSampler` and the loader drops the incomplete last batch (`drop_last`):

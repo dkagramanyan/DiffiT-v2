@@ -62,7 +62,7 @@ fi
 diffit-train \
     --outdir "${OUTDIR:-./training-runs}" \
     --cfg "${CFG:-diffit-512}" \
-    --data "${DATA:-./datasets/imagenet_9to4_orig_512x512.zip}" \
+    --data "${DATA:-./datasets/imagenet_9to4_1024x1024_512x512.zip}" \
     --gpus "${GPUS:-2}" \
     --batch-gpu "${BATCH_GPU:-64}" \
     --snapshot-keep-last "${KEEP_LAST:-1}" \
