@@ -30,6 +30,8 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
     "ruff>=0.4.0",
+    # Analysis/toy scripts plot with it; combra no longer installs it (0.17).
+    "matplotlib>=3.7",
 ]
 # Optional: enables the combra metrics during training-time eval. Training runs
 # unchanged without it (the import is guarded). combra is pulled from its private
@@ -47,7 +49,7 @@ combra = [
 # Local development is unaffected -- the model envs carry an editable install of
 # combra that shadows this URL; the pin governs fresh installs (cluster, CI).
 # Bump it deliberately when you want combra's newer behaviour.
-    "combra[metrics] @ git+https://github.com/dkagramanyan/combra.git@v0.15.3",
+    "combra[metrics] @ git+https://github.com/dkagramanyan/combra.git@v0.17.1",
 ]
 
 # Console entry-points. After `pip install -e .` these are available on PATH.
