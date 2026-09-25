@@ -51,6 +51,7 @@ RUN_VARS=(CONDA_ENV OUTDIR CFG DATA GPUS BATCH_GPU KEEP_LAST AUGMENT NUM_FID_SAM
 # --- Environment -------------------------------------------------------------
 # Repo root: under SLURM the script runs from a spool copy, so walk up from the submit
 # dir there and from this file's own location on a workstation.
+SELF="$(realpath "${BASH_SOURCE[0]}")"   # this file, for the detached re-launch below
 REPO_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 while [[ ! -f "$REPO_DIR/pyproject.toml" && "$REPO_DIR" != / ]]; do REPO_DIR="$(dirname "$REPO_DIR")"; done
 [[ -f "$REPO_DIR/pyproject.toml" ]] || { echo "cannot find the repo root -- submit from inside the repo" >&2; exit 1; }
@@ -68,7 +69,7 @@ if [[ -z "${RUN_LOG:-}" ]]; then
   mkdir -p "$LOG_DIR"
   export RUN_LOG="$LOG_DIR/$RUN_NAME-$(date +%Y%m%d-%H%M%S).log"
   if [[ -z "${SLURM_JOB_ID:-}" && "${FOREGROUND:-0}" != 1 ]]; then
-    setsid nohup bash "${BASH_SOURCE[0]}" "$@" > "$RUN_LOG" 2>&1 < /dev/null &
+    setsid nohup bash "$SELF" "$@" > "$RUN_LOG" 2>&1 < /dev/null &
     pid=$!
     echo "$pid" > "${RUN_LOG%.log}.pid"
     echo "Started $RUN_NAME in the background (pid $pid, its own process group)."

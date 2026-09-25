@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "diffit"
-version = "0.7.4"
+version = "0.7.5"
 description = "DiffiT: Diffusion Vision Transformers for Image Generation (v2 performance refresh)"
 readme = "README.md"
 requires-python = ">=3.12"

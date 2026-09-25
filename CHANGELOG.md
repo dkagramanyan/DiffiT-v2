@@ -5,6 +5,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.7.5] — 2026-09-25
+
+### Fixed
+- **`sh/train_*.sh` detach from any directory.** The detached re-launch ran
+  `bash "${BASH_SOURCE[0]}"` after the script had cd'd to the repo root, so a
+  relative path (e.g. `bash ../DiffiT/sh/train_256.sh` from outside the repo) no
+  longer resolved and the detached run died at once. The script now resolves its
+  own absolute path (`SELF`) before the cd, as edm2-v2 / StyleSwin-v2 / san-v2 do.
+
 ## [0.7.4] — 2026-09-25
 
 ### Changed
