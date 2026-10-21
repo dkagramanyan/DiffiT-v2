@@ -2,6 +2,7 @@
 
 Shared by train.py and experiments/train_sample_split.py.
 """
+import re
 import warnings
 
 import numpy as np
@@ -45,6 +46,19 @@ except ImportError as _combra_exc:
 # to carry a "10k" suffix that stayed 10k whatever --num-fid-samples said, so every
 # chart built from them was mislabelled. The sample count is logged once instead, as
 # Metrics/combra_num_fid_samples.
+
+
+def metric_tag(name):
+    """The stats.jsonl / TensorBoard tag of an :func:`evaluate_metrics` key.
+
+    combra (>= 0.25) scores the angles twice, keyed ``v1_<k>`` (P0) and ``v2_<k>``
+    (P6); each version gets its own section, ``combra_vN_<k>`` ->
+    ``Metrics_vN/combra_<k>``. Everything else (``combra_fid`` / ``combra_cmmd`` /
+    ``combra_fd_dinov2``, the Inception suite, ``combra_num_fid_samples``,
+    ``combra_fid_best``) stays under ``Metrics/<key>``.
+    """
+    m = re.fullmatch(r"combra_(v\d+)_(.+)", name)
+    return f"Metrics_{m[1]}/combra_{m[2]}" if m else f"Metrics/{name}"
 
 
 @torch.inference_mode()
@@ -361,8 +375,10 @@ def evaluate_metrics(
         :func:`precompute_combra_reference` (rank 0 only; ``None`` elsewhere). When
         combra is active (``inception_metrics=False`` and combra installed) the
         generated batch is scored with combra's ``fid`` / ``cmmd`` / ``fd_dinov2``
-        image-feature metrics plus the angle-density / Gaussian-fit metrics, merged
-        into the returned dict under ``combra_*`` keys. Both the angle and the
+        image-feature metrics plus the angle-density / Gaussian-fit metrics of both
+        angle versions, merged into the returned dict under ``combra_*`` keys
+        (``combra_v1_w1``, ..., ``combra_v2_w1``, ..., ``combra_fid``; see
+        :func:`metric_tag` for where each is logged). Both the angle and the
         feature extraction are sharded: every rank extracts from its own generated
         shard and the rows are gathered to rank 0, so all GPUs share that work and
         the (cached) reference side never recomputes.

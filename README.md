@@ -385,7 +385,15 @@ extract the EMA weights from any of these (or an older bare EMA `state_dict`).
 
 Quality metrics (**IS**, **FID**, **sFID**, **Precision**, **Recall**) are computed automatically every `snap` ticks during training using 10000 samples by default (configurable per `--cfg`), when combra is **not** used. Results are logged to TensorBoard under `Metrics/` and to `stats.jsonl`. Adjust with `--num-fid-samples` (set to 0 to disable).
 
-`--combra-metrics` (on by default) is **mutually exclusive** with the Inception suite above: when it is on, the IS/FID/sFID/Precision/Recall metrics are disabled and only `combra_*` metrics are logged. combra generates `--num-fid-samples` fakes each tick, scored against the training set (capped to a seeded random subset by `--combra-ref-count`). The image-feature metrics are logged as `combra_fid`, `combra_cmmd`, `combra_fd_dinov2` plus `combra_fid_best` and `combra_num_fid_samples`, which records the sample count the run actually used; the angle-density metrics (`combra_w1`, `combra_mu1`, …) keep their bare names. (These keys used to carry a literal `10k` suffix that stayed `10k` whatever `--num-fid-samples` said, so every chart built from them was mislabelled.)
+`--combra-metrics` (on by default) is **mutually exclusive** with the Inception suite above: when it is on, the IS/FID/sFID/Precision/Recall metrics are disabled and only `combra_*` metrics are logged. combra generates `--num-fid-samples` fakes each tick, scored against the training set (capped to a seeded random subset by `--combra-ref-count`). Since 0.8.0 (combra 0.25) the angle metrics are computed with both versions of combra's vertex-angle extraction, **v1** (P0) and **v2** (P6), and every eval logs three sections:
+
+| Section | stats.jsonl key / TensorBoard tag | Keys |
+|---|---|---|
+| `Metrics` | `Metrics/combra_<k>` | `combra_fid`, `combra_cmmd`, `combra_fd_dinov2`, `combra_num_fid_samples` (the sample count the run actually used), `combra_fid_best` (running best FID) |
+| `Metrics_v1` | `Metrics_v1/combra_<k>` | `combra_w1`, `combra_w2`, `combra_circular_w1`, `combra_circular_w2`, `combra_mu1`, `combra_mu2`, `combra_sigma1`, `combra_sigma2`, `combra_amp1`, `combra_amp2` on the v1 angles |
+| `Metrics_v2` | `Metrics_v2/combra_<k>` | the same ten keys on the v2 angles |
+
+The same strings are the `stats.jsonl` keys (non-finite values written as `null`) and the TensorBoard tags (non-finite values skipped). The `.log` gets one line per section, in this order: `Metrics: combra_fid … combra_cmmd … combra_fd_dinov2 … combra_num_fid_samples … combra_fid_best …`, `Metrics v1: combra_w1 … combra_amp2 …`, `Metrics v2: …` (a value that is not available yet, e.g. `combra_fid_best` before the first finite FID, prints `nan`). When combra returns a metric as `nan` (an unresolved bimodal-Gaussian fit, no vertices extracted, …) its warning saying why is written to the `.log` too. `Metrics/combra_fid` keeps its name, so `combra.metrics.load_fid_by_kimg` reads the history unchanged, and snapshot retention still ranks by `combra_fid` / `combra_fd_dinov2` / `combra_cmmd`. (The image keys used to carry a literal `10k` suffix that stayed `10k` whatever `--num-fid-samples` said, so every chart built from them was mislabelled; before 0.8.0 the angle keys were one unprefixed set under `Metrics/`.) The `[startup]` line of the `.log` records the combra version.
 
 To enable combra metrics, install the optional extra:
 
@@ -460,7 +468,7 @@ Quality metrics are computed **inline during training** every `snap` ticks. The 
 - **Precision** — fraction of generated samples in the real data manifold
 - **Recall** — fraction of real samples covered by the generated manifold
 
-With `--combra-metrics` on (default) these Inception metrics are replaced by the combra suite instead — the angle-density metrics plus `combra_fid` / `combra_cmmd` / `combra_fd_dinov2` (`--num-fid-samples` fakes vs the whole training set; with `--augment` on, the reference holds all 8 dihedral transforms of each real, so it matches the distribution the model is trained on). See [Training output](#training-output) above for the install needed (CMMD requires `open-clip-torch`).
+With `--combra-metrics` on (default) these Inception metrics are replaced by the combra suite instead — the angle-density metrics of both angle versions (`Metrics_v1/` and `Metrics_v2/`, see [Training output](#training-output)) plus `combra_fid` / `combra_cmmd` / `combra_fd_dinov2` (`--num-fid-samples` fakes vs the whole training set; with `--augment` on, the reference holds all 8 dihedral transforms of each real, so it matches the distribution the model is trained on). See [Training output](#training-output) above for the install needed (CMMD requires `open-clip-torch`).
 
 By default, 10000 samples are generated for each evaluation (configurable via `--num-fid-samples`). For a full FID-50K evaluation, use the standalone evaluator:
 

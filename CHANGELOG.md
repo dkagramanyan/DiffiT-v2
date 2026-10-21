@@ -5,6 +5,58 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-22
+
+### Changed
+- **combra pin `v0.19.1` → `v0.25.0`.** combra 0.25 scores the angles with both
+  versions of its vertex-angle extraction, v1 (P0, `min_segment_len` 5) and v2 (P6),
+  and keys them `v1_<k>` / `v2_<k>`; the image metrics stay `fid` / `cmmd` /
+  `fd_dinov2`. There is no `pi` key any more.
+- **Three metric sections in every sink.** `combra_vN_<k>` is logged as
+  `Metrics_vN/combra_<k>` (TensorBoard sections `Metrics_v1` and `Metrics_v2`, ten
+  keys each: `w1`, `w2`, `circular_w1`, `circular_w2`, `mu1`, `mu2`, `sigma1`,
+  `sigma2`, `amp1`, `amp2`); `combra_fid`, `combra_cmmd`, `combra_fd_dinov2`,
+  `combra_num_fid_samples` and `combra_fid_best` stay under `Metrics/`. stats.jsonl
+  uses the same strings as keys (non-finite -> `null`; `Metrics/combra_fid` is
+  unchanged, so `load_fid_by_kimg` still reads it) and TensorBoard the same tags
+  (non-finite skipped). One helper, `diffit.metrics.metric_tag`, maps keys to tags
+  for all three sinks. The single `Metrics:` line of the `.log` becomes three, in
+  this order: `Metrics: combra_fid … combra_fid_best …`, `Metrics v1: combra_w1 …
+  combra_amp2 …`, `Metrics v2: …`. Best-snapshot selection still ranks by
+  `combra_fid` / `combra_fd_dinov2` / `combra_cmmd`. The Inception suite (combra
+  off) keeps its one `Metrics:` line.
+- The `[startup]` line records the combra version (`combra 0.25.0`), not only the
+  end-of-run HPARAMS.
+- CI installs the combra tag pinned in `pyproject.toml` (read from the `[combra]`
+  extra) instead of unpinned combra `main`.
+
+### Fixed
+- **Random startup aborts on the combra smoke test.** combra's `self_test` required
+  the six bimodal-Gaussian keys of four real images scored against themselves to be
+  finite; a degenerate fit on those four (e.g. `--combra-ref-count 64 --seed 42`)
+  aborted the run before training. combra 0.25 no longer requires them when called
+  with `images=`.
+- **combra's reason for a nan metric reaches the `.log`.** combra explains a nan
+  (an unresolved bimodal fit, no extracted vertices, …) only through Python logging,
+  which went to stderr. The rank-0 logger now routes `logging.getLogger("combra")`
+  warnings into the `.log` with the usual `[ts]` prefix (`[ts] WARNING
+  combra.metrics.gauss: …`): one handler, propagation off while attached, so nothing
+  prints twice.
+- **`combra_fid_best` prints `nan`, not `inf`,** when no eval has produced a finite
+  FID yet (stats.jsonl already wrote `null`).
+- **`diffit-compare-samplers` runs again.** It crashed at once with `TypeError:
+  load_data() missing 1 required keyword-only argument: 'num_classes'`. Its reference
+  was the first `--num-samples` images of the class-sorted zip (512 -> 152/360/0 per
+  class) against uniform-class fakes; it is now built as train.py builds its combra
+  reference (a seeded random subset by `--seed`, the whole dataset when it is not
+  larger) and, with the new `--augment` (default `True`, as in train.py), expanded to
+  the 8 dihedral transforms of each real. The VAE is loaded as in `gen_images`
+  (sliced, tiled at >= 1024 px, as training decodes). The docstring said the
+  reference was `[-1, 1]` float; it is NCHW `uint8`.
+- `tests/test_combra_contract.py` asserted the retired `pi` key; it now checks the
+  ten angle keys, and a new test maps `distributed_metrics`' real key set to the
+  three sections.
+
 ## [0.7.5] — 2026-09-25
 
 ### Fixed

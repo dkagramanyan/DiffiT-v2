@@ -54,6 +54,7 @@ from diffit.metrics import (
     all_ranks_ok,
     compute_activations,
     evaluate_metrics,
+    metric_tag,
     precompute_combra_reference,
     sample_latents,
     to_uint8,
@@ -223,8 +224,14 @@ def print_training_options(c, log_fn=print):
 
 
 def startup_header(num_gpus):
-    """One ``[startup]`` line: torch / CUDA versions, device and the relevant env vars (§7)."""
-    parts = [f"torch {torch.__version__}", f"cuda {torch.version.cuda}", f"gpus {num_gpus}",
+    """One ``[startup]`` line: torch / CUDA / combra versions, device and the relevant env vars (§7)."""
+    try:
+        import combra
+        combra_version = combra.__version__
+    except ImportError:
+        combra_version = "not installed"
+    parts = [f"torch {torch.__version__}", f"cuda {torch.version.cuda}", f"combra {combra_version}",
+             f"gpus {num_gpus}",
              f"device {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'}"]
     for var in ("CUDA_VISIBLE_DEVICES", "TORCH_CUDA_ARCH_LIST", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
         if os.environ.get(var):
@@ -322,6 +329,24 @@ def stats_jsonl_line(row, *, now, start_time):
     fields = {k: None if isinstance(v, float) and not math.isfinite(v) else v
               for k, v in fields.items()}
     return json.dumps(fields, allow_nan=False)
+
+
+def metrics_log_lines(row):
+    """The ``.log`` lines of one eval: ``Metrics: ...`` then ``Metrics v1: ...``, ``Metrics v2: ...``.
+
+    One line per tag section in ``row`` (``Metrics/`` and each ``Metrics_vN/``, see
+    :func:`diffit.metrics.metric_tag`), keys without the section prefix; the other
+    columns of the row are not metrics and are left out.
+    """
+    sections = {}
+    for tag, value in row.items():
+        section, _, key = tag.partition("/")
+        if section == "Metrics" or section.startswith("Metrics_"):
+            sections.setdefault(section, []).append(f"{key} {value:.4f}")
+    return [
+        ("Metrics" if s == "Metrics" else "Metrics " + s.split("_", 1)[1]) + ": " + "  ".join(sections[s])
+        for s in sorted(sections, key=lambda s: (s != "Metrics", s))
+    ]
 
 
 def format_time(seconds):
@@ -896,13 +921,13 @@ def training_loop(
                     )
                     if is_main and stats_metrics is not None:
                         for name, value in stats_metrics.items():
-                            row[f"Metrics/{name}"] = float(value)
+                            row[metric_tag(name)] = float(value)
                         if "combra_fid" in stats_metrics:
                             best_fid = min(best_fid, float(stats_metrics["combra_fid"]))
-                            row["Metrics/combra_fid_best"] = best_fid
-                        logged = {k[len("Metrics/"):]: v for k, v in row.items() if k.startswith("Metrics/")}
-                        if logged:
-                            logger.log("Metrics: " + "  ".join(f"{k} {v:.4f}" for k, v in logged.items()))
+                            # No finite FID yet: nan, not the inf sentinel (null in stats.jsonl either way).
+                            row["Metrics/combra_fid_best"] = best_fid if math.isfinite(best_fid) else math.nan
+                        for line in metrics_log_lines(row):
+                            logger.log(line)
                     if is_main:
                         # Only on ticks that ran an eval (§7).
                         row["Timing/eval_sec"] = time.time() - eval_start

@@ -78,3 +78,29 @@ def test_hyperparameters_are_recorded(source):
     # Without this the HPARAMS tab is empty and two runs can be compared by their
     # curves but not by the configuration that produced them.
     assert "_write_run_hparams" in source
+
+
+def test_combra_warnings_reach_the_run_log(tmp_path):
+    # combra gives the reason a metric is nan only through Python logging; it must land
+    # in the .log with the usual [ts] prefix, once, however often the logger is configured.
+    import logging
+    import re
+
+    from diffit import logger
+
+    try:
+        logger.configure(str(tmp_path), run_name="run")
+        logger.configure(str(tmp_path), run_name="run")  # a re-configure adds no 2nd handler
+        logging.getLogger("combra.metrics.gauss").warning("fit unresolved (%s)", "reference")
+        logging.getLogger("combra.metrics.gauss").info("not a warning")
+    finally:
+        logger.close()
+    logging.getLogger("combra.metrics.gauss").warning("after close")
+    lines = (tmp_path / "run.log").read_text().splitlines()
+    assert len(lines) == 1, lines
+    assert re.fullmatch(
+        r"\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\] WARNING combra.metrics.gauss: fit unresolved \(reference\)",
+        lines[0])
+    combra_logger = logging.getLogger("combra")  # combra itself keeps a NullHandler there
+    assert not any(isinstance(h, logger._LogHandler) for h in combra_logger.handlers)
+    assert combra_logger.propagate

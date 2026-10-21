@@ -68,6 +68,37 @@ def test_jsonl_line_writes_non_finite_as_null():
     assert isinstance(fields["datetime"], str)
 
 
+def test_metric_sections_reach_jsonl_and_log():
+    # combra >= 0.25: two angle sections (v1 = P0, v2 = P6) next to the image metrics.
+    # The same tag strings are the stats.jsonl keys, the TensorBoard tags and (minus
+    # the section) the .log keys; one .log line per section, Metrics: first.
+    from diffit.metrics import metric_tag
+    from scripts.train import metrics_log_lines, stats_jsonl_line
+
+    evaluated = {"combra_v1_w1": 1.0, "combra_v1_amp2": math.nan, "combra_v2_w1": 2.0,
+                 "combra_v2_amp2": 0.25, "combra_fid": 30.0, "combra_cmmd": 0.5,
+                 "combra_fd_dinov2": 400.0, "combra_num_fid_samples": 48.0}
+    row = {"Loss/train": 1.25, "Progress/kimg": 1.0}
+    for name, value in evaluated.items():
+        row[metric_tag(name)] = value
+    row["Metrics/combra_fid_best"] = math.nan  # no finite FID yet: nan, not inf
+
+    fields = json.loads(stats_jsonl_line(row, now=1.0, start_time=0.0))
+    assert fields["Metrics_v1/combra_w1"] == 1.0 and fields["Metrics_v1/combra_amp2"] is None
+    assert fields["Metrics_v2/combra_amp2"] == 0.25 and fields["Metrics/combra_fid"] == 30.0
+    assert not any(k.startswith(("Metrics/combra_v", "Metrics_v1/combra_fid")) for k in fields)
+
+    assert metrics_log_lines(row) == [
+        "Metrics: combra_fid 30.0000  combra_cmmd 0.5000  combra_fd_dinov2 400.0000  "
+        "combra_num_fid_samples 48.0000  combra_fid_best nan",
+        "Metrics v1: combra_w1 1.0000  combra_amp2 nan",
+        "Metrics v2: combra_w1 2.0000  combra_amp2 0.2500",
+    ]
+    # The Inception suite (combra off) stays one Metrics: line.
+    assert metric_tag("FID") == "Metrics/FID"
+    assert metrics_log_lines({metric_tag("IS"): 2.0, metric_tag("FID"): 9.0}) == ["Metrics: IS 2.0000  FID 9.0000"]
+
+
 def test_tick_status_line_format():
     from scripts.train import format_time, tick_status_line
 

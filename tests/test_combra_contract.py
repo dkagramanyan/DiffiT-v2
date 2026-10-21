@@ -31,6 +31,7 @@ REQUIRED = [
     ("combra.io", "write_hparams"),
     # scripts/compare_samplers.py / scripts/download_models.py
     ("combra.metrics", "compare_samplers"),
+    ("combra.metrics", "dihedral_expand"),
     ("combra.metrics", "compute_cmmd"),
     ("combra.metrics", "compute_fd_dinov2"),
     ("combra.metrics", "compute_fid"),
@@ -115,5 +116,43 @@ def test_angle_metrics_run_on_pooled_angles():
     out = angle_density_metrics_from_pooled(
         angles(100, 20, 240, 25), angles(104, 21, 236, 26)
     )
-    for key in ("w1", "w2", "circular_w1", "circular_w2", "mu1", "sigma1", "pi"):
+    for key in ANGLE_KEYS:
         assert np.isfinite(out[key]), f"{key} is not finite"
+
+
+# The ten per-version angle keys of combra >= 0.25 (no `pi` since 0.21).
+ANGLE_KEYS = ("w1", "w2", "circular_w1", "circular_w2",
+              "mu1", "mu2", "sigma1", "sigma2", "amp1", "amp2")
+
+
+@requires_combra
+def test_distributed_metrics_keys_map_to_three_sections():
+    # What the training loop actually logs: distributed_metrics' keys, prefixed
+    # combra_ by evaluate_metrics, through metric_tag. Each angle version gets its own
+    # section; the image metrics stay in Metrics/ (load_fid_by_kimg reads
+    # Metrics/combra_fid). CPU, tiny synthetic features -- no backbone runs.
+    import numpy as np
+    from combra.metrics.distributed import distributed_metrics
+
+    from diffit.metrics import metric_tag
+
+    rng = np.random.default_rng(0)
+
+    def side():
+        angles = {m: np.concatenate([rng.normal(100, 20, 2800), rng.normal(240, 25, 1200)]) % 360
+                  for m in ("v1", "v2")}
+        return angles, {n: rng.normal(size=(16, 8)) for n in ("fid", "cmmd", "fd_dinov2")}
+
+    ref_angles, ref_feat = side()
+    gen_angles, gen_feat = side()
+    out = distributed_metrics({"angles": ref_angles, "feat": ref_feat}, gen_angles, gen_feat, device="cpu")
+
+    tags = {metric_tag(f"combra_{k}") for k in out}
+    assert tags == (
+        {f"Metrics_{v}/combra_{k}" for v in ("v1", "v2") for k in ANGLE_KEYS}
+        | {"Metrics/combra_fid", "Metrics/combra_cmmd", "Metrics/combra_fd_dinov2"}
+    )
+    # The best-snapshot selection keys still exist under their old names.
+    from scripts.train import BEST_SNAPSHOT_METRICS
+
+    assert {f"combra_{k}" for k in out} >= set(BEST_SNAPSHOT_METRICS)

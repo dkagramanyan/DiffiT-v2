@@ -6,15 +6,21 @@ need to generate good-quality images?* For every sampler and every ``k``, this
 generates a batch of samples from a trained DiffiT checkpoint, then scores the
 batch against a fixed batch of real reference images with combra's
 ``compare_samplers`` (FID / CMMD / FD-DINOv2 + angle-Wasserstein / Gaussian-fit
-metrics). The result is a tidy table saved as JSON.
+metrics; the angle columns are combra's default angle version, v1 = P0, under
+unprefixed names). The result is a tidy table saved as JSON.
+
+The reference is built as ``scripts/train.py`` builds its combra reference: a
+seeded random subset of ``--num-samples`` reals (all of them if the dataset is not
+larger), expanded to the 8 dihedral transforms of each with ``--augment True``
+(the default, as in train.py) -- pass the value the run was trained with.
 
 This is the DiffiT-side wiring for :func:`combra.metrics.compare_samplers`; the
 generic sweep lives in combra so it stays sampler- and codebase-agnostic.
 
-Usage (see also sbatch/h200_compare_samplers_256x256.sbatch):
+Usage:
 
     diffit-compare-samplers \\
-        --model-path ./runs/.../network-final.pt \\
+        --model-path ./training-runs/.../diffit-snapshot-000400-inference.pt \\
         --data ./datasets/imagenet_9to4_1024x1024_256x256.zip \\
         --image-size 256 --cfg-scale 4.4 --num-samples 512 \\
         --samplers dpm++,unipc,ddim,ddpm \\
@@ -27,17 +33,18 @@ from pathlib import Path
 import click
 import numpy as np
 import torch
-from diffusers.models import AutoencoderKL
 
 import diffit.diffit as diffit_module
 from diffit import create_diffusion, diffusion_defaults
 from diffit.constants import VAE_SCALE_FACTOR
 from diffit.dist_util import extract_inference_state_dict, load_state_dict
-from diffit.image_datasets import load_data
+from diffit.image_datasets import count_data, read_class_meta
 from diffit.metrics import sample_latents, to_uint8
+from scripts.gen_images import _load_vae
+from scripts.train import load_reference_shard
 
 try:
-    from combra.metrics import compare_samplers
+    from combra.metrics import compare_samplers, dihedral_expand
 
     HAS_COMBRA = True
 except ImportError:
@@ -48,21 +55,20 @@ def _parse_csv(s):
     return [x.strip() for x in s.split(",") if x.strip()]
 
 
-def _load_reference_images(data, image_size, num_samples):
-    """Pull ``num_samples`` real reference images as an NCHW float batch in [-1, 1]."""
-    loader = load_data(
-        data_dir=data, batch_size=min(num_samples, 64), image_size=image_size,
-        class_cond=False, deterministic=True, num_workers=2,
-        drop_last=False,
-    )
-    imgs = []
-    got = 0
-    for batch, _ in loader:
-        imgs.append(batch.numpy())
-        got += batch.shape[0]
-        if got >= num_samples:
-            break
-    return np.concatenate(imgs, axis=0)[:num_samples]
+def _load_reference_images(data, image_size, num_samples, seed, augment):
+    """The real reference batch, built the way ``scripts/train.py`` builds its combra reference.
+
+    A seeded random subset of ``num_samples`` reals (the whole dataset when it holds
+    no more), never the first N of the class-sorted zip, so the reference keeps the
+    dataset's class mix like the uniform-class fakes; with ``augment`` it is expanded
+    to all 8 dihedral transforms of each real, as train.py's ``--augment`` does.
+    Returned as NCHW ``uint8``.
+    """
+    num_classes = read_class_meta(data)[1]
+    total_count = count_data(data)
+    ref_count = min(num_samples, total_count)
+    reference = load_reference_shard(data, ref_count, total_count, image_size, 2, 0, 1, seed, num_classes)
+    return dihedral_expand(reference) if augment else reference
 
 
 @torch.inference_mode()
@@ -117,9 +123,11 @@ def _generate_batch(model, vae, dev, latent_size, num_classes, num_samples,
 @click.option("--num-classes", type=int, default=None, help="Override num_classes (default: auto-detect from checkpoint)")
 @click.option("--decode-layer", type=int, default=None, help="Decode layer override")
 @click.option("--seed", type=int, default=0, show_default=True)
+@click.option("--augment", type=bool, default=True, show_default=True, metavar="BOOL",
+              help="Expand the reference to its 8 dihedral transforms; pass the run's train.py --augment")
 @click.option("--outdir", required=True, type=str, help="Output directory for the JSON table")
 def main(model_path, data, image_size, cfg_scale, scale_pow, num_samples, batch_size,
-         samplers, k_values, vae_decoder, model_name, num_classes, decode_layer, seed, outdir):
+         samplers, k_values, vae_decoder, model_name, num_classes, decode_layer, seed, augment, outdir):
     """Compare samplers by combra metrics as a function of sampling steps."""
     if not HAS_COMBRA:
         raise click.UsageError("combra is not installed; `pip install combra` to run this comparison.")
@@ -147,15 +155,15 @@ def main(model_path, data, image_size, cfg_scale, scale_pow, num_samples, batch_
     model.to(dev).eval()
     del state
 
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{vae_decoder}").to(dev).eval()
-    for prm in vae.parameters():
-        prm.requires_grad_(False)
+    # Sliced, and tiled at >= 1024 px, as train.py decodes its eval samples.
+    vae = _load_vae(vae_decoder, dev, image_size)
 
     diffusion_steps = diffusion_defaults()["diffusion_steps"]
 
     # --- Reference real images -----------------------------------------------
-    print(f"Loading {num_samples} real reference images from {data} ...")
-    reference = _load_reference_images(data, image_size, num_samples)
+    print(f"Loading {num_samples} real reference images from {data}"
+          f"{' (x8 dihedral)' if augment else ''} ...")
+    reference = _load_reference_images(data, image_size, num_samples, seed, augment)
 
     # --- One generator per sampler; gen(k) returns a uint8 NHWC batch --------
     def make_sampler_fn(name):
