@@ -11,20 +11,22 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - **combra pin `v0.19.1` → `v0.25.0`.** combra 0.25 scores the angles with both
   versions of its vertex-angle extraction, v1 (P0, `min_segment_len` 5) and v2 (P6),
   and keys them `v1_<k>` / `v2_<k>`; the image metrics stay `fid` / `cmmd` /
-  `fd_dinov2`. There is no `pi` key any more.
+  `fd_dinov2`. v1 keeps the two-amplitude fit (`amp1`, `amp2`); v2 uses the
+  mass-share fit (`combra.fitting.fit_bimodal_share`) and reports `pi`, the relative
+  error of mode 1's mass share, instead.
 - **Three metric sections in every sink.** `combra_vN_<k>` is logged as
-  `Metrics_vN/combra_<k>` (TensorBoard sections `Metrics_v1` and `Metrics_v2`, ten
-  keys each: `w1`, `w2`, `circular_w1`, `circular_w2`, `mu1`, `mu2`, `sigma1`,
-  `sigma2`, `amp1`, `amp2`); `combra_fid`, `combra_cmmd`, `combra_fd_dinov2`,
+  `Metrics_vN/combra_<k>` (TensorBoard sections `Metrics_v1`, ten keys: `w1`, `w2`,
+  `circular_w1`, `circular_w2`, `mu1`, `mu2`, `sigma1`, `sigma2`, `amp1`, `amp2`; and
+  `Metrics_v2`, nine: the same up to `sigma2`, then `pi`); `combra_fid`, `combra_cmmd`, `combra_fd_dinov2`,
   `combra_num_fid_samples` and `combra_fid_best` stay under `Metrics/`. stats.jsonl
   uses the same strings as keys (non-finite -> `null`; `Metrics/combra_fid` is
   unchanged, so `load_fid_by_kimg` still reads it) and TensorBoard the same tags
   (non-finite skipped). One helper, `diffit.metrics.metric_tag`, maps keys to tags
   for all three sinks. The single `Metrics:` line of the `.log` becomes three, in
   this order: `Metrics: combra_fid … combra_fid_best …`, `Metrics v1: combra_w1 …
-  combra_amp2 …`, `Metrics v2: …`. Best-snapshot selection still ranks by
-  `combra_fid` / `combra_fd_dinov2` / `combra_cmmd`. The Inception suite (combra
-  off) keeps its one `Metrics:` line.
+  combra_amp2 …`, `Metrics v2: combra_w1 … combra_pi …`. Best-snapshot selection
+  still ranks by `combra_fid` / `combra_fd_dinov2` / `combra_cmmd`. The Inception
+  suite (combra off) keeps its one `Metrics:` line.
 - The `[startup]` line records the combra version (`combra 0.25.0`), not only the
   end-of-run HPARAMS.
 - CI installs the combra tag pinned in `pyproject.toml` (read from the `[combra]`
@@ -54,7 +56,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   (sliced, tiled at >= 1024 px, as training decodes). The docstring said the
   reference was `[-1, 1]` float; it is NCHW `uint8`.
 - `tests/test_combra_contract.py` asserted the retired `pi` key; it now checks the
-  ten angle keys, and a new test maps `distributed_metrics`' real key set to the
+  angle keys of each version (taken from combra, not hardcoded), and a new test maps `distributed_metrics`' real key set to the
   three sections.
 
 ## [0.7.5] — 2026-09-25

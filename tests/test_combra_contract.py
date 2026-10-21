@@ -113,16 +113,29 @@ def test_angle_metrics_run_on_pooled_angles():
         both = [rng.normal(mu1, sigma1, k), rng.normal(mu2, sigma2, n - k)]
         return np.concatenate(both) % 360
 
-    out = angle_density_metrics_from_pooled(
-        angles(100, 20, 240, 25), angles(104, 21, 236, 26)
-    )
-    for key in ANGLE_KEYS:
-        assert np.isfinite(out[key]), f"{key} is not finite"
+    for method in _gauss_keys():
+        out = angle_density_metrics_from_pooled(
+            angles(100, 20, 240, 25), angles(104, 21, 236, 26), method=method
+        )
+        assert tuple(out) == angle_keys(method)
+        for key in out:
+            assert np.isfinite(out[key]), f"{method} {key} is not finite"
 
 
-# The ten per-version angle keys of combra >= 0.25 (no `pi` since 0.21).
-ANGLE_KEYS = ("w1", "w2", "circular_w1", "circular_w2",
-              "mu1", "mu2", "sigma1", "sigma2", "amp1", "amp2")
+# The four Wasserstein keys of every angle version; the fit keys follow per version
+# from combra (v1: mu1 mu2 sigma1 sigma2 amp1 amp2; v2, the mass-share fit: mu1 mu2
+# sigma1 sigma2 pi).
+WASS_KEYS = ("w1", "w2", "circular_w1", "circular_w2")
+
+
+def _gauss_keys():
+    from combra.metrics.gauss import GAUSS_KEYS
+
+    return GAUSS_KEYS
+
+
+def angle_keys(method):
+    return (*WASS_KEYS, *_gauss_keys()[method])
 
 
 @requires_combra
@@ -140,7 +153,7 @@ def test_distributed_metrics_keys_map_to_three_sections():
 
     def side():
         angles = {m: np.concatenate([rng.normal(100, 20, 2800), rng.normal(240, 25, 1200)]) % 360
-                  for m in ("v1", "v2")}
+                  for m in _gauss_keys()}
         return angles, {n: rng.normal(size=(16, 8)) for n in ("fid", "cmmd", "fd_dinov2")}
 
     ref_angles, ref_feat = side()
@@ -148,8 +161,9 @@ def test_distributed_metrics_keys_map_to_three_sections():
     out = distributed_metrics({"angles": ref_angles, "feat": ref_feat}, gen_angles, gen_feat, device="cpu")
 
     tags = {metric_tag(f"combra_{k}") for k in out}
+    assert {t.split("/")[0] for t in tags} == {"Metrics", "Metrics_v1", "Metrics_v2"}
     assert tags == (
-        {f"Metrics_{v}/combra_{k}" for v in ("v1", "v2") for k in ANGLE_KEYS}
+        {f"Metrics_{v}/combra_{k}" for v in _gauss_keys() for k in angle_keys(v)}
         | {"Metrics/combra_fid", "Metrics/combra_cmmd", "Metrics/combra_fd_dinov2"}
     )
     # The best-snapshot selection keys still exist under their old names.

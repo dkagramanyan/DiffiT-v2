@@ -76,7 +76,7 @@ def test_metric_sections_reach_jsonl_and_log():
     from scripts.train import metrics_log_lines, stats_jsonl_line
 
     evaluated = {"combra_v1_w1": 1.0, "combra_v1_amp2": math.nan, "combra_v2_w1": 2.0,
-                 "combra_v2_amp2": 0.25, "combra_fid": 30.0, "combra_cmmd": 0.5,
+                 "combra_v2_pi": 0.25, "combra_fid": 30.0, "combra_cmmd": 0.5,
                  "combra_fd_dinov2": 400.0, "combra_num_fid_samples": 48.0}
     row = {"Loss/train": 1.25, "Progress/kimg": 1.0}
     for name, value in evaluated.items():
@@ -85,14 +85,14 @@ def test_metric_sections_reach_jsonl_and_log():
 
     fields = json.loads(stats_jsonl_line(row, now=1.0, start_time=0.0))
     assert fields["Metrics_v1/combra_w1"] == 1.0 and fields["Metrics_v1/combra_amp2"] is None
-    assert fields["Metrics_v2/combra_amp2"] == 0.25 and fields["Metrics/combra_fid"] == 30.0
+    assert fields["Metrics_v2/combra_pi"] == 0.25 and fields["Metrics/combra_fid"] == 30.0
     assert not any(k.startswith(("Metrics/combra_v", "Metrics_v1/combra_fid")) for k in fields)
 
     assert metrics_log_lines(row) == [
         "Metrics: combra_fid 30.0000  combra_cmmd 0.5000  combra_fd_dinov2 400.0000  "
         "combra_num_fid_samples 48.0000  combra_fid_best nan",
         "Metrics v1: combra_w1 1.0000  combra_amp2 nan",
-        "Metrics v2: combra_w1 2.0000  combra_amp2 0.2500",
+        "Metrics v2: combra_w1 2.0000  combra_pi 0.2500",
     ]
     # The Inception suite (combra off) stays one Metrics: line.
     assert metric_tag("FID") == "Metrics/FID"
