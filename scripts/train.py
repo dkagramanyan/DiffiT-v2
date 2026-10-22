@@ -51,7 +51,6 @@ from diffit.inception import InceptionFeatureExtractor
 from diffit.metrics import (
     COMBRA_IMPORT_ERROR,
     HAS_COMBRA,
-    all_ranks_ok,
     compute_activations,
     evaluate_metrics,
     metric_tag,
@@ -373,29 +372,6 @@ def tick_status_line(*, tick, kimg, total_sec, sec_per_tick, sec_per_kimg,
     )
 
 
-def combra_smoke_test(ref_images, device, log_fn=print):
-    """Verify the combra metrics actually *compute* before training, not just import.
-
-    Delegates to ``combra.metrics.self_test``, which since combra 0.8 takes
-    ``strict=True`` (require the image-feature metrics to be finite, rather than
-    tolerating ``nan``) and ``images=`` (score a real reference slice against itself).
-    That is what this repo's private copy used to do by hand; models-API §6 always
-    specified one shared implementation, and now there is one.
-    """
-    sample = ref_images[: min(4, len(ref_images))]
-    from combra.metrics import self_test as _combra_self_test
-
-    try:
-        metrics = _combra_self_test(
-            images=sample, device=device, image_metrics=True, strict=True
-        )
-    except RuntimeError:
-        raise
-    except Exception as e:  # noqa: BLE001 -- surface any backend failure the same way
-        raise RuntimeError(f"combra metrics smoke test failed to run: {e}") from e
-    log_fn(f"combra metrics smoke test passed ({len(metrics)} metrics computed)")
-
-
 def load_reference_shard(data, ref_count, total_count, image_size, workers, rank, world_size, seed, num_classes):
     """Load this rank's slice of a ``ref_count``-image combra reference (uint8 NCHW).
 
@@ -639,23 +615,6 @@ def training_loop(
             local_ref = load_reference_shard(
                 data, ref_count, total_count, image_size, workers, rank, num_gpus, seed, num_dataset_classes,
             )
-            smoke_ok = True
-            if is_main:
-                logger.log("Running combra metrics smoke test...")
-                try:
-                    combra_smoke_test(local_ref, device, logger.log)
-                except Exception as e:  # noqa: BLE001 -- re-raised on every rank below
-                    smoke_ok = False
-                    logger.log(f"combra metrics smoke test failed: {e}")
-            # Agree before the next collective. The smoke test runs on rank 0 only, so
-            # letting it raise there stranded every other rank in the reference
-            # precompute's all_reduce -- the failure surfaced as an NCCL timeout rather
-            # than as the backend error that actually caused it.
-            if not all_ranks_ok(smoke_ok, device, num_gpus):
-                raise RuntimeError(
-                    "combra metrics smoke test failed on rank 0 (see its log above). "
-                    "Refusing to burn a training run producing no metrics."
-                )
             if is_main:
                 logger.log("combra metrics enabled → DiffiT Inception metrics disabled.")
             # (reference, ok): ok is rank-uniform, so gating on it is safe -- combra_ref

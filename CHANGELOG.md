@@ -5,6 +5,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-10-22
+
+### Removed
+- **The startup combra smoke test** (`combra_smoke_test`, a `combra.metrics.self_test`
+  on rank 0 followed by an `all_ranks_ok` gate). It loaded the backbones on rank 0
+  alone while the other ranks waited in a collective, so a slow backbone load (10 min
+  21 s on an offline 2x H200 node) tripped the 10-minute NCCL watchdog and killed the
+  run. The backbones now load only in the reference precompute, on all ranks together;
+  its failure handling is unchanged.
+
+### Changed
+- **combra pin `v0.25.0` → `v0.25.1`.** The backbones load from the
+  `download_models.sh` cache with no network access; a missing file fails fast when
+  `HF_HUB_OFFLINE=1`.
+
 ## [0.8.0] — 2026-10-22
 
 ### Changed
