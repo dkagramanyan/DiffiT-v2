@@ -302,6 +302,9 @@ and the full `diffit-train` command line. `LOG_DIR` moves the logs.
 `sh/generate_*.sh` take `NETWORK` / `SAMPLES_PER_CLASS` / … the same way (no detach).
 Prefetch backbones once on a login node with `diffit-download-models` before an
 offline run.
+With `--combra-metrics` on and `--num-fid-samples` > 0, `diffit-train` first checks
+that the combra backbone weights are cached (`combra.metrics.require_backbones`, no
+network) and exits naming every missing file before it loads data or spawns ranks.
 
 ### No resume — size runs to the walltime
 

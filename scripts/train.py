@@ -1109,6 +1109,18 @@ def launch_from_opts(opts):
 
     cfg = dataclasses.replace(BASE_CONFIGS[opts["cfg"]], **overrides)
 
+    # First check of a training start: the metric backbones download_models.sh fetches
+    # must be cached, or the run would stall on an offline node loading them. Local
+    # caches only, no network. Before spawn, so it prints to the tee'd sh/ log.
+    if opts["combra_metrics"] and cfg.num_fid_samples > 0 and HAS_COMBRA and not opts["dry_run"]:
+        from combra.metrics import require_backbones
+
+        try:
+            files = require_backbones()
+        except RuntimeError as e:
+            raise click.ClickException(str(e)) from e
+        print(f"Backbone weights found (download_models.sh): {', '.join(files)}", flush=True)
+
     # Label contract (§3/§5): training is class-conditional, so the zip must record its
     # class names, or every snapshot would carry class_names=None.
     if read_class_meta(opts["data"])[0] is None:

@@ -27,6 +27,8 @@ REQUIRED = [
     ("combra.metrics.distributed", "distributed_metrics"),
     ("combra.metrics.distributed", "gather_generated"),
     ("combra.metrics.distributed", "precompute_reference"),
+    # scripts/train.py launch_from_opts (first check of a training start)
+    ("combra.metrics", "require_backbones"),
     ("combra.io", "write_hparams"),
     # scripts/compare_samplers.py / scripts/download_models.py
     ("combra.metrics", "compare_samplers"),

@@ -7,6 +7,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.8.1] — 2026-10-22
 
+### Added
+- **The backbone weights are checked first at every training start.** With
+  `--combra-metrics` on and `--num-fid-samples` > 0, `diffit-train` calls
+  `combra.metrics.require_backbones()` before anything else (dataset check, spawn,
+  reference precompute): the FID Inception, CLIP and DINOv2 files that
+  `download_models.sh` fetches must be in the local caches (no network). A missing
+  file exits non-zero with combra's list of what is missing; on success one line,
+  `Backbone weights found (download_models.sh): fid, cmmd, fd_dinov2`, is printed to
+  the `sh/` log. Skipped on `--dry-run`, and when combra is not installed.
+
 ### Removed
 - **The startup combra smoke test** (`combra_smoke_test`, a `combra.metrics.self_test`
   on rank 0 followed by an `all_ranks_ok` gate). It loaded the backbones on rank 0
